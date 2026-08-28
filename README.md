@@ -29,7 +29,7 @@ NodalS does **not** make the pressure field usable by adding an artificial press
 In the SIMPLE/SIMPLEC pressure-correction step, the current physical pressure action is the factored Schur-type operator
 
 \[
-S = B\,\mathrm{diag}(rAU)\,B^T.
+S = B\,\{diag}(rAU)\,B^T.
 \]
 
 The matrix used by PETSc GAMG may be a full or compact **preconditioning matrix**, but that Pmat is not substituted for the physical pressure operator in the compact/factored formulation. In particular, the compact FE face-energy matrix is a preconditioner surrogate rather than an artificial pressure-dissipation term added to the governing equations.
