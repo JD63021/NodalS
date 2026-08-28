@@ -6,7 +6,7 @@ The project is an attempt to make practical CFD workflows possible in a finite-e
 
 ## What NodalS discretizes
 
-The current mixed finite-element pair is
+The current mixed finite-element pair is inspired from Farrell et al,2019 (https://doi.org/10.1137/18M1219370).
 
 \[
 V_h = [P_1 + BF_3]^3, \qquad Q_h = P_0.
