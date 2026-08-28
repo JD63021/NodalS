@@ -1,0 +1,227 @@
+# =============================================================================
+# NodalS v1.00 — fully annotated generic-flow test.case
+# =============================================================================
+# This is the generic CFD template. Every normal user-facing .case knob currently
+# understood by NodalS v1.00 is present below, followed by the source-level expert
+# switches in [petsc]. Values are chosen to reproduce the working 82ktet
+# shellSphere normal-inlet case with the FAST full-GAMG pressure backend.
+#
+# PIPE-ONLY SPECIAL VERIFICATION FEATURES (intentionally NOT active here):
+#   - [solver] re = <value>
+#       Used by the hard-coded Hagen–Poiseuille verification path.
+#   - [boundary] inlet_type = parabolic
+#   - [boundary] bulk_velocity = <value>
+#       Used by the validated straight-pipe parabolic inlet/diagnostics.
+#
+# For normal/general flow use:
+#   problem = flow
+#   nu      = kinematic viscosity
+#   speed   = positive inward normal-speed magnitude at the inlet
+#
+# Any line in [petsc] is an expert override. The friendly sections above it are
+# preferred for normal use. Arbitrary PETSc options can also be added to [petsc]
+# even if they are not listed here.
+# =============================================================================
+
+# --- MPI/run-control section --------------------------------------------------
+[run]                                                   # Launcher/MPI controls.
+name = shellSphere82k_generic                            # Case name; also prefixes log/output names.
+ranks = 16                                              # Number of MPI ranks passed to mpirun -np.
+output_root = auto                                      # Base folder for this run's log/results. "auto" -> ~/Downloads/NodalS_<case>_<timestamp>. You may instead give any path, e.g. ~/NodalS-runs/my_case.
+timeout_seconds = 0                                     # Wall-clock timeout in seconds; 0 disables launcher timeout.
+map_by = core                                           # Open MPI mapping policy, e.g. core, socket, numa.
+bind_to = core                                          # Open MPI binding policy; "core" pins each rank to a core.
+report_bindings = true                                  # Print MPI rank-to-core bindings at startup.
+
+# OUTPUT EXAMPLES:
+#   output_root = ~/NodalS-runs                         # Put timestamped/selected case outputs under a user-owned runs folder.
+#   output_root = /scratch/myname/nodals/run01          # Absolute paths are also allowed.
+#   vtu_output = ~/results/velocity_pressure.vtu        # Optional exact VTU destination; normally leave blank.
+#
+# --- Physical problem / mesh --------------------------------------------------
+[solver]                                                # Mesh and continuum-model controls.
+mesh = ~/NodalS v1.00/meshes/shellsphere1/82ktet/constant/polyMesh  # Mesh is directly assignable: point this at ANY OpenFOAM tetrahedral constant/polyMesh directory, inside or outside NodalS.
+problem = flow                                          # Generic flow mode; alternatives in source are pipe and mms.
+nu = 0.001                                              # Kinematic viscosity used by generic flow.
+convection = central                                    # Convective discretization: central or none.
+# PIPE SPECIAL ONLY: re = 20                            # Do not use for generic flow; special pipe verification control.
+
+# --- Boundary conditions ------------------------------------------------------
+[boundary]                                              # Boundary-role assignment and supported BCs.
+wall_patch = patch_0_0                                  # No-slip wall patch(es); names may be separated by comma/semicolon/space.
+wall_type = wall                                        # Wall BC; wall/no_slip/noslip all mean the existing no-slip condition.
+inlet_patch = patch_1_0                                 # Patch used as the generic normal-speed inlet.
+inlet_type = normal                                     # Generic v1.00 inlet type; "normal" means fixed patch-normal speed.
+speed = 0.2                                             # Positive inward normal-speed magnitude; launcher handles solver sign convention.
+outlet_patch = patch_2_0                                # Patch used as the open outlet.
+outlet_type = pressure0                                 # Existing natural-zero-traction / physical pressure-gauge outlet.
+# PIPE SPECIAL ONLY: inlet_type = parabolic             # Hard-coded validated Hagen–Poiseuille inlet profile.
+# PIPE SPECIAL ONLY: bulk_velocity = 1.0                # Bulk speed for the special parabolic pipe verification case.
+
+# --- SUPG stabilization --------------------------------------------------------
+[supg]                                                  # Optional momentum SUPG controls.
+enabled = false                                         # true enables SUPG; false leaves central Galerkin convection unstabilized.
+tau_scale = 0.05                                        # Multiplicative scale applied to the SUPG stabilization parameter tau.
+form = implicit                                         # SUPG form: implicit or explicit.
+kernel = fast                                           # SUPG implementation: fast or legacy.
+quad_points = 64                                        # SUPG tetrahedral quadrature: 64, 45, or 125 points.
+
+# --- SIMPLE / SIMPLEC outer iteration -----------------------------------------
+[simple]                                                # Pressure-velocity segregated outer iteration.
+variant = simplec                                       # Coupling algorithm: simple or simplec.
+alpha_u = 0.7                                           # Velocity under-relaxation factor; must satisfy 0 < alpha_u <= 1.
+alpha_p = 1.0                                           # Pressure-correction under-relaxation factor; 0 < alpha_p <= 1.
+u_relax_mode = row_l1                                   # Momentum relaxation metric: row_l1 or diag.
+rau_mode = diag                                         # rAU metric used by pressure coupling: diag or row_l1.
+rau_scale = 1                                           # Positive multiplier applied to rAU.
+simplec_blend = 1                                       # SIMPLEC blend fraction; 1 is full SIMPLEC, 0 tends toward diagonal fallback behavior.
+simplec_floor_fraction = 1e-6                           # Positive-diagonal floor fraction used when forming SIMPLEC correction metrics.
+simplec_fallback = diag                                 # SIMPLEC invalid/weak-denominator handling: diag, floor, or error.
+rtol = 1e-3                                             # Outer convergence gate; Ux, Uy, Uz initial residuals AND continuity must all pass.
+max_iterations = 10000                                  # Maximum SIMPLE/SIMPLEC outer iterations.
+
+# --- Momentum predictor --------------------------------------------------------
+[momentum]                                              # Per-component momentum-solve controls.
+rtol = 1e-8                                             # Relative tolerance for the momentum predictor.
+atol = 0                                                # Absolute tolerance; 0 disables an additional absolute target.
+relative_drop = 0.5                                     # Stop inner predictor after this fractional initial-residual drop; 0 disables this gate.
+max_iterations = 20000                                  # Hard maximum inner momentum iterations.
+check_every = 1                                         # Recompute/check inner momentum residual every N iterations.
+local_sweeps = 1                                        # Number of local custom SGS sweeps per inner iteration.
+sor_omega = 1                                           # SGS/SOR relaxation omega; must satisfy 0 < omega < 2.
+
+# --- Pressure solve -------------------------------------------------------------
+[pressure]                                              # Physical pressure operator + preconditioning architecture.
+mode = fast_full_gamg                                   # fast_full_gamg, compact_cheb, or compact_pcg.
+pmat = full                                             # full for fast_full_gamg; compact for the low-memory compact modes.
+refresh = 100                                           # Rebuild pressure Pmat/GAMG every N outer iterations; 1 means every iteration.
+ksp_type = richardson                                   # PETSc pressure KSP type used by the fast backend.
+rtol = 0.5                                              # Relative tolerance used by the pressure KSP/Richardson backend.
+atol = 1e-12                                            # Absolute pressure-solve tolerance.
+divtol = 1e8                                            # PETSc KSP divergence tolerance.
+max_iterations = 20                                     # Maximum pressure KSP/Richardson iterations per outer iteration.
+pc_type = gamg                                          # PETSc pressure preconditioner; production fast path uses GAMG.
+mg_level_ksp = richardson                               # KSP used on non-coarse GAMG levels.
+mg_level_pc = jacobi                                    # Smoother/preconditioner used on non-coarse GAMG levels.
+mg_level_iterations = 1                                 # Number of level-KSP iterations/smoothing steps per GAMG application.
+# solver = fast_full_gamg                               # Legacy alias for "mode"; leave unused when mode is present.
+
+# --- Compact-Chebyshev controls -----------------------------------------------
+# These values are parsed even when fast_full_gamg is selected, but are only
+# active when pressure.mode = compact_cheb.
+[chebyshev]                                             # Low-memory custom FP64 Chebyshev pressure controls.
+mode = adaptive                                         # adaptive extends in blocks; fixed uses exactly "steps".
+power_iterations = 10                                   # Power iterations used to estimate the preconditioned spectral upper bound.
+lambda_max_safety = 1.2                                 # Safety multiplier applied to the estimated lambda_max; must be > 1.
+lambda_min_fraction = 0.06                              # lambda_min as a fraction of lambda_max; must lie strictly between 0 and 1.
+rtol = 0.1                                              # Chebyshev relative target for the physical pressure residual.
+atol = 1e-12                                            # Chebyshev absolute target for the physical pressure residual.
+spectrum_refresh = 100                                  # Refresh cadence for the power-spectrum estimate; 0 follows source semantics.
+steps = 40                                              # Number of stages when mode=fixed; ignored by adaptive mode.
+require_target = false                                  # If true, failure to hit the requested Chebyshev target is not accepted.
+initial_block = 8                                       # Initial adaptive Chebyshev block size.
+extend_block = 4                                        # Additional stages added each adaptive extension.
+max_steps = 40                                          # Maximum Chebyshev stages in adaptive mode.
+divergence_factor = 1e8                                 # Growth guard used to reject catastrophically divergent pressure corrections.
+
+# --- Output, diagnostics, and audits ------------------------------------------
+[output]                                                # Output and runtime-instrumentation controls.
+write_vtu = true                                        # Write a VTU result file after a completed solve.
+vtu_output =                                            # Optional exact VTU filename/path. Leave blank to place <case>_solution.vtu under output_root; set a path here only when you want to override that.
+vtu_velocity_mode = cell_average                        # VTU velocity field: legacy, cell_average/u0, or both.
+resource_profile = true                                 # Print summed/max-rank RSS/HWM and phase resource marks.
+memory_audit = false                                    # Enable additional detailed memory-audit diagnostics.
+mesh_audit_only = false                                 # true performs mesh/patch audit and exits without solving.
+
+# =============================================================================
+# Expert/source-level switches
+# =============================================================================
+# Anything in this section is passed directly as a PETSc/source option:
+#       foo = value   ->   -foo value
+#
+# The values below are safe production/default values. Most "gate" and "shadow"
+# switches are development diagnostics and should normally remain 0/false.
+#
+# Native PETSc has many additional KSP/PC/GAMG options not enumerated by NodalS.
+# They may also be placed here without a leading "-", or passed after:
+#       ./bin/nodals cases/test.case -- -some_petsc_option value
+# =============================================================================
+
+[petsc]                                                 # Direct advanced option passthrough.
+
+# --- SUPG expert coefficient ---------------------------------------------------
+supg_magic = 9                                          # Additional positive constant used in the source SUPG tau formula.
+
+# --- Custom momentum production/shadow diagnostics ----------------------------
+custom_momentum_live = 0                                # Legacy/custom-momentum live-mode diagnostic switch; keep 0 for current production path.
+custom_momentum_shadow = 0                              # Build/compare a shadow momentum path for parity diagnostics.
+custom_momentum_shadow_strict = 0                       # Abort on shadow mismatch instead of only reporting it.
+custom_momentum_shadow_sgs = 1                          # Include SGS comparison when momentum shadowing is enabled.
+custom_momentum_shadow_tol = 5e-12                      # Numerical tolerance for momentum shadow parity checks.
+custom_momentum_shadow_interval = 50                    # Outer-iteration interval between momentum shadow checks; 0 disables periodic checks.
+m2b_direct_dynamic = 1                                  # Keep the accepted direct custom dynamic momentum assembly path enabled.
+m3_static_reference = 0                                 # Enable historical static-momentum reference diagnostic.
+m4b_b_reference = 0                                     # Enable historical pressure-divergence B reference diagnostic.
+m5b_pcg_reference = 0                                   # Enable historical custom pressure-PCG reference diagnostic.
+m6b_velocity_reference = 0                              # Enable historical velocity-state reference diagnostic.
+custom_pressure_b_shadow_tol = 5e-12                    # Tolerance for custom pressure-B shadow/reference checks.
+custom_pressure_pcg_reference_tol = 5e-10               # Tolerance for custom pressure-PCG reference checks.
+
+# --- Gate-1 / PETSc outer-pressure comparison diagnostics ---------------------
+gate1_compare_pcg = 0                                   # Compare PETSc pressure route with custom PCG; production default in NodalS is off.
+gate1_solution_tol = 5e-8                               # Solution-difference tolerance for the Gate-1 comparison.
+gate1_true_residual_tol = 1e-8                          # True-residual tolerance for the Gate-1 comparison.
+
+# --- Gate-3 pressure mass/algebra diagnostic ----------------------------------
+gate3_mp_probe = 0                                      # Enable the historical pressure-mass/algebra probe.
+gate3_mp_algebra_tol = 1e-14                            # Algebra-consistency tolerance used by the Gate-3 probe.
+
+# --- Gate-4 through Gate-8 historical pressure/PCD probes ---------------------
+gate4_kp_probe = 0                                      # Enable historical geometric Kp construction/probe.
+gate5_kp_gamg_probe = 0                                 # Enable historical Kp+GAMG probe.
+gate6_diffusion_pcd_probe = 0                           # Enable historical diffusion/PCD-chain probe.
+gate6_chain_tol = 1e-7                                  # Chain-consistency tolerance for Gate-6.
+gate6_kp_true_residual_tol = 1e-8                       # Kp true-residual tolerance for Gate-6.
+gate7_cp_probe = 0                                      # Enable historical convection-pressure Cp probe.
+gate8_esw_bc_probe = 0                                  # Enable historical ESW/boundary-condition PCD probe.
+gate8_cancel_tol = 1e-13                                # Cancellation tolerance used by Gate-8 checks.
+gate8_wall_flux_tol = 1e-13                             # Wall-flux tolerance used by Gate-8 checks.
+
+# --- Gate-9 historical live-PCD / GAMG controls -------------------------------
+gate9_live_pcd = 0                                      # Enable the historical live PCD pressure path.
+gate9d_gamg_only = 0                                    # Enable Gate-9D GAMG-only cycle experiment.
+gate9d_omega = 1                                        # Richardson/GAMG cycle relaxation used by Gate-9D.
+gate9d_max_cycles = 100                                 # Maximum Gate-9D cycles.
+gate9e_ngfv = 0                                         # Enable the historical NGFV pressure-preconditioner experiment.
+gate9_kp_rtol = 1e-10                                   # Relative target for historical Gate-9 Kp solves.
+gate9_kp_max_it = 200                                   # Maximum iterations for historical Gate-9 Kp solves.
+gate9_kp_true_residual_tol = 1e-8                       # True Kp residual acceptance tolerance.
+gate9_outer_true_residual_tol = 1e-8                    # True outer pressure residual acceptance tolerance.
+
+# --- Legacy fixed-Chebyshev diagnostic controls -------------------------------
+# The production compact route uses the friendly [chebyshev] Gate-9I controls.
+gate9h_lambda_min = 0.1                                 # Lower spectral bound for legacy fixed Chebyshev (Gate-9H).
+gate9h_lambda_max = 4.5                                 # Upper spectral bound for legacy fixed Chebyshev (Gate-9H).
+gate9h_max_steps = 60                                   # Maximum fixed-Chebyshev stages for Gate-9H.
+gate9h_check_every = 5                                  # Residual-check interval for Gate-9H.
+
+# --- Alternative historical pressure-Pmat experiment coefficients ------------
+p_fe_fv_p1_strength = 1.0                               # Blend/strength coefficient for historical FE/FV face Pmat experiment.
+p_fv_lsq_strength = 0.9                                 # LSQ contribution strength for historical FV-LSQ Pmat experiment.
+p_fv_lsq_tpfa_floor = 0.10                              # TPFA floor fraction for historical FV-LSQ Pmat experiment.
+
+# --- Factored-Schur microbenchmark --------------------------------------------
+pressure_factored_benchmark = 0                         # Enable explicit benchmarking of the factored physical Schur action.
+pressure_factored_benchmark_at = 1                      # Outer iteration at which to run the factored-Schur benchmark.
+pressure_factored_benchmark_reps = 200                  # Number of repeated factored-Schur actions in the benchmark.
+
+# --- Pressure profiling --------------------------------------------------------
+pressure_profile = 0                                    # Enable detailed pressure-operator/preconditioner profiling.
+m10_pcg_profile = 0                                     # Enable the historical M10 custom-PCG profiling mode.
+pressure_profile_at = 1                                 # Outer iteration at which detailed pressure profiling runs.
+pressure_profile_fine_reps = 200                        # Number of fine physical-operator repetitions in profiling.
+pressure_profile_pc_reps = 50                           # Number of pressure PCApply repetitions in profiling.
+pressure_profile_cg_its = 10                            # Number of CG iterations used in each profiling sample.
+pressure_profile_cg_reps = 5                            # Number of repeated CG profiling samples.
+pressure_profile_level_mat_reps = 50                    # Number of repeated level-matrix applications in GAMG profiling.
+pressure_profile_level_solve_reps = 10                  # Number of repeated level-solve applications in GAMG profiling.

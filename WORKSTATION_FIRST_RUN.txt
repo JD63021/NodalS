@@ -1,0 +1,30 @@
+NodalS v1.00 — workstation acceptance
+
+cd "$HOME/NodalS v1.00"
+export PETSC_DIR="$HOME/petsc-main"
+export PETSC_ARCH=arch-cuda-debug
+
+1) Build:
+   ./build.sh
+
+2) Static checks:
+   ./tests/regression.sh
+
+3) Run the primary FAST 40k Re=20 parabolic case:
+   ./tests/regression.sh --fast
+
+4) Optional compact frozen-reference parity:
+   ./tests/regression.sh --compact-parity
+
+5) Install once:
+   ./install.sh
+
+Normal use:
+   ./bin/nodals cases/test.case
+   ./bin/nodals cases/generic-normal.case
+
+Low-memory alternatives:
+   ./bin/nodals cases/40k_Re20_compact_cheb.case
+   ./bin/nodals cases/generic-normal-compact.case
+
+Change MPI ranks in [run] ranks = N, or use --set run.ranks=N.

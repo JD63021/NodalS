@@ -1,0 +1,109 @@
+# NodalS v1.00 canonical parity case.
+# This reproduces the validated Gate9N 111k Re=20 parabolic pipe runner.
+
+[run]
+name = 111k_Re20_parabolic
+ranks = 16
+timeout_seconds = 0
+map_by = core
+bind_to = core
+report_bindings = true
+output_root = auto
+
+[solver]
+mesh = ~/Desktop/meshes/pipe/111k/constant/polyMesh
+problem = pipe
+re = 20
+# nu =              # leave blank to derive nu = Ubulk*D/Re from the actual pipe geometry
+convection = central
+
+[boundary]
+# NodalS v1.00 deliberately supports only the currently validated BC family.
+wall_patch = patch_0_0
+wall_type = wall
+inlet_patch = patch_2_0
+inlet_type = parabolic
+bulk_velocity = 1.0
+outlet_patch = patch_1_0
+outlet_type = pressure0
+
+[supg]
+enabled = false
+tau_scale = 0.05
+form = implicit
+kernel = fast
+quad_points = 64
+
+[simple]
+variant = simplec
+rtol = 1e-3
+max_iterations = 10000
+alpha_u = 0.7
+alpha_p = 1.0
+u_relax_mode = row_l1
+rau_mode = diag
+rau_scale = 1
+simplec_blend = 1
+simplec_floor_fraction = 1e-6
+simplec_fallback = diag
+
+[momentum]
+rtol = 1e-8
+atol = 0
+relative_drop = 0.5
+max_iterations = 20000
+check_every = 1
+local_sweeps = 1
+sor_omega = 1
+
+[pressure]
+solver = cheb_gamg
+pmat = compact
+rtol = 0.1
+atol = 1e-12
+divtol = 1e8
+max_iterations = 300
+refresh = 1
+pc_type = gamg
+mg_level_ksp = richardson
+mg_level_pc = jacobi
+mg_level_iterations = 1
+
+[chebyshev]
+mode = adaptive
+steps = 40
+power_iterations = 10
+spectrum_refresh = 100
+lambda_max_safety = 1.2
+lambda_min_fraction = 0.06
+require_target = false
+initial_block = 8
+extend_block = 4
+max_steps = 40
+divergence_factor = 1e8
+
+[output]
+write_vtu = true
+vtu_velocity_mode = cell_average
+resource_profile = true
+memory_audit = false
+mesh_audit_only = false
+
+# Every key in [petsc] is passed directly to the underlying solver as -key value.
+# Use this section for advanced/experimental source options not represented above.
+[petsc]
+gate1_compare_pcg = 0
+gate3_mp_probe = 0
+gate5_kp_gamg_probe = 0
+gate6_diffusion_pcd_probe = 0
+gate7_cp_probe = 0
+gate8_esw_bc_probe = 0
+gate9e_ngfv = 0
+m3_static_reference = 0
+m4b_b_reference = 0
+m5b_pcg_reference = 0
+m6b_velocity_reference = 0
+custom_pressure_b_shadow_tol = 5e-12
+custom_pressure_pcg_reference_tol = 5e-10
+m10_pcg_profile = 0
+pressure_profile = 0

@@ -1,0 +1,97 @@
+--- reference/main_solver.inc.gate9n	2026-08-28 14:33:33.033441544 +0000
++++ src/80_app/main_solver.inc	2026-08-28 14:35:34.050028017 +0000
+@@ -138,8 +138,10 @@
+   char pressureSolveModeName[32]="custom_pcg";
+   PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pressure_solve_mode",pressureSolveModeName,sizeof(pressureSolveModeName),nullptr));
+   const std::string pressureSolveMode(pressureSolveModeName);
+-  if(pressureSolveMode!="custom_pcg" && pressureSolveMode!="petsc_fgmres")
+-    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode must be custom_pcg or petsc_fgmres");
++  if(pressureSolveMode!="custom_pcg" && pressureSolveMode!="petsc_fgmres" && pressureSolveMode!="gamg_richardson")
++    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode must be custom_pcg, petsc_fgmres, or gamg_richardson");
++  if(pressureSolveMode=="gamg_richardson") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
++    "NODALS_PRESSURE_BACKEND mode=FAST_FULL_GAMG_RICHARDSON exactOperator=factored_B_rAU_Bt pmat=full recommendedPc=gamg recommendedRefresh=100\n"));
+   PetscBool gate1ComparePcg=PETSC_TRUE;
+   PetscReal gate1SolutionTol=5e-8,gate1TrueResidualTol=1e-8;
+   PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate1_compare_pcg",&gate1ComparePcg,nullptr));
+@@ -597,13 +599,18 @@
+       "P1BF3_FULL_PMAT_LAG_CONFIG enabled=1 interval=%" PetscInt_FMT " exactOperator=factored_B_rAU_Bt pmat=full_explicit_Schur_snapshot semantics=assemble_Pmat_only_on_GAMG_refresh\n",
+       pPreconditionerRefresh));
+     if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+-      "P1BF3_M4B_PRESSURE_ARCH physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI exactOperator=custom_FP64_B_rAU_Bt PETScB=none_live Pmat=PETSc_FP64_full GAMG=PETSc_FP64 outerKrylov=custom_FP64_PCG PETScKSPRole=GAMG_PC_owner_only\n"));
+-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M5A_CONFIG Bcell=eliminated schurStorage=flat_CSR_terms pmatRefresh=analytic_B_coefficients CustomOuterPCG=FP64 PETScGAMG=FP64\n"));
++      "P1BF3_M4B_PRESSURE_ARCH physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI exactOperator=custom_FP64_B_rAU_Bt PETScB=none_live Pmat=PETSc_FP64_full GAMG=PETSc_FP64 outerKrylov=%s PETScKSPRole=%s\n",
++      pressureSolveMode=="gamg_richardson"?"PETSc_RICHARDSON":(pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES":"custom_FP64_PCG"),
++      pressureSolveMode=="custom_pcg"?"GAMG_PC_owner_only":"live_pressure_solver"));
+     if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
++      "P1BF3_M5A_CONFIG Bcell=eliminated schurStorage=flat_CSR_terms pmatRefresh=analytic_B_coefficients pressureBackend=%s PETScGAMG=FP64\n",
++      pressureSolveMode=="gamg_richardson"?"PETSc_Richardson_GAMG":(pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES":"custom_FP64_PCG")));
++    if(pPmatMode=="full" && pressureSolveMode=="custom_pcg") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+       "P1BF3_M5B_PCG_CONFIG outer=custom_FP64_MPI_PCG exactOperator=custom_FP64_B_rAU_Bt preconditioner=PETSc_FP64_GAMG_PCApply PETScKSPSolve=%s referenceTol=%.3e\n",
+       m5bPcgReference?"first_solve_reference_only":"never_called_in_production",(double)customPressurePcgReferenceTol));
+     if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+-      "P1BF3_M6A_PRESSURE_STATE_CONFIG physicalP=native_CPP_FP64 continuity=native_CPP_FP64 pressureRhs=native_CPP_FP64 correction=custom_PCG_FP64 PETScPressureVecs=pcIn_pcOut_bridge_only staticVolumeFixedDiv=native_FP64_plus_layout_bridge eventualFP32SafePressureState=1\n"));
++      "P1BF3_M6A_PRESSURE_STATE_CONFIG physicalP=native_CPP_FP64 continuity=native_CPP_FP64 pressureRhs=native_CPP_FP64 correction=%s PETScPressureVecs=pcIn_pcOut_bridge_only staticVolumeFixedDiv=native_FP64_plus_layout_bridge eventualFP32SafePressureState=1\n",
++      pressureSolveMode=="gamg_richardson"?"PETSc_Richardson_FP64":(pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES_FP64":"custom_PCG_FP64")));
+     if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+       "P1BF3_M6B_VELOCITY_STATE_CONFIG physicalU=native_CPP_FP64 staticMomentumRhs=native_CPP_FP64 dynamicMomentumRhs=native_CPP_FP64 momentumWork=native_CPP_FP64 diagMetricRau=custom_CPP_FP64 PETScVelocityVecs=none_live PETScPhysicalState=none_live eventualFP32SafeVelocityState=1 reference=%s\n",m6bVelocityReference?"PASS":"SKIPPED_PRODUCTION"));
+     if(pPmatMode=="native_face") {
+@@ -640,10 +647,12 @@
+       "P1BF3_SIMPLE_CONFIG ranks=%d variant=%s alphaU=%.6g alphaP=%.6g uRelaxMode=%s rauScale=%.6g rauMode=%s "
+       "simplecBlend=%.6g simplecFloorFraction=%.3e simplecFallback=%s rAU=rauScale/correction_metric simpleRtol=%.3e maxOuter=%" PetscInt_FMT
+       " velocitySolver=processorBlockJacobi+localSGS precision=FP64 uRtol=%.3e uAtol=%.3e uRelDrop=%.3g uOmega=%.3g uLocalSweeps=%" PetscInt_FMT " uCheckEvery=%" PetscInt_FMT
+-      " outerGate=all_initial_residuals_Ux_Uy_Uz_plus_continuity pressureSolver=custom_FP64_PCG_plus_PETSc_PCApply pressureState=native_FP64 pPcRefresh=%" PetscInt_FMT "\n",
++      " outerGate=all_initial_residuals_Ux_Uy_Uz_plus_continuity pressureSolver=%s pressureState=native_FP64 pPcRefresh=%" PetscInt_FMT "\n",
+       size,simpleVariant.c_str(),(double)au,(double)ap,uRelaxMode.c_str(),(double)rauScale,rauMode.c_str(),
+       (double)simplecBlend,(double)simplecFloorFraction,simplecFallback.c_str(),(double)simpleTol,maxOuter,
+-      (double)uTol,(double)uAtol,(double)uRelDrop,(double)uOmega,uLocalSweeps,uCheck,pPreconditionerRefresh));
++      (double)uTol,(double)uAtol,(double)uRelDrop,(double)uOmega,uLocalSweeps,uCheck,
++      pressureSolveMode=="gamg_richardson"?"PETSc_Richardson_plus_GAMG_fullPmat":(gate9iAutoChebyshev?"FP64_Chebyshev_plus_GAMG_compact":(pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES":"custom_FP64_PCG_plus_PETSc_PCApply")),
++      pPreconditionerRefresh));
+     if(simpleVariant=="simplec") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+       "P1BF3_SIMPLEC_CONFIG metric=relaxed_signed_row_sum formula=Dc=(1-blend)*diag(Ar)+blend*(Ar*1) standardBlend=1 "
+       "pressureUnderRelaxation=alphaP userControlled note=alphaP_1_is_typical_SIMPLEC_test positiveGuard=%s floorFraction=%.3e\n",
+@@ -795,7 +804,9 @@
+ 
+           PetscCall(KSPCreate(PETSC_COMM_WORLD,&pksp));
+           PetscCall(KSPSetOperators(pksp,pressureOperator,pressurePmat));
+-          PetscCall(KSPSetType(pksp,pressureSolveMode=="petsc_fgmres" ? KSPFGMRES : KSPCG));
++          if(pressureSolveMode=="petsc_fgmres") PetscCall(KSPSetType(pksp,KSPFGMRES));
++          else if(pressureSolveMode=="gamg_richardson") PetscCall(KSPSetType(pksp,KSPRICHARDSON));
++          else PetscCall(KSPSetType(pksp,KSPCG));
+           PetscCall(KSPGetPC(pksp,&ppc));
+           if(gate9LivePcd) {
+             if(!gate9LivePcdCtx) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9 live PCD context was not constructed");
+@@ -837,6 +848,10 @@
+           PetscCall(PCGetType(ppc,&pPcType));
+           if(pressureSolveMode=="petsc_fgmres" && std::string(pKspType)!=std::string(KSPFGMRES))
+             SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate 1 requires PETSc FGMRES; remove any conflicting -p_ksp_type option");
++          if(pressureSolveMode=="gamg_richardson" && std::string(pKspType)!=std::string(KSPRICHARDSON))
++            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"NodalS fast pressure mode requires PETSc Richardson; remove any conflicting -p_ksp_type option");
++          if(pressureSolveMode=="gamg_richardson" && pPmatMode!="full")
++            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"NodalS fast pressure mode requires -p_pmat full");
+           if(gate9LivePcd && std::string(pPcType)!=std::string(PCSHELL)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 requires live PC type shell; remove conflicting -p_pc_type");
+           if(gate9LivePcd) { PCSide side; PetscCall(KSPGetPCSide(pksp,&side)); if(side!=PC_RIGHT) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 requires right preconditioning"); }
+           PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+@@ -1356,8 +1371,8 @@
+           if(fReason<0) {
+             solveFailed=PETSC_TRUE; pressureFailureReason=(PetscInt)fReason;
+             PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+-              "P1BF3_SOLVE_FAILURE stage=gate1_petsc_fgmres it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+-              it,pits,(int)fReason,(double)fReported));
++              "P1BF3_SOLVE_FAILURE stage=%s it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
++              pressureSolveMode=="gamg_richardson"?"fast_full_gamg_richardson":"gate1_petsc_fgmres",it,pits,(int)fReason,(double)fReported));
+             break;
+           }
+           PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,pressureCorrection));
+@@ -1369,7 +1384,10 @@
+           if(nsp) PetscCall(customPressureProjectConstant(trueR));
+           double trueRn=0.0; PetscCall(customPressureNorm2(trueR,&trueRn));
+           trueRel=trueRn/std::max(prhsNorm,1e-300);
+-          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
++          if(pressureSolveMode=="gamg_richardson") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
++            "NODALS_FAST_GAMG_RICHARDSON it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e trueRel=%.3e rhsNorm=%.3e pmat=full exactOperator=factored_B_rAU_Bt\n",
++            it,pits,(int)fReason,(double)fReported,trueRel,prhsNorm));
++          else PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+             "P1BF3_GATE1_FGMRES it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e trueRel=%.3e rhsNorm=%.3e\n",
+             it,pits,(int)fReason,(double)fReported,trueRel,prhsNorm));
+           if(gate9LivePcd && gate9LivePcdCtx) {

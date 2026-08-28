@@ -1,0 +1,62 @@
+# Generic existing normal-inlet / pressure-0-outlet example.
+# Audit a new mesh's patch normals/areas before assigning inlet and outlet.
+
+[run]
+name = shellSphere82k_normal
+ranks = 16
+output_root = auto
+
+[solver]
+mesh = ~/Desktop/meshes/shellsphere1/82ktet/constant/polyMesh
+problem = flow
+nu = 0.001
+re = 1
+convection = central
+
+[boundary]
+wall_patch = patch_0_0
+wall_type = wall
+inlet_patch = patch_1_0
+inlet_type = normal
+speed = 0.2
+outlet_patch = patch_2_0
+outlet_type = pressure0
+
+[supg]
+enabled = false
+tau_scale = 0.05
+form = implicit
+kernel = fast
+quad_points = 64
+
+[simple]
+variant = simplec
+rtol = 1e-3
+max_iterations = 10000
+alpha_u = 0.7
+alpha_p = 1.0
+
+[momentum]
+rtol = 1e-8
+relative_drop = 0.5
+local_sweeps = 1
+sor_omega = 1
+
+[pressure]
+solver = cheb_gamg
+pmat = compact
+rtol = 0.1
+atol = 1e-12
+refresh = 1
+
+[chebyshev]
+mode = adaptive
+power_iterations = 10
+spectrum_refresh = 100
+lambda_max_safety = 1.2
+lambda_min_fraction = 0.06
+max_steps = 40
+
+[output]
+write_vtu = true
+resource_profile = true
