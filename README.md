@@ -18,8 +18,7 @@ The face-bubble enrichment gives the velocity space additional divergence-coupli
 
 At the algebraic level, the linearized incompressible problem has the familiar form
 
-(A_u B^T)(u) = (f)
-(B   0  )(p)   (0)
+(A_u B^T ; B   0)( u; p) =  (f; 0)
 
 where \(A_u\) is the momentum operator and \(B\) is the discrete divergence operator.
 
