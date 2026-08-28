@@ -9,7 +9,7 @@ The project is an attempt to make practical CFD workflows possible in a finite-e
 The current mixed finite-element pair is inspired from Farrell et al,2019 (https://doi.org/10.1137/18M1219370).
 
 \[
-V_h = [P_1 + BF_3]^3, \qquad Q_h = P_0.
+V_h = [P_1 + BF_3]^3, Q_h = P_0.
 \]
 
 For each tetrahedron, each scalar velocity component contains the four standard continuous linear \(P_1\) vertex basis functions together with four cubic face-bubble \(BF_3\) functions. Pressure is discontinuous piecewise constant \(P_0\), with one pressure degree of freedom per cell.
@@ -18,19 +18,8 @@ The face-bubble enrichment gives the velocity space additional divergence-coupli
 
 At the algebraic level, the linearized incompressible problem has the familiar form
 
-\[
-\begin{bmatrix}
-A_u & B^T \\
-B   & 0
-\end{bmatrix}
-\begin{bmatrix}
-u \\ p
-\end{bmatrix}
-=
-\begin{bmatrix}
-f \\ 0
-\end{bmatrix},
-\]
+(A_u B^T)(u) = (f)
+(B   0  )(p)   (0)
 
 where \(A_u\) is the momentum operator and \(B\) is the discrete divergence operator.
 
