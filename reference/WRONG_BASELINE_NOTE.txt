@@ -1,0 +1,13 @@
+NodalS v1.00 initial modularization accidentally used the wrong historical oracle:
+
+d43884099ceb03b4871bacd50e961eb695d4518825e3910724b186786b67d39c
+
+That source predates/reverts accepted memory optimizations and must not be used as
+the numerical/performance/memory baseline.
+
+The corrected authoritative oracle is FULLFAST-FP64-RICH-SCALE:
+
+0de1a33840d0f36fa84dd7a301bb2073c3dc344cb958defeb0bd7390334d4d01
+
+The active modular fragments are required to concatenate byte-for-byte to the
+correct oracle; tests/check_source_freeze.py enforces this.

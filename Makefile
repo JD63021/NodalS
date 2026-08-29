@@ -30,8 +30,8 @@ nodals_solver: app/nodals_main.o
 	@echo "NODALS_LINK target=$@ PETSC_ARCH=$(PETSC_ARCH) removed=-lnvToolsExt"
 	${CXXLINKER} -o $@ $^ ${NODALS_PETSC_KSP_LIB}
 
-# Same flags, but compiled directly from the byte-frozen monolithic source.
-# Used only for workstation numerical parity regression.
+# Same flags, compiled directly from the authoritative FULLFAST-FP64-RICH-SCALE
+# oracle (SHA256 0de1a338...). Used for workstation parity regression.
 reference/p1bf3_simple_foam_mpi.o: reference/p1bf3_simple_foam_mpi.cpp
 
 nodals_reference_solver: reference/p1bf3_simple_foam_mpi.o

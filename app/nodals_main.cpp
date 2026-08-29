@@ -1,8 +1,8 @@
 // NodalS v1.00
 // Modular NodalS v1.00 solver.
-// The frozen Gate9N baseline remains under reference/.  The active source keeps
-// that numerical implementation and adds the first-class fast full-Pmat
-// PETSc GAMG/Richardson pressure backend alongside the compact low-memory route.
+// The authoritative FULLFAST-FP64-RICH-SCALE oracle remains under reference/.
+// The ordered fragments below reassemble byte-for-byte to SHA256 0de1a338...
+// and therefore preserve the accepted numerical, performance and memory architecture.
 // Fragments intentionally remain one translation unit in v1.00.
 #include "../src/00_core/preamble.inc"
 #include "../src/00_core/mesh_runtime.inc"

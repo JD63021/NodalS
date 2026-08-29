@@ -6,8 +6,12 @@
 #include <cmath>
 #include <chrono>
 #include <climits>
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -22,4 +26,5 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <type_traits>
 

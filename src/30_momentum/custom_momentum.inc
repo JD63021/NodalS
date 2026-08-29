@@ -63,9 +63,10 @@ struct CustomMomentumCSR {
   std::vector<double> exchangeSend,ghostValues;
   std::vector<MPI_Request> exchangeRequests;
 
-  // Final M2B momentum storage: one immutable static diffusion value array plus
-  // one active numeric array. aRel contains the physical operator during direct
-  // assembly and becomes the relaxed operator after finalizeRelaxation().
+  // M1+M2 memory-hygiene storage: only one active numeric CSR array is retained.
+  // kNu remains as an intentionally-empty compatibility field for legacy shadow
+  // diagnostics; static diffusion is re-integrated directly into aRel on every
+  // physical-operator rebuild.  No persistent second nnz-sized FP64 array exists.
   std::vector<double> kNu,aRel;
   // Legacy M1/M2A shadow arrays are kept as empty fields so old diagnostic helpers
   // remain source-compatible; they consume no retained numeric payload in M2B.
@@ -80,13 +81,14 @@ struct CustomMomentumCSR {
   std::vector<double> workB,workX,workY,workBeff;
 };
 
+
 static int customMomentumOwnerOfGid(const std::vector<PetscInt>& off,PetscInt gid) {
   auto it=std::upper_bound(off.begin(),off.end(),gid);
   if(it==off.begin() || (it==off.end() && gid>=off.back())) return -1;
   return (int)((it-off.begin())-1);
 }
 
-static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int rank,const GhostPlan *extraRauGhosts,CustomMomentumCSR& A) {
+static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int rank,CustomMomentumCSR& A) {
   PetscFunctionBeginUser;
   const PetscInt nv=(PetscInt)M.points.size();
   std::vector<PetscInt> off(D.velCount.size()+1,0);
@@ -132,25 +134,6 @@ static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int
   for(PetscInt g:A.colGid) if(g<A.rstart || g>=A.rend) A.ghostGid.push_back(g);
   std::sort(A.ghostGid.begin(),A.ghostGid.end());
   A.ghostGid.erase(std::unique(A.ghostGid.begin(),A.ghostGid.end()),A.ghostGid.end());
-  const std::vector<PetscInt> momentumOnlyGhosts=A.ghostGid;
-  if(extraRauGhosts) {
-    if(extraRauGhosts->rstart!=A.rstart || extraRauGhosts->rend!=A.rend)
-      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"full-Pmat rAU halo ownership mismatch");
-    A.ghostGid.insert(A.ghostGid.end(),extraRauGhosts->ghosts.begin(),extraRauGhosts->ghosts.end());
-  }
-  std::sort(A.ghostGid.begin(),A.ghostGid.end());
-  A.ghostGid.erase(std::unique(A.ghostGid.begin(),A.ghostGid.end()),A.ghostGid.end());
-  if(extraRauGhosts) {
-    PetscInt localExtra=0;
-    for(PetscInt g:extraRauGhosts->ghosts)
-      if(!std::binary_search(momentumOnlyGhosts.begin(),momentumOnlyGhosts.end(),g)) ++localExtra;
-    PetscInt globalExtra=0,globalRauGhosts=0,localRauGhosts=(PetscInt)extraRauGhosts->ghosts.size();
-    PetscCallMPI(MPI_Allreduce(&localExtra,&globalExtra,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
-    PetscCallMPI(MPI_Allreduce(&localRauGhosts,&globalRauGhosts,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "NODALS_FULL_PMAT_RAU_HALO mode=union_custom_momentum_plus_pressure_plan globalPressureGhostRefs=%" PetscInt_FMT " globalExtraGhostRefs=%" PetscInt_FMT " purpose=full_Schur_rAU_update\n",
-      globalRauGhosts,globalExtra));
-  }
 
   const int nr=(int)D.velCount.size();
   A.reqSendCounts.assign((std::size_t)nr,0); A.reqRecvCounts.assign((std::size_t)nr,0);
@@ -186,7 +169,8 @@ static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int
   }
 
   const std::size_t nnz=A.colGid.size();
-  A.kNu.assign(nnz,0.0); A.aRel.assign(nnz,0.0);
+  A.kNu.clear(); A.kNu.shrink_to_fit(); // M2: persistent static K payload eliminated
+  A.aRel.assign(nnz,0.0);
   A.convection.clear(); A.supg.clear(); A.aPhys.clear();
   A.physDiag.assign((std::size_t)A.nOwned,0.0); A.relaxDelta.assign((std::size_t)A.nOwned,0.0);
   A.relaxedDiag.assign((std::size_t)A.nOwned,0.0); A.metric.assign((std::size_t)A.nOwned,0.0);
@@ -214,11 +198,11 @@ static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int
   unsigned long long localBytes=0,globalBytes=0;
   localBytes += (unsigned long long)(A.rowPtr.capacity()+A.colGid.capacity()+A.colLocal.capacity()+A.diagPos.capacity()+A.ghostGid.capacity()+A.reqRecvGid.capacity()+A.reqRecvLocalOffset.capacity())*sizeof(PetscInt);
   localBytes += (unsigned long long)(A.reqSendCounts.capacity()+A.reqSendDispls.capacity()+A.reqRecvCounts.capacity()+A.reqRecvDispls.capacity())*sizeof(int);
-  localBytes += (unsigned long long)(A.exchangeSend.capacity()+A.ghostValues.capacity()+A.kNu.capacity()+A.aRel.capacity()+A.physDiag.capacity()+A.relaxDelta.capacity()+A.relaxedDiag.capacity()+A.metric.capacity()+A.rAU.capacity()+A.workB.capacity()+A.workX.capacity()+A.workY.capacity()+A.workBeff.capacity())*sizeof(double);
+  localBytes += (unsigned long long)(A.exchangeSend.capacity()+A.ghostValues.capacity()+A.aRel.capacity()+A.physDiag.capacity()+A.relaxDelta.capacity()+A.relaxedDiag.capacity()+A.metric.capacity()+A.rAU.capacity()+A.workB.capacity()+A.workX.capacity()+A.workY.capacity()+A.workBeff.capacity())*sizeof(double);
   for(int d=0;d<3;++d) localBytes += (unsigned long long)(A.fieldOwned[d].capacity()+A.fieldGhost[d].capacity()+A.convRhs[d].capacity()+A.supgRhs[d].capacity())*sizeof(double);
   PetscCallMPI(MPI_Allreduce(&localBytes,&globalBytes,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-    "P1BF3_CUSTOM_MOM_MEMORY summedRetainedMiB=%.3f bytesPerGlobalVelDof=%.3f note=M3A_staticK_plus_activeA_direct_static_and_dynamic_no_PETSc_momentum_matrices\n",
+    "P1BF3_CUSTOM_MOM_MEMORY summedRetainedMiB=%.3f bytesPerGlobalVelDof=%.3f note=M1M2_single_activeA_static_diffusion_reintegrated_no_persistent_kNu_no_PETSc_momentum_matrices\n",
     (double)globalBytes/(1024.0*1024.0),D.ns?((double)globalBytes/(double)D.ns):0.0));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -393,7 +377,16 @@ static PetscErrorCode buildCustomPressureBPlan(const Mesh& M,const Discrete& D,i
     for(int a=0;a<8;++a) { const PetscInt g=D.g2free[(std::size_t)ent[a]]; cp.velLocal[a]=(g>=0)?customPeerLocalIndex(P.velocityHalo,g):-1; if(g>=0 && cp.velLocal[a]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A B forward halo missing velocity gid"); }
   }
 
-  P.transposeCells.clear();
+  // A2 memory hygiene: reserve the exact transpose support count.  The old
+  // push_back growth could leave nearly 2x capacity depending on mesh/rank.
+  std::size_t transposeSupportCount=0;
+  for(PetscInt c=0;c<nc;++c) {
+    PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    bool any=false;
+    for(int a=0;a<8;++a) { const PetscInt g=D.g2free[(std::size_t)ent[a]]; if(g>=vStart && g<vEnd) { any=true; break; } }
+    if(any) ++transposeSupportCount;
+  }
+  P.transposeCells.clear(); P.transposeCells.reserve(transposeSupportCount);
   for(PetscInt c=0;c<nc;++c) {
     PetscInt ent[8],gid[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
     CustomPressureTransposeCell cp;
@@ -420,7 +413,7 @@ static PetscErrorCode buildCustomPressureBPlan(const Mesh& M,const Discrete& D,i
   auto haloBytes=[](const CustomPeerHalo& H)->unsigned long long{return (unsigned long long)(H.ghostGid.capacity()+H.reqRecvGid.capacity()+H.reqRecvLocalOffset.capacity())*sizeof(PetscInt)+(unsigned long long)(H.reqSendCounts.capacity()+H.reqSendDispls.capacity()+H.reqRecvCounts.capacity()+H.reqRecvDispls.capacity())*sizeof(int)+(unsigned long long)(H.exchangeSend.capacity()+H.ghostValues.capacity())*sizeof(double);};
   lb+=haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)+(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity())*sizeof(double);
   unsigned long long gb=0; PetscCallMPI(MPI_Allreduce(&lb,&gb,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_PLAN pressureRows=%llu transposeSupportCells=%llu transposeSupportReplication=%.6f retainedMiB=%.3f semantics=custom_FP64_owned_rows_peer_halo\n",gf,gt,M.tets.empty()?0.0:(double)gt/(double)M.tets.size(),(double)gb/(1024.0*1024.0)));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_PLAN pressureRows=%llu transposeSupportCells=%llu transposeSupportReplication=%.6f retainedMiB=%.3f semantics=custom_FP64_owned_rows_peer_halo\n",gf,gt,distributedGlobalCellCount(D)?(double)gt/(double)distributedGlobalCellCount(D):0.0,(double)gb/(1024.0*1024.0)));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -719,7 +712,7 @@ static PetscErrorCode customPressureSchurParity(Mat factored,const Discrete& D,C
   Vec x=nullptr,y=nullptr; PetscCall(VecDuplicate(D.volumes,&x)); PetscCall(VecDuplicate(D.volumes,&y)); PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(x,&s,&e));
   { PetscScalar *a=nullptr; PetscCall(VecGetArray(x,&a)); for(PetscInt i=0;i<e-s;++i){const double g=(double)(s+i+1);a[i]=(PetscScalar)(std::sin(0.001013*g)+0.31*std::cos(0.000617*g));} PetscCall(VecRestoreArray(x,&a)); }
   PetscCall(customVecOwnedRange(x,s,e,P.pOwned)); PetscCall(customPressureSchurApply(P,M,P.pOwned,P.pressureWork)); PetscCall(MatMult(factored,x,y)); CustomPressureParityNorm n; PetscCall(customPressureCompareOwned(P.pressureWork,y,n));
-  const bool ok=n.rel<=tol; PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4A_SCHUR_PARITY SRel=%.3e SMaxAbs=%.3e tol=%.3e arithmetic=custom_FP64_B_rAU_Bt reference=PETSc_FP64_factored status=%s\n",n.rel,n.maxAbs,tol,ok?"PASS":"CHECK"));
+  const bool ok=n.rel<=tol; PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4A_SCHUR_PARITY SRel=%.3e SMaxAbs=%.3e tol=%.3e arithmetic=custom_FP64_B_rAU_Bt reference=PETSc_PetscScalar_factored status=%s\n",n.rel,n.maxAbs,tol,ok?"PASS":"CHECK"));
   PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y)); if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A custom factored Schur parity failed"); PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -734,6 +727,7 @@ static PetscErrorCode customPressureLiveSchurParity(Mat explicitRef,const Discre
 
 static PetscErrorCode customMomentumLoadFromPetsc(Mat M,const CustomMomentumCSR& A,std::vector<double>& vals) {
   PetscFunctionBeginUser;
+  if(A.colGid.empty() && A.rowPtr.back()>0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M1 colGid was released after setup; PETSc matrix-value shadow loading is setup-only");
   if(vals.size()!=A.colGid.size()) vals.assign(A.colGid.size(),0.0); else std::fill(vals.begin(),vals.end(),0.0);
   for(PetscInt i=0;i<A.nOwned;++i) {
     const PetscInt row=A.rstart+i; PetscInt ncols=0; const PetscInt *cols=nullptr; const PetscScalar *mv=nullptr;
@@ -804,9 +798,17 @@ static inline double customMomentumFieldValue(const CustomMomentumCSR& A,int d,P
   return (li<A.nOwned)?A.fieldOwned[d][(std::size_t)li]:A.fieldGhost[d][(std::size_t)(li-A.nOwned)];
 }
 
-static PetscErrorCode customMomentumResetPhysical(CustomMomentumCSR& A) {
+struct CustomDynamicAssemblyPlan;
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale);
+
+static PetscErrorCode customMomentumResetPhysical(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double nu,PetscBool legacyReference) {
   PetscFunctionBeginUser;
-  A.aRel=A.kNu;
+  // Gate-only legacy reference retains cached nu*K. Production M2 rebuilds nu*K
+  // directly into the sole active CSR values from the compact reference tensor.
+  if(legacyReference) {
+    if(A.kNu.size()!=A.aRel.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 legacy reference missing cached kNu");
+    A.aRel=A.kNu;
+  } else PetscCall(assembleStaticDiffusionCustom(P,A,nu));
   for(int d=0;d<3;++d) { std::fill(A.convRhs[d].begin(),A.convRhs[d].end(),0.0); std::fill(A.supgRhs[d].begin(),A.supgRhs[d].end(),0.0); }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -848,7 +850,7 @@ static PetscErrorCode customMomentumFinalizeRelaxation(CustomMomentumCSR& A,
 
 static PetscErrorCode customMomentumMatVec(CustomMomentumCSR& A,const std::vector<double>& vals,const std::vector<double>& xOwned,std::vector<double>& yOwned) {
   PetscFunctionBeginUser;
-  if(vals.size()!=A.colGid.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum matrix value size mismatch");
+  if(vals.size()!=(std::size_t)A.rowPtr.back()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum matrix value size mismatch");
   PetscCall(customMomentumExchange(A,xOwned));
   if((PetscInt)yOwned.size()!=A.nOwned) yOwned.resize((std::size_t)A.nOwned);
   std::fill(yOwned.begin(),yOwned.end(),0.0);
@@ -868,6 +870,7 @@ static PetscErrorCode customMomentumDerive(CustomMomentumCSR& A,bool centralConv
   const std::string& uRelaxMode,double alphaU,const std::string& simpleVariant,const std::string& rauMode,
   double simplecBlend,double floorFraction,const std::string& fallback,double rauScale) {
   PetscFunctionBeginUser;
+  if(A.kNu.size()!=A.aRel.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"legacy custom momentum shadow derive requires persistent kNu and is disabled in M1+M2 production branch");
   const double relaxFactor=1.0/alphaU-1.0;
   for(std::size_t k=0;k<A.aPhys.size();++k)
     A.aPhys[k]=A.kNu[k]+(centralConvection?A.convection[k]:0.0)+(implicitSupg?A.supg[k]:0.0);

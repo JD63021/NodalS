@@ -187,20 +187,56 @@ struct Discrete {
   std::vector<int> cellOwner;
   std::vector<PetscInt> velCount, cellCount;
   std::vector<char> fixedEntity;
-  std::array<std::vector<double>,3> dirValue;
+  // A2 memory hygiene: fixed Dirichlet values are stored only for fixed entities.
+  // g2free uses -1 for an as-yet-unassigned free entity during boundary setup and
+  // -(slot+2) for a fixed entity; after ownership, free entities receive gid>=0.
+  // This removes three dense FP64 arrays over all velocity entities without adding
+  // another global entity->slot map.
+  std::vector<std::array<double,3>> fixedDirValue;
   PetscInt ns=0, freeVertices=0, freeFaces=0, fixedVertices=0, fixedFaces=0;
 };
+
+static PetscInt distributedGlobalCellCount(const Discrete& D) {
+  return std::accumulate(D.cellCount.begin(),D.cellCount.end(),(PetscInt)0);
+}
+static PetscInt distributedGlobalVelCount(const Discrete& D) { return D.ns; }
+
+static inline PetscInt fixedDirSlotFromEncodedGid(PetscInt g) { return -g-2; }
+
+static double entityDirValue(const Discrete& D,int d,PetscInt entity) {
+  const PetscInt g=D.g2free[(std::size_t)entity];
+  if(g>=0) throw std::runtime_error("entityDirValue called on free entity");
+  const PetscInt slot=fixedDirSlotFromEncodedGid(g);
+  if(slot<0 || slot>=(PetscInt)D.fixedDirValue.size()) throw std::runtime_error("invalid compact Dirichlet slot");
+  return D.fixedDirValue[(std::size_t)slot][(std::size_t)d];
+}
+
+static void setEntityDirValue(Discrete& D,int d,PetscInt entity,double value) {
+  const PetscInt g=D.g2free[(std::size_t)entity];
+  const PetscInt slot=fixedDirSlotFromEncodedGid(g);
+  if(slot<0 || slot>=(PetscInt)D.fixedDirValue.size()) throw std::runtime_error("invalid compact Dirichlet slot in setter");
+  D.fixedDirValue[(std::size_t)slot][(std::size_t)d]=value;
+}
+
+static void finalizeCompactDirichletSlots(Discrete& D) {
+  D.g2free.assign(D.fixedEntity.size(),-1);
+  PetscInt nfixed=0;
+  for(char f:D.fixedEntity) if(f) ++nfixed;
+  D.fixedDirValue.assign((std::size_t)nfixed,std::array<double,3>{0.0,0.0,0.0});
+  PetscInt slot=0;
+  for(std::size_t e=0;e<D.fixedEntity.size();++e) if(D.fixedEntity[e]) D.g2free[e]=-(slot++ + 2);
+}
 
 static void prepareBoundaryData(const Mesh& M,const ProblemConfig& P,Discrete& D) {
   const PetscInt nv=(PetscInt)M.points.size(), nf=(PetscInt)M.faces.size(), ni=(PetscInt)M.neighbour.size();
   D.fixedEntity.assign(nv+nf,0);
-  for(int d=0;d<3;++d) D.dirValue[d].assign(nv+nf,0.0);
 
   if(P.mode==ProblemMode::MMS) {
     for(PetscInt f=ni;f<nf;++f) {
       D.fixedEntity[nv+f]=1;
       for(int v:M.faces[f].v) D.fixedEntity[v]=1;
     }
+    finalizeCompactDirichletSlots(D);
     return;
   }
 
@@ -212,13 +248,17 @@ static void prepareBoundaryData(const Mesh& M,const ProblemConfig& P,Discrete& D
     if(isWallPatch(B,pi)) for(int v:M.faces[f].v) onWall[v]=1;
     if(pi==B.inlet) for(int v:M.faces[f].v) onInlet[v]=1;
   }
+  for(PetscInt v=0;v<nv;++v) if(onWall[v] || onInlet[v]) D.fixedEntity[v]=1;
+
+  // Allocate compact slots only after the complete fixed-entity mask is known.
+  finalizeCompactDirichletSlots(D);
+
   for(PetscInt v=0;v<nv;++v) {
-    if(onWall[v] || onInlet[v]) D.fixedEntity[v]=1;
     // Preserve the existing wall-priority convention at inlet/wall edge vertices.
     // BF3 below restores the requested inlet face mean exactly despite that corner incompatibility.
     if(onInlet[v] && !onWall[v]) {
-      if(P.inletBC==InletBCMode::PipeParabolic) D.dirValue[2][v]=pipeBoundaryUz(P.pipe,M.points[v].x,M.points[v].y);
-      else { D.dirValue[0][v]=B.inletVelocity.x; D.dirValue[1][v]=B.inletVelocity.y; D.dirValue[2][v]=B.inletVelocity.z; }
+      if(P.inletBC==InletBCMode::PipeParabolic) setEntityDirValue(D,2,v,pipeBoundaryUz(P.pipe,M.points[v].x,M.points[v].y));
+      else { setEntityDirValue(D,0,v,B.inletVelocity.x); setEntityDirValue(D,1,v,B.inletVelocity.y); setEntityDirValue(D,2,v,B.inletVelocity.z); }
     }
   }
 
@@ -235,14 +275,10 @@ static void prepareBoundaryData(const Mesh& M,const ProblemConfig& P,Discrete& D
       exactMean[2]=P.pipe.profileScale*triangleAverageIdealPipeUz(P.pipe,X);
     } else { exactMean[0]=B.inletVelocity.x; exactMean[1]=B.inletVelocity.y; exactMean[2]=B.inletVelocity.z; }
     for(int d=0;d<3;++d) {
-      const double vertexMean=(D.dirValue[d][F.v[0]]+D.dirValue[d][F.v[1]]+D.dirValue[d][F.v[2]])/3.0;
-      D.dirValue[d][nv+f]=(20.0/9.0)*(exactMean[d]-vertexMean);
+      const double vertexMean=(entityDirValue(D,d,F.v[0])+entityDirValue(D,d,F.v[1])+entityDirValue(D,d,F.v[2]))/3.0;
+      setEntityDirValue(D,d,nv+f,(20.0/9.0)*(exactMean[d]-vertexMean));
     }
   }
-}
-
-static double entityDirValue(const Discrete& D,int d,PetscInt entity) {
-  return D.dirValue[d][entity];
 }
 
 
@@ -266,6 +302,27 @@ static const CentralTensor& centralTensor() {
           for(int b=0;b<8;++b)
             for(int j=0;j<3;++j)
               out.t[a][m][b][j] += val[a]*val[m]*gr[b][j]*q.w;
+    }
+    return out;
+  }();
+  return T;
+}
+
+struct DiffusionTensor {
+  double t[8][8][3][3] = {};
+};
+
+static const DiffusionTensor& diffusionTensor() {
+  static const DiffusionTensor T = []() {
+    DiffusionTensor out;
+    // Reference contraction for int grad(phi_a).grad(phi_b) dV.  Build once
+    // with the same exact collapsed 5^3 rule used by the accepted static K.
+    const auto Q=tetDuffy5();
+    for(const auto& q:Q) {
+      double val[8],gr[8][3]; basis(q.lam,val,gr);
+      for(int a=0;a<8;++a) for(int b=0;b<8;++b)
+        for(int j=0;j<3;++j) for(int k=0;k<3;++k)
+          out.t[a][b][j][k] += gr[a][j]*gr[b][k]*q.w;
     }
     return out;
   }();

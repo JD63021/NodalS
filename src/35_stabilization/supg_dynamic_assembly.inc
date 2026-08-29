@@ -428,7 +428,18 @@ static PetscErrorCode buildCustomDynamicAssemblyPlan(const Mesh& M,const Discret
     basis(Q[q].lam,P.ref[q].phi,P.ref[q].gradRef); referenceHessian(Q[q].lam,P.ref[q].hessRef);
     wsum+=Q[q].w; wabs+=std::abs(Q[q].w); wmin=std::min(wmin,Q[q].w); wmax=std::max(wmax,Q[q].w);
   }
-  P.cells.clear();
+  // A2 memory hygiene: exact two-pass reserve for distributed row-support cells.
+  // This avoids geometric vector-capacity jumps (e.g. ~2x retained capacity)
+  // without changing which cells are included in the plan.
+  std::size_t rowSupportCount=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    const auto t=M.tets[(std::size_t)c];
+    bool any=false;
+    for(int i=0;i<4 && !any;++i) { const PetscInt g=D.g2free[(std::size_t)t[i]]; if(g>=A.rstart && g<A.rend) any=true; }
+    for(int i=0;i<4 && !any;++i) { const PetscInt g=D.g2free[(std::size_t)(nv+M.oppFace[(std::size_t)c][i])]; if(g>=A.rstart && g<A.rend) any=true; }
+    if(any) ++rowSupportCount;
+  }
+  P.cells.clear(); P.cells.reserve(rowSupportCount);
   // Row-support halo: include a tet on this rank iff at least one of its free
   // scalar velocity rows is owned here. Each global row is therefore assembled
   // exactly once, while partition-boundary cells may be evaluated by two ranks.
@@ -487,24 +498,166 @@ static PetscErrorCode buildCustomDynamicAssemblyPlan(const Mesh& M,const Discret
   PetscCallMPI(MPI_Allreduce(&lrows,&grows,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
     "P1BF3_M3A_DYNAMIC_PLAN summedRowSupportCells=%llu globalCells=%zu supportReplication=%.6f ownedRowIncidences=%llu quadraturePoints=%" PetscInt_FMT " matrixAssembly=direct_custom_owned_rows no_offrank_insertion=1 weightSum=%.16e weightAbsSum=%.16e weightRange=[%.6e,%.6e]\n",
-    gc,M.tets.size(),M.tets.empty()?0.0:(double)gc/(double)M.tets.size(),grows,P.nQ,wsum,wabs,wmin,wmax));
+    gc,(std::size_t)distributedGlobalCellCount(D),distributedGlobalCellCount(D)?(double)gc/(double)distributedGlobalCellCount(D):0.0,grows,P.nQ,wsum,wabs,wmin,wmax));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
-static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A) {
+
+// -----------------------------------------------------------------------------
+// PLAN-C1 compact live dynamic assembly plan.
+// The full CustomDynamicCellPlan is useful during setup, but several fields are
+// redundant once static RHS/topology construction is complete.  Keep only the
+// data required by repeated diffusion/convection/SUPG assembly.
+// ref[a] >= 0 : custom momentum local index for a free velocity entity.
+// ref[a] <  0 : encoded fixed entity id as -(entity+1).
+// For an owned basis, ref[a] is exactly the owned local row index.
+// -----------------------------------------------------------------------------
+struct CustomDynamicRuntimeCellPlan {
+  PetscInt ref[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  std::uint8_t ownedBasis[8]={0,0,0,0,0,0,0,0};
+  std::uint8_t nOwnedRows=0;
+  std::uint8_t rowSlot[8][8]={{0}};
+  double det=0.0,invJ[3][3]={{0}},h2=0.0;
+};
+struct CustomDynamicRuntimePlan {
+  std::vector<CustomDynamicRuntimeCellPlan> cells;
+  PetscInt nQ=0;
+  std::vector<SupgReferencePoint> ref;
+  std::vector<double> forcing;
+  PetscBool forcingZero=PETSC_TRUE;
+  double nu=0.0;
+};
+static inline PetscBool dynRefFree(PetscInt r){ return r>=0 ? PETSC_TRUE:PETSC_FALSE; }
+static inline PetscInt dynFixedEntity(PetscInt r){ return -r-1; }
+static inline void dynGradLambdaFromInvJ(const double invJ[3][3],double g[4][3]) {
+  for(int d=0;d<3;++d) {
+    g[1][d]=invJ[0][d]; g[2][d]=invJ[1][d]; g[3][d]=invJ[2][d];
+    g[0][d]=-(g[1][d]+g[2][d]+g[3][d]);
+  }
+}
+static PetscErrorCode compactCustomDynamicPlan(CustomDynamicAssemblyPlan& P,CustomDynamicRuntimePlan& R) {
   PetscFunctionBeginUser;
-  std::fill(A.kNu.begin(),A.kNu.end(),0.0);
-  // The old FE startup used the collapsed 5^3 rule for non-MMS flow.  Degree 4
-  // is sufficient for all P1+BF3 diffusion products on affine tetrahedra, so
-  // this is an exact one-time construction of the same scalar K topology.
+  R.cells.clear(); R.cells.reserve(P.cells.size());
+  for(const auto& cp:P.cells) {
+    CustomDynamicRuntimeCellPlan rp;
+    for(int a=0;a<8;++a) {
+      rp.ref[a]=(cp.gid[a]>=0)?cp.localIndex[a]:-(cp.entity[a]+1);
+      rp.ownedBasis[a]=(std::uint8_t)cp.ownedBasis[a];
+      for(int b=0;b<8;++b) rp.rowSlot[a][b]=cp.rowSlot[a][b];
+    }
+    rp.nOwnedRows=(std::uint8_t)cp.nOwnedRows; rp.det=cp.det; rp.h2=cp.h2;
+    for(int j=0;j<3;++j) for(int d=0;d<3;++d) rp.invJ[j][d]=cp.invJ[j][d];
+    R.cells.push_back(rp);
+  }
+  R.nQ=P.nQ; R.ref=std::move(P.ref); R.forcing=std::move(P.forcing);
+  R.forcingZero=P.forcingZero; R.nu=P.nu;
+  const unsigned long long oldLocal=(unsigned long long)P.cells.capacity()*sizeof(CustomDynamicCellPlan);
+  const unsigned long long newLocal=(unsigned long long)R.cells.capacity()*sizeof(CustomDynamicRuntimeCellPlan);
+  unsigned long long oldGlobal=0,newGlobal=0;
+  PetscCallMPI(MPI_Allreduce(&oldLocal,&oldGlobal,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&newLocal,&newGlobal,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  std::vector<CustomDynamicCellPlan>().swap(P.cells);
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DYNPLAN_COMPACT fullCellBytes=%zu compactCellBytes=%zu oldCellMiB=%.3f compactCellMiB=%.3f savedCellMiB=%.3f ratio=%.6f status=PASS\n",
+    sizeof(CustomDynamicCellPlan),sizeof(CustomDynamicRuntimeCellPlan),(double)oldGlobal/(1024.0*1024.0),(double)newGlobal/(1024.0*1024.0),(double)(oldGlobal-newGlobal)/(1024.0*1024.0),oldGlobal?(double)newGlobal/(double)oldGlobal:0.0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
+  const auto& R=diffusionTensor();
+  for(const auto& cp:P.cells) {
+    double metric[3][3]={{0}};
+    for(int j=0;j<3;++j) for(int k=0;k<3;++k) for(int d=0;d<3;++d) metric[j][k]+=cp.invJ[j][d]*cp.invJ[k][d];
+    double Kl[8][8]={{0}};
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) { double v=0.0; for(int j=0;j<3;++j) for(int k=0;k<3;++k) v+=R.t[a][b][j][k]*metric[j][k]; Kl[a][b]=scale*cp.det*v; }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a];
+      for(int b=0;b<8;++b) if(dynRefFree(cp.ref[b])) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact static diffusion missing row slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kl[a][b]; }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customMomentumResetPhysical(const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double nu,PetscBool) {
+  PetscFunctionBeginUser; PetscCall(assembleStaticDiffusionCustom(P,A,nu)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode assembleCentralConvectionCustom(const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A) {
+  PetscFunctionBeginUser;
+  const auto& T=centralTensor(); for(auto& r:A.convRhs) std::fill(r.begin(),r.end(),0.0);
+  for(const auto& cp:P.cells) {
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) { if(dynRefFree(cp.ref[m])) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]); else { const PetscInt e=dynFixedEntity(cp.ref[m]); for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e); } }
+    double uref[8][3]={{0}}; for(int m=0;m<8;++m) for(int j=0;j<3;++j) for(int d=0;d<3;++d) uref[m][j]+=coeff[d][m]*cp.invJ[j][d];
+    double Cl[8][8]={{0}}; for(int a=0;a<8;++a) for(int b=0;b<8;++b) { double v=0.0; for(int m=0;m<8;++m) for(int j=0;j<3;++j) v+=uref[m][j]*T.t[a][m][b][j]; Cl[a][b]=cp.det*v; }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) { const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a]; for(int b=0;b<8;++b) { if(dynRefFree(cp.ref[b])) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact central missing row slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Cl[a][b]; } else { const PetscInt e=dynFixedEntity(cp.ref[b]); for(int d=0;d<3;++d) A.convRhs[d][(std::size_t)lr]-=Cl[a][b]*entityDirValue(D,d,e); } } }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode assembleSupgCustom(const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double tauScale,double supgMagic,const std::string& form,SupgStats& stats) {
+  PetscFunctionBeginUser;
+  const bool implicit=(form=="implicit"); if(!implicit && form!="explicit") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"SUPG form must be implicit or explicit");
+  for(auto& r:A.supgRhs) std::fill(r.begin(),r.end(),0.0); double localTauMin=1e300,localTauMax=0.0,localTauWeighted=0.0,localWeight=0.0;
+  for(std::size_t ic=0;ic<P.cells.size();++ic) {
+    const auto& cp=P.cells[ic]; double gradLambda[4][3]; dynGradLambdaFromInvJ(cp.invJ,gradLambda);
+    double coeff[3][8]={{0}}; for(int m=0;m<8;++m) { if(dynRefFree(cp.ref[m])) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]); else { const PetscInt e=dynFixedEntity(cp.ref[m]); for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e); } }
+    double Sl[8][8]={{0}},Vr[3][8]={{0}},gradLambdaDot[4][4]={{0}}; for(int i=0;i<4;++i) for(int j=i;j<4;++j){double v=0;for(int d=0;d<3;++d)v+=gradLambda[i][d]*gradLambda[j][d];gradLambdaDot[i][j]=gradLambdaDot[j][i]=v;}
+    for(PetscInt q=0;q<P.nQ;++q) {
+      const auto& rq=P.ref[(std::size_t)q]; const std::size_t iq=(ic*(std::size_t)P.nQ+(std::size_t)q)*3; double adv[3]={0,0,0}; for(int d=0;d<3;++d) for(int m=0;m<8;++m) adv[d]+=coeff[d][m]*rq.phi[m]; const double speed2=adv[0]*adv[0]+adv[1]*adv[1]+adv[2]*adv[2];
+      double gradBasis[8][3]={{0}},stream[8]={0},strongTrial[8]={0}; for(int a=0;a<4;++a) for(int d=0;d<3;++d) gradBasis[a][d]=gradLambda[a][d];
+      for(int i=0;i<4;++i){int js[3],kk=0;for(int j=0;j<4;++j)if(j!=i)js[kk++]=j;for(int d=0;d<3;++d)gradBasis[4+i][d]=27.0*(rq.lam[js[1]]*rq.lam[js[2]]*gradLambda[js[0]][d]+rq.lam[js[0]]*rq.lam[js[2]]*gradLambda[js[1]][d]+rq.lam[js[0]]*rq.lam[js[1]]*gradLambda[js[2]][d]);}
+      for(int a=0;a<8;++a)stream[a]=adv[0]*gradBasis[a][0]+adv[1]*gradBasis[a][1]+adv[2]*gradBasis[a][2]; for(int a=0;a<4;++a)strongTrial[a]=stream[a];
+      for(int i=0;i<4;++i){int js[3],kk=0;for(int j=0;j<4;++j)if(j!=i)js[kk++]=j;const double lap=54.0*(rq.lam[js[2]]*gradLambdaDot[js[0]][js[1]]+rq.lam[js[1]]*gradLambdaDot[js[0]][js[2]]+rq.lam[js[0]]*gradLambdaDot[js[1]][js[2]]);strongTrial[4+i]=-P.nu*lap+stream[4+i];}
+      const double diff=4.0*P.nu/cp.h2,den=std::max(4.0*speed2/cp.h2+supgMagic*diff*diff,1e-30),tau=tauScale/std::sqrt(den),w=tau*rq.w*cp.det,volumeW=rq.w*cp.det; localTauMin=std::min(localTauMin,tau);localTauMax=std::max(localTauMax,tau);localTauWeighted+=tau*volumeW;localWeight+=volumeW;
+      if(implicit){for(int a=0;a<8;++a){const double ta=w*stream[a];for(int b=0;b<8;++b)Sl[a][b]+=ta*strongTrial[b];if(!P.forcingZero)for(int d=0;d<3;++d)Vr[d][a]+=ta*P.forcing[iq+d];}}
+      else {double sr[3]={0,0,0};for(int d=0;d<3;++d){for(int b=0;b<8;++b)sr[d]+=coeff[d][b]*strongTrial[b];if(!P.forcingZero)sr[d]-=P.forcing[iq+d];}for(int a=0;a<8;++a){const double ta=-w*stream[a];for(int d=0;d<3;++d)Vr[d][a]+=ta*sr[d];}}
+    }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii){const int a=(int)cp.ownedBasis[ii];const PetscInt lr=cp.ref[a];if(implicit){for(int b=0;b<8;++b){if(dynRefFree(cp.ref[b])){const std::uint8_t slot=cp.rowSlot[a][b];if(slot==255)SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact SUPG missing row slot");A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Sl[a][b];}else{const PetscInt e=dynFixedEntity(cp.ref[b]);for(int d=0;d<3;++d)A.supgRhs[d][(std::size_t)lr]-=Sl[a][b]*entityDirValue(D,d,e);}}}for(int d=0;d<3;++d)A.supgRhs[d][(std::size_t)lr]+=Vr[d][a];}
+  }
+  double globalMin=0,globalMax=0,globalTW=0,globalW=0; PetscCallMPI(MPI_Allreduce(&localTauMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localTauMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localTauWeighted,&globalTW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localWeight,&globalW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));stats.tauMin=globalMin;stats.tauMax=globalMax;stats.tauMean=globalW?globalTW/globalW:0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
+  const auto& R=diffusionTensor();
+  for(const auto& cp:P.cells) {
+    double metric[3][3]={{0}};
+    for(int j=0;j<3;++j) for(int k=0;k<3;++k)
+      for(int d=0;d<3;++d) metric[j][k]+=cp.invJ[j][d]*cp.invJ[k][d];
+    double Kl[8][8]={{0}};
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
+      double v=0.0;
+      for(int j=0;j<3;++j) for(int k=0;k<3;++k) v+=R.t[a][b][j][k]*metric[j][k];
+      Kl[a][b]=scale*cp.det*v;
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii];
+      const PetscInt lr=cp.gid[a]-A.rstart;
+      for(int b=0;b<8;++b) if(cp.gid[b]>=0) {
+        const std::uint8_t slot=cp.rowSlot[a][b];
+        if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 static diffusion missing precomputed CSR slot");
+        A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kl[a][b];
+      }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustomLegacyQuadrature(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
   const auto Q=tetDuffy5();
   for(const auto& cp:P.cells) {
     double Kl[8][8]={{0}};
     for(const auto& q:Q) {
       double val[8],grr[8][3],gr[8][3]; basis(q.lam,val,grr);
       for(int a=0;a<8;++a) for(int d=0;d<3;++d) {
-        gr[a][d]=0.0;
-        for(int j=0;j<3;++j) gr[a][d]+=grr[a][j]*cp.invJ[j][d];
+        gr[a][d]=0.0; for(int j=0;j<3;++j) gr[a][d]+=grr[a][j]*cp.invJ[j][d];
       }
       const double w=q.w*cp.det;
       for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
@@ -513,12 +666,11 @@ static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyP
       }
     }
     for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
-      const int a=(int)cp.ownedBasis[ii];
-      const PetscInt lr=cp.gid[a]-A.rstart;
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.gid[a]-A.rstart;
       for(int b=0;b<8;++b) if(cp.gid[b]>=0) {
         const std::uint8_t slot=cp.rowSlot[a][b];
-        if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A static diffusion missing precomputed CSR slot");
-        A.kNu[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kl[a][b];
+        if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 legacy static diffusion missing precomputed CSR slot");
+        A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=scale*Kl[a][b];
       }
     }
   }
@@ -546,6 +698,7 @@ static PetscErrorCode assembleStaticMomentumRhsNative(const Mesh& M,const Discre
 
 static PetscErrorCode customMomentumAddEntry(CustomMomentumCSR& A,PetscInt rowGid,PetscInt colGid,double v) {
   PetscFunctionBeginUser;
+  if(A.colGid.empty() && A.rowPtr.back()>0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M1 colGid released; use precomputed dynamic rowSlot for live assembly");
   if(rowGid<A.rstart || rowGid>=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"M3A attempted non-owned row insertion");
   const PetscInt i=rowGid-A.rstart,b=A.rowPtr[(std::size_t)i],e=A.rowPtr[(std::size_t)i+1];
   auto it=std::lower_bound(A.colGid.begin()+b,A.colGid.begin()+e,colGid);
