@@ -2,7 +2,7 @@ namespace {
 constexpr double PI = 3.141592653589793238462643383279502884;
 
 struct Vec3 { double x=0, y=0, z=0; };
-struct Face { std::vector<int> v; };
+struct Face { std::array<int,3> v{}; };
 struct Patch { std::string name; PetscInt startFace=0,nFaces=0; };
 struct Mesh {
   std::vector<Vec3> points;
@@ -16,11 +16,81 @@ struct Mesh {
 
 static std::vector<Vec3> cellCentroids(const Mesh& M);
 
-static std::string readFile(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error("cannot open " + path);
-  std::ostringstream ss; ss << in.rdbuf(); return ss.str();
+static bool parseIntegerToken(const std::string& tok,long long& value) {
+  if(tok.empty()) return false;
+  char *end=nullptr;
+  errno=0;
+  const long long v=std::strtoll(tok.c_str(),&end,10);
+  if(errno!=0 || !end || *end!='\0') return false;
+  value=v;
+  return true;
 }
+
+class FoamTokenStream {
+public:
+  explicit FoamTokenStream(const std::string& p):in_(p),path_(p) {
+    if(!in_) throw std::runtime_error("cannot open " + path_);
+  }
+
+  std::string next() {
+    char c=0;
+    while(in_.get(c)) {
+      if(std::isspace(static_cast<unsigned char>(c))) continue;
+      if(c=='/') {
+        const int q=in_.peek();
+        if(q=='/') { in_.get(); skipLineComment(); continue; }
+        if(q=='*') { in_.get(); skipBlockComment(); continue; }
+      }
+      if(c=='(' || c==')' || c=='{' || c=='}' || c==';') return std::string(1,c);
+      if(c=='\"') return readQuoted();
+
+      std::string tok(1,c);
+      while(true) {
+        const int q=in_.peek();
+        if(q==EOF) break;
+        const char d=static_cast<char>(q);
+        if(std::isspace(static_cast<unsigned char>(d)) || d=='(' || d==')' || d=='{' || d=='}' || d==';') break;
+        if(d=='/') {
+          // A slash beginning a comment terminates the current token. Plain slashes are
+          // retained so quoted/unquoted paths remain harmless if encountered in headers.
+          in_.get();
+          const int r=in_.peek();
+          in_.unget();
+          if(r=='/' || r=='*') break;
+        }
+        in_.get(); tok.push_back(d);
+      }
+      return tok;
+    }
+    return {};
+  }
+
+  const std::string& path() const { return path_; }
+
+private:
+  std::ifstream in_;
+  std::string path_;
+
+  void skipLineComment() {
+    char c=0; while(in_.get(c)) if(c=='\n' || c=='\r') break;
+  }
+  void skipBlockComment() {
+    char prev=0,c=0;
+    while(in_.get(c)) { if(prev=='*' && c=='/') return; prev=c; }
+    throw std::runtime_error("unterminated block comment in " + path_);
+  }
+  std::string readQuoted() {
+    std::string out; char c=0;
+    while(in_.get(c)) {
+      if(c=='\\') {
+        char d=0; if(!in_.get(d)) break; out.push_back(d); continue;
+      }
+      if(c=='\"') return out;
+      out.push_back(c);
+    }
+    throw std::runtime_error("unterminated quoted string in " + path_);
+  }
+};
 
 
 struct ProcessMemoryKiB { long long rss=0, hwm=0; };
@@ -81,81 +151,115 @@ static PetscErrorCode printResourceMark(const char *label, PetscInt cells,
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
-static std::string stripComments(std::string s) {
-  s = std::regex_replace(s, std::regex(R"(/\*[\s\S]*?\*/)"), "");
-  s = std::regex_replace(s, std::regex(R"(//[^\n\r]*)"), "");
-  return s;
+static void expectFoamToken(FoamTokenStream& ts,const char *want) {
+  const std::string got=ts.next();
+  if(got!=want) throw std::runtime_error("expected token '"+std::string(want)+"' but got '"+got+"' in "+ts.path());
 }
 
-struct ListBody { int n=0; std::string body; };
-static ListBody extractListBody(const std::string& path) {
-  std::string s = stripComments(readFile(path));
-  size_t foam = s.find("FoamFile");
-  size_t afterHeader = 0;
-  if (foam != std::string::npos) {
-    size_t lb = s.find('{', foam);
-    if (lb == std::string::npos) throw std::runtime_error("bad FoamFile header in " + path);
-    int depth=1; size_t i=lb+1;
-    for (; i<s.size() && depth; ++i) { if (s[i]=='{') ++depth; else if (s[i]=='}') --depth; }
-    if (depth) throw std::runtime_error("unterminated FoamFile header in " + path);
-    afterHeader = i;
+static long long requireIntegerToken(FoamTokenStream& ts,const std::string& tok,const char *what) {
+  long long v=0;
+  if(!parseIntegerToken(tok,v)) throw std::runtime_error("invalid "+std::string(what)+" token '"+tok+"' in "+ts.path());
+  return v;
+}
+
+static double requireDoubleToken(FoamTokenStream& ts,const std::string& tok,const char *what) {
+  if(tok.empty()) throw std::runtime_error("missing "+std::string(what)+" in "+ts.path());
+  char *end=nullptr; errno=0;
+  const double v=std::strtod(tok.c_str(),&end);
+  if(errno!=0 || !end || *end!='\0') throw std::runtime_error("invalid "+std::string(what)+" token '"+tok+"' in "+ts.path());
+  return v;
+}
+
+static int seekFoamListStart(FoamTokenStream& ts) {
+  // polyMesh files have a FoamFile dictionary followed by: <count> ( ... ).
+  // Scan tokens rather than materializing/regex-rewriting the complete file.
+  for(std::string tok=ts.next(); !tok.empty(); tok=ts.next()) {
+    long long n=0;
+    if(!parseIntegerToken(tok,n) || n<0 || n>INT_MAX) continue;
+    const std::string next=ts.next();
+    if(next=="(") return static_cast<int>(n);
   }
-  std::string tail = s.substr(afterHeader);
-  std::smatch m;
-  std::regex re(R"((\d+)\s*\()") ;
-  if (!std::regex_search(tail,m,re)) throw std::runtime_error("cannot find OpenFOAM list count in " + path);
-  int n = std::stoi(m[1].str());
-  size_t openPos = afterHeader + (size_t)m.position(0) + (size_t)m.length(0) - 1;
-  int depth=1; size_t i=openPos+1;
-  for (; i<s.size() && depth; ++i) { if (s[i]=='(') ++depth; else if (s[i]==')') --depth; }
-  if (depth) throw std::runtime_error("unterminated OpenFOAM list in " + path);
-  return {n, s.substr(openPos+1, (i-1)-(openPos+1))};
+  throw std::runtime_error("cannot find OpenFOAM list count in " + ts.path());
 }
 
 static std::vector<Vec3> readPoints(const std::string& path) {
-  auto L=extractListBody(path); std::vector<Vec3> p; p.reserve(L.n);
-  std::regex re(R"(\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\))");
-  for (auto it=std::sregex_iterator(L.body.begin(),L.body.end(),re); it!=std::sregex_iterator(); ++it) {
-    p.push_back({std::stod((*it)[1].str()),std::stod((*it)[2].str()),std::stod((*it)[3].str())});
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Vec3> p; p.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    expectFoamToken(ts,"(");
+    const double x=requireDoubleToken(ts,ts.next(),"point x");
+    const double y=requireDoubleToken(ts,ts.next(),"point y");
+    const double z=requireDoubleToken(ts,ts.next(),"point z");
+    expectFoamToken(ts,")");
+    p.push_back({x,y,z});
   }
-  if ((int)p.size()!=L.n) throw std::runtime_error("point count mismatch in " + path);
+  expectFoamToken(ts,")");
   return p;
 }
 
 static std::vector<Face> readFaces(const std::string& path) {
-  auto L=extractListBody(path); std::vector<Face> F; F.reserve(L.n);
-  std::regex re(R"((\d+)\s*\(([^()]*)\))");
-  for (auto it=std::sregex_iterator(L.body.begin(),L.body.end(),re); it!=std::sregex_iterator(); ++it) {
-    int k=std::stoi((*it)[1].str()); std::istringstream is((*it)[2].str()); Face f; int v;
-    while (is>>v) f.v.push_back(v);
-    if ((int)f.v.size()!=k) throw std::runtime_error("face arity mismatch in " + path);
-    F.push_back(std::move(f));
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Face> F; F.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    const long long k=requireIntegerToken(ts,ts.next(),"face arity");
+    if(k!=3) throw std::runtime_error("non-triangular face found in "+path+"; this tetrahedral solver requires face arity 3");
+    expectFoamToken(ts,"(");
+    Face f;
+    for(int j=0;j<3;++j) {
+      const long long v=requireIntegerToken(ts,ts.next(),"face vertex");
+      if(v<0 || v>INT_MAX) throw std::runtime_error("face vertex label out of range in "+path);
+      f.v[static_cast<std::size_t>(j)]=static_cast<int>(v);
+    }
+    expectFoamToken(ts,")");
+    F.push_back(f);
   }
-  if ((int)F.size()!=L.n) throw std::runtime_error("face count mismatch in " + path);
+  expectFoamToken(ts,")");
   return F;
 }
 
 static std::vector<int> readLabels(const std::string& path) {
-  auto L=extractListBody(path); std::vector<int> a; a.reserve(L.n);
-  std::istringstream is(L.body); long long v;
-  while (is>>v) a.push_back((int)v);
-  if ((int)a.size()!=L.n) throw std::runtime_error("label count mismatch in " + path + ": got " + std::to_string(a.size()) + " expected " + std::to_string(L.n));
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<int> a; a.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    const long long v=requireIntegerToken(ts,ts.next(),"label");
+    if(v<INT_MIN || v>INT_MAX) throw std::runtime_error("label out of int range in "+path);
+    a.push_back(static_cast<int>(v));
+  }
+  expectFoamToken(ts,")");
   return a;
 }
 
 static std::vector<Patch> readBoundary(const std::string& path) {
-  auto L=extractListBody(path);
-  std::vector<Patch> out; out.reserve(L.n);
-  std::regex re(R"(([A-Za-z0-9_.+\-]+)\s*\{([^{}]*)\})");
-  for (auto it=std::sregex_iterator(L.body.begin(),L.body.end(),re); it!=std::sregex_iterator(); ++it) {
-    const std::string name=(*it)[1].str(), body=(*it)[2].str();
-    std::smatch mn,ms;
-    if(!std::regex_search(body,mn,std::regex(R"(nFaces\s+(\d+)\s*;)")) ||
-       !std::regex_search(body,ms,std::regex(R"(startFace\s+(\d+)\s*;)")))
-      throw std::runtime_error("cannot parse boundary patch " + name + " in " + path);
-    out.push_back({name,(PetscInt)std::stoll(ms[1].str()),(PetscInt)std::stoll(mn[1].str())});
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Patch> out; out.reserve(static_cast<std::size_t>(n));
+  for(int pi=0;pi<n;++pi) {
+    const std::string name=ts.next();
+    if(name.empty() || name==")") throw std::runtime_error("missing boundary patch name in "+path);
+    expectFoamToken(ts,"{");
+    long long nFaces=-1,startFace=-1;
+    int depth=1;
+    while(depth>0) {
+      const std::string tok=ts.next();
+      if(tok.empty()) throw std::runtime_error("unterminated boundary patch "+name+" in "+path);
+      if(tok=="{") { ++depth; continue; }
+      if(tok=="}") { --depth; continue; }
+      if(depth!=1) continue;
+      if(tok=="nFaces") {
+        nFaces=requireIntegerToken(ts,ts.next(),"nFaces");
+        const std::string semi=ts.next(); if(semi!=";") throw std::runtime_error("missing ';' after nFaces for "+name+" in "+path);
+      } else if(tok=="startFace") {
+        startFace=requireIntegerToken(ts,ts.next(),"startFace");
+        const std::string semi=ts.next(); if(semi!=";") throw std::runtime_error("missing ';' after startFace for "+name+" in "+path);
+      }
+    }
+    if(nFaces<0 || startFace<0) throw std::runtime_error("cannot parse boundary patch "+name+" in "+path);
+    out.push_back({name,(PetscInt)startFace,(PetscInt)nFaces});
   }
-  if((int)out.size()!=L.n) throw std::runtime_error("boundary patch count mismatch in " + path);
+  expectFoamToken(ts,")");
   return out;
 }
 
@@ -191,7 +295,6 @@ static Mesh loadFoamTetMesh(const std::string& pm) {
     }
   }
   if (M.owner.size()!=M.faces.size()) throw std::runtime_error("owner size != faces size");
-  for (auto& f:M.faces) if (f.v.size()!=3) throw std::runtime_error("non-triangular face found; this first solver requires tetrahedra");
   int maxc=-1; for(int x:M.owner) maxc=std::max(maxc,x); for(int x:M.neighbour) maxc=std::max(maxc,x);
   int nc=maxc+1; std::vector<std::vector<int>> cf(nc);
   for (int f=0; f<(int)M.faces.size(); ++f) cf[M.owner[f]].push_back(f);

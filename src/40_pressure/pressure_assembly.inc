@@ -99,18 +99,17 @@ static PetscErrorCode printMemoryAuditMat(const char *stage,const char *name,Mat
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
-static PetscErrorCode auditMeshMemory(const Mesh& M,PetscInt cells) {
+static PetscErrorCode auditMeshMemory(const Mesh& M,PetscInt cells,const char *scope="replicated_per_rank") {
   PetscFunctionBeginUser;
   unsigned long long useful=0,retained=0;
   useful += vectorUsefulBytes(M.points); retained += vectorRetainedBytes(M.points);
-  PetscCall(printMemoryAuditBytes("after_mesh","mesh.points",vectorUsefulBytes(M.points),vectorRetainedBytes(M.points),cells,"replicated_per_rank"));
-  unsigned long long fu=vectorUsefulBytes(M.faces),fr=u64bytes(sizeof(M.faces))+u64bytes(M.faces.capacity())*u64bytes(sizeof(Face));
-  for(const auto& f:M.faces){fu+=vectorUsefulBytes(f.v);fr+=u64bytes(f.v.capacity())*u64bytes(sizeof(int));}
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.points",vectorUsefulBytes(M.points),vectorRetainedBytes(M.points),cells,scope));
+  const unsigned long long fu=vectorUsefulBytes(M.faces),fr=vectorRetainedBytes(M.faces);
   useful+=fu;retained+=fr;
-  PetscCall(printMemoryAuditBytes("after_mesh","mesh.faces_nested",fu,fr,cells,"replicated_per_rank","includes_outer_Face_vector_objects_and_inner_vertex_capacity"));
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.faces_compact",fu,fr,cells,scope,"fixed_std_array_3_vertices_no_per_face_heap_allocation"));
   auto addvec=[&](const char *name,const auto& v){
     const auto u=vectorUsefulBytes(v),r=vectorRetainedBytes(v); useful+=u;retained+=r;
-    return printMemoryAuditBytes("after_mesh",name,u,r,cells,"replicated_per_rank");
+    return printMemoryAuditBytes("after_mesh",name,u,r,cells,scope);
   };
   PetscCall(addvec("mesh.owner",M.owner));
   PetscCall(addvec("mesh.neighbour",M.neighbour));
@@ -120,18 +119,41 @@ static PetscErrorCode auditMeshMemory(const Mesh& M,PetscInt cells) {
   unsigned long long pu=vectorUsefulBytes(M.patches),pr=u64bytes(sizeof(M.patches))+u64bytes(M.patches.capacity())*u64bytes(sizeof(Patch));
   for(const auto& p:M.patches){pu+=u64bytes(p.name.size()+1);pr+=u64bytes(p.name.capacity()+1);}
   useful+=pu;retained+=pr;
-  PetscCall(printMemoryAuditBytes("after_mesh","mesh.patches",pu,pr,cells,"replicated_per_rank"));
-  PetscCall(printMemoryAuditBytes("after_mesh","mesh.TOTAL_CPP",useful,retained,cells,"replicated_per_rank","excludes_allocator_metadata_and_temporary_parser_strings"));
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.patches",pu,pr,cells,scope));
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.TOTAL_CPP",useful,retained,cells,scope,"excludes_allocator_metadata_and_temporary_parser_strings"));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
-static PetscErrorCode auditDiscreteMemory(const Discrete& D,PetscInt cells) {
+
+static unsigned long long meshRetainedEstimateLocal(const Mesh& M) {
+  unsigned long long r=0;
+  r+=vectorRetainedBytes(M.points)+vectorRetainedBytes(M.faces)+vectorRetainedBytes(M.owner)+vectorRetainedBytes(M.neighbour)
+    +vectorRetainedBytes(M.tets)+vectorRetainedBytes(M.oppFace)+vectorRetainedBytes(M.facePatch);
+  r+=u64bytes(sizeof(M.patches))+u64bytes(M.patches.capacity())*u64bytes(sizeof(Patch));
+  for(const auto& p:M.patches) r+=u64bytes(p.name.capacity()+1);
+  return r;
+}
+static PetscErrorCode auditRootGlobalMeshMemory(const Mesh& Mroot,int rank,PetscInt cells) {
+  PetscFunctionBeginUser;
+  const unsigned long long b=(rank==0)?meshRetainedEstimateLocal(Mroot):0ull;
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.rootGlobal.TOTAL_CPP",b,b,cells,"root_only_single_global_copy","retained_only_on_rank0_for_postprocess_and_global_oracle"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode auditRootGlobalOwnershipMemory(const Discrete& Droot,int rank,PetscInt cells) {
+  PetscFunctionBeginUser; unsigned long long b=0;
+  if(rank==0) b=vectorRetainedBytes(Droot.g2free)+vectorRetainedBytes(Droot.pGid)+vectorRetainedBytes(Droot.cellOwner)+vectorRetainedBytes(Droot.velCount)+vectorRetainedBytes(Droot.cellCount)+vectorRetainedBytes(Droot.fixedEntity)+vectorRetainedBytes(Droot.fixedDirValue);
+  PetscCall(printMemoryAuditBytes("after_fe_assembly","discrete.rootGlobalOwnership",b,b,cells,"root_only_single_global_copy","global_gid_owner_maps_retained_on_rank0_for_final_diagnostics"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditDiscreteMemory(const Discrete& D,PetscInt cells,PetscBool distributed=PETSC_FALSE) {
   PetscFunctionBeginUser;
   int rank=0; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
   unsigned long long useful=0,retained=0;
-  auto emit=[&](const char *name,const auto& v,const char *scope="replicated_per_rank")->PetscErrorCode{
+  const char *mapScope=distributed?"distributed_rank_local_support":"replicated_per_rank";
+  auto emit=[&](const char *name,const auto& v,const char *scope=nullptr)->PetscErrorCode{
     const auto u=vectorUsefulBytes(v),r=vectorRetainedBytes(v); useful+=u;retained+=r;
-    return printMemoryAuditBytes("after_fe_assembly",name,u,r,cells,scope);
+    return printMemoryAuditBytes("after_fe_assembly",name,u,r,cells,scope?scope:mapScope);
   };
   PetscCall(emit("discrete.g2free",D.g2free));
   PetscCall(emit("discrete.pGid",D.pGid));
@@ -139,14 +161,11 @@ static PetscErrorCode auditDiscreteMemory(const Discrete& D,PetscInt cells) {
   PetscCall(emit("discrete.velCount",D.velCount,"small_rank_metadata"));
   PetscCall(emit("discrete.cellCount",D.cellCount,"small_rank_metadata"));
   PetscCall(emit("discrete.fixedEntity",D.fixedEntity));
-  for(int d=0;d<3;++d) {
-    std::string n="discrete.dirValue"+std::to_string(d);
-    PetscCall(emit(n.c_str(),D.dirValue[d]));
-  }
+  PetscCall(emit("discrete.fixedDirValueCompact",D.fixedDirValue));
   PetscCall(emit("discrete.volumesOwnedFP64",D.volumesOwnedFP64,"distributed_owned_pressure_rows"));
   PetscCall(emit("discrete.fixedDivOwnedFP64",D.fixedDivOwnedFP64,"distributed_owned_pressure_rows"));
   for(int d=0;d<3;++d){std::string n="discrete.rhsOwnedFP64_"+std::to_string(d);PetscCall(emit(n.c_str(),D.rhsOwnedFP64[(std::size_t)d],"distributed_owned_velocity_rows"));}
-  PetscCall(printMemoryAuditBytes("after_fe_assembly","discrete.TOTAL_CPP",useful,retained,cells,"mixed","most_large_arrays_are_global_and_replicated_per_rank"));
+  PetscCall(printMemoryAuditBytes("after_fe_assembly","discrete.TOTAL_CPP",useful,retained,cells,distributed?"mixed_distributed":"mixed",distributed?"local_entity_cell_maps_plus_distributed_owned_payloads":"most_large_arrays_are_global_and_replicated_per_rank"));
   PetscCall(printMemoryAuditMat("after_fe_assembly","D.A_diffusion",D.A,cells));
   for(int d=0;d<3;++d){std::string n="D.B"+std::to_string(d);PetscCall(printMemoryAuditMat("after_fe_assembly",n.c_str(),D.B[d],cells));}
   unsigned long long rhsVecs=0;for(int d=0;d<3;++d)if(D.rhs[d])++rhsVecs;
@@ -221,6 +240,104 @@ static PetscErrorCode auditPlanMemory(const GhostPlan& G,const PressureAssemblyP
   PetscCall(printMemoryAuditBytes("after_plans","supg.forcing",vectorUsefulBytes(S.forcing),vectorRetainedBytes(S.forcing),cells,"distributed_owned_cells","empty_for_pipe_and_generic_flow"));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
+
+static PetscErrorCode auditCustomMomentumDetailedMemory(const CustomMomentumCSR& A,PetscInt cells) {
+  PetscFunctionBeginUser;
+  auto ints=[&](const char *name,const auto&... vecs)->PetscErrorCode {
+    unsigned long long u=0,r=0;
+    ((u+=vectorUsefulBytes(vecs),r+=vectorRetainedBytes(vecs)),...);
+    return printMemoryAuditBytes("after_state_objects",name,u,r,cells,"distributed_owned_velocity_rows_plus_halo");
+  };
+  auto doubles=[&](const char *name,const auto&... vecs)->PetscErrorCode {
+    unsigned long long u=0,r=0;
+    ((u+=vectorUsefulBytes(vecs),r+=vectorRetainedBytes(vecs)),...);
+    return printMemoryAuditBytes("after_state_objects",name,u,r,cells,"distributed_owned_velocity_rows_plus_halo");
+  };
+
+  // CSR/index topology retained by the current assembled-SGS predictor.
+  PetscCall(ints("momentum.csr.rowPtr",A.rowPtr));
+  PetscCall(ints("momentum.csr.colGid_RELEASED_M1",A.colGid));
+  PetscCall(ints("momentum.csr.colLocal",A.colLocal));
+  PetscCall(ints("momentum.csr.diagPos",A.diagPos));
+  PetscCall(ints("momentum.halo.gids_offsets",A.ghostGid,A.reqRecvGid,A.reqRecvLocalOffset));
+
+  unsigned long long iu=0,ir=0;
+  auto addInt=[&](const auto& v){iu+=vectorUsefulBytes(v);ir+=vectorRetainedBytes(v);};
+  addInt(A.reqSendCounts);addInt(A.reqSendDispls);addInt(A.reqRecvCounts);addInt(A.reqRecvDispls);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.halo.counts_displs",iu,ir,cells,"small_rank_peer_metadata"));
+  const unsigned long long requ=(unsigned long long)A.exchangeRequests.size()*sizeof(MPI_Request);
+  const unsigned long long reqr=(unsigned long long)sizeof(A.exchangeRequests)+(unsigned long long)A.exchangeRequests.capacity()*sizeof(MPI_Request);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.halo.mpi_requests",requ,reqr,cells,"small_rank_peer_metadata"));
+
+  // M1+M2 actual payload: kNu is intentionally empty; only active aRel remains.
+  PetscCall(doubles("momentum.matrix.kNu_ELIMINATED_M2",A.kNu));
+  PetscCall(doubles("momentum.matrix.aRel_FP64",A.aRel));
+
+  // Diagonal/coupling quantities. A matrix-free rewrite must KEEP or reproduce
+  // these because SIMPLE/SIMPLEC pressure coupling uses the resulting rAU.
+  PetscCall(doubles("momentum.diag.physDiag",A.physDiag));
+  PetscCall(doubles("momentum.diag.relaxDelta",A.relaxDelta));
+  PetscCall(doubles("momentum.diag.relaxedDiag",A.relaxedDiag));
+  PetscCall(doubles("momentum.diag.metric",A.metric));
+  PetscCall(doubles("momentum.diag.rAU",A.rAU));
+
+  // Current custom halo numeric buffers.
+  PetscCall(doubles("momentum.halo.exchange_numeric",A.exchangeSend,A.ghostValues));
+
+  unsigned long long fou=0,forr=0,fgu=0,fgr=0,cru=0,crr=0,sru=0,srr=0;
+  for(int d=0;d<3;++d){
+    fou+=vectorUsefulBytes(A.fieldOwned[d]);forr+=vectorRetainedBytes(A.fieldOwned[d]);
+    fgu+=vectorUsefulBytes(A.fieldGhost[d]);fgr+=vectorRetainedBytes(A.fieldGhost[d]);
+    cru+=vectorUsefulBytes(A.convRhs[d]);crr+=vectorRetainedBytes(A.convRhs[d]);
+    sru+=vectorUsefulBytes(A.supgRhs[d]);srr+=vectorRetainedBytes(A.supgRhs[d]);
+  }
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.fields.owned3_FP64",fou,forr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.fields.ghost3_FP64",fgu,fgr,cells,"distributed_velocity_halo"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.rhs.convection3_FP64",cru,crr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.rhs.supg3_FP64",sru,srr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(doubles("momentum.work.sgs4_FP64",A.workB,A.workX,A.workY,A.workBeff));
+
+  // Legacy shadow arrays should remain empty in the accepted M2B/M3A path.
+  PetscCall(doubles("momentum.legacy.empty_shadows",A.convection,A.supg,A.aPhys));
+
+  // Category totals. Keep them non-overlapping so their slopes can be added.
+  unsigned long long topology=0,matrix=0,diag=0,halo=0,fields=0,rhs=0,work=0;
+  auto vr=[&](const auto& v){return vectorRetainedBytes(v);};
+  topology=vr(A.rowPtr)+vr(A.colGid)+vr(A.colLocal)+vr(A.diagPos);
+  matrix=vr(A.kNu)+vr(A.aRel);
+  diag=vr(A.physDiag)+vr(A.relaxDelta)+vr(A.relaxedDiag)+vr(A.metric)+vr(A.rAU);
+  halo=vr(A.ghostGid)+vr(A.reqRecvGid)+vr(A.reqRecvLocalOffset)+vr(A.reqSendCounts)+vr(A.reqSendDispls)+vr(A.reqRecvCounts)+vr(A.reqRecvDispls)+vr(A.exchangeSend)+vr(A.ghostValues)+reqr;
+  for(int d=0;d<3;++d){fields+=vr(A.fieldOwned[d])+vr(A.fieldGhost[d]);rhs+=vr(A.convRhs[d])+vr(A.supgRhs[d]);}
+  work=vr(A.workB)+vr(A.workX)+vr(A.workY)+vr(A.workBeff);
+  const unsigned long long total=topology+matrix+diag+halo+fields+rhs+work+vr(A.convection)+vr(A.supg)+vr(A.aPhys);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_topology",topology,topology,cells,"distributed_nonoverlap_total","rowPtr_colLocal_diagPos_colGid_released"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_matrix_values",matrix,matrix,cells,"distributed_nonoverlap_total","aRel_only_kNu_eliminated"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_diag_coupling",diag,diag,cells,"distributed_nonoverlap_total","must_preserve_physDiag_relaxedDiag_metric_rAU_semantics"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_halo",halo,halo,cells,"distributed_nonoverlap_total","peer_metadata_plus_exchange_numeric"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_fields",fields,fields,cells,"distributed_nonoverlap_total","three_owned_plus_three_ghost_velocity_buffers"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_dynamic_rhs",rhs,rhs,cells,"distributed_nonoverlap_total","convection3_plus_supg3"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_work",work,work,cells,"distributed_nonoverlap_total","four_FP64_SGS_residual_work_vectors"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","custom.momentumCSR_DETAILED_TOTAL",total,total,cells,"distributed_nonoverlap_total","sum_of_detailed_custom_momentum_components"));
+
+  // M1+M2 are now actual allocations, not projections.  What remains removable
+  // by the later M3 matrix-free step is active aRel plus rowPtr/colLocal/diagPos.
+  const unsigned long long matfreeCore=diag+halo+fields+rhs+work;
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.ACTUAL_M1_colGid_released",vr(A.colGid),vr(A.colGid),cells,"actual_allocation","must_be_zero_after_setup"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.ACTUAL_M2_kNu_eliminated",vr(A.kNu),vr(A.kNu),cells,"actual_allocation","must_be_zero_persistent_static_diffusion_reintegrated"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.PROJECTION_M3_matfree_core_retained",matfreeCore,matfreeCore,cells,"accounting_projection_only","excludes_dynamicPlan; assumes_alternative_nonCSR_smoother"));
+  const unsigned long long removableMatfree=(topology+matrix);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.PROJECTION_M3_remaining_CSR_matrix_removable",removableMatfree,removableMatfree,cells,"accounting_projection_only","rowPtr_colLocal_diagPos_plus_aRel_after_M1M2"));
+
+  unsigned long long lnnz=(unsigned long long)A.colLocal.size(),gnnz=0,lnowned=(unsigned long long)A.nOwned,gnowned=0,lghost=(unsigned long long)A.ghostGid.size(),gghost=0;
+  PetscCallMPI(MPI_Allreduce(&lnnz,&gnnz,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lnowned,&gnowned,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lghost,&gghost,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MOMENTUM_MEMORY_COUNTS globalOwnedVel=%llu globalCSRnnz=%llu avgNnzPerVelRow=%.6f aggregateGhostSlots=%llu sizeofPetscInt=%zu sizeofDouble=%zu sizeofMPIRequest=%zu\n",
+    gnowned,gnnz,gnowned?(double)gnnz/(double)gnowned:0.0,gghost,sizeof(PetscInt),sizeof(double),sizeof(MPI_Request)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 
 static PetscErrorCode auditStateObjects(Mat C,Mat Sg,Mat Knu,Mat Aphys,Mat Ar,
                                         const Discrete& D,const GhostPlan& G,
@@ -305,6 +422,7 @@ static int localBasisForEntity(const Mesh& M,PetscInt cell,PetscInt entity) {
 static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,const std::string& pPmatMode,PetscBool buildExpandedSchur,PressureAssemblyPlan& P) {
   PetscFunctionBeginUser;
   const PetscInt nv=(PetscInt)M.points.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  const PetscInt globalNc=distributedGlobalCellCount(D);
   // Only full/legacy surrogate modes need the global vertex-star support.
   // native_face is intentionally lean: its compact face graph is built directly
   // from the custom live B geometry and never stores vertexCells or Bcell.
@@ -449,6 +567,15 @@ static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,
     }
   }
 
+  // FULLFAST-FP64-HIST: vertexCells is setup-only for the full flat-Schur plan.
+  // Once flatRow/Col/Term arrays are complete, release the nested star map.
+  if(pPmatMode=="full") {
+    std::vector<std::vector<PetscInt>>().swap(P.vertexCells);
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_FULLFAST_PLAN_COMPACT vertexCells=RELEASED flatTermCoeffBytes=%zu coeffStorage=float64 exactPhysicalSchur=FP64_factored\n",
+      sizeof(double)));
+  }
+
   const PetscInt nlp=D.cellCount[rank];
 
   // Build FV pressure-side support only for the fv_lsq surrogate.  Production
@@ -469,7 +596,7 @@ static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,
     }
     std::sort(fvDiagGhosts.begin(),fvDiagGhosts.end());
     fvDiagGhosts.erase(std::unique(fvDiagGhosts.begin(),fvDiagGhosts.end()),fvDiagGhosts.end());
-    PetscCall(VecCreateGhost(PETSC_COMM_WORLD,nlp,nc,(PetscInt)fvDiagGhosts.size(),
+    PetscCall(VecCreateGhost(PETSC_COMM_WORLD,nlp,globalNc,(PetscInt)fvDiagGhosts.size(),
                              fvDiagGhosts.empty()?nullptr:fvDiagGhosts.data(),&P.fvCellDiag));
     for(PetscInt i=0;i<nlp;++i) P.fvCellDiagLocal[P.fvCellDiagStart+i]=i;
     for(PetscInt j=0;j<(PetscInt)fvDiagGhosts.size();++j)
@@ -488,7 +615,7 @@ static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,
     } else {
       for(const auto& rp:P.rows) { const PetscInt li=rp.row-pStart; if(li<0 || li>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Schur row ownership mismatch during exact preallocation"); for(const auto& cp:rp.columns){if(cp.col>=pStart&&cp.col<pEnd)++dnnz[(size_t)li];else++onnz[(size_t)li];} }
     }
-    PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,0,dnnz.data(),0,onnz.data(),&P.S));
+    PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,0,dnnz.data(),0,onnz.data(),&P.S));
     PetscCall(MatSetOption(P.S,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
     PetscCall(MatSetOption(P.S,MAT_SYMMETRIC,PETSC_TRUE));
     PetscInt ld=0,lo=0; for(PetscInt i=0;i<nlp;++i){ld+=dnnz[(size_t)i];lo+=onnz[(size_t)i];}
@@ -511,16 +638,16 @@ static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,
           const PetscInt pg=D.pGid[(std::size_t)L]; if(pg>=pStart && pg<pEnd) ++dnnz[(std::size_t)lr]; else ++onnz[(std::size_t)lr];
         }
       }
-      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,0,dnnz.data(),0,onnz.data(),&P.Pcompact));
+      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,0,dnnz.data(),0,onnz.data(),&P.Pcompact));
       PetscCall(MatSetOption(P.Pcompact,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
       PetscCall(MatSetOption(P.Pcompact,MAT_SYMMETRIC,PETSC_TRUE));
       PetscInt ld=0,lo=0; for(PetscInt i=0;i<nlp;++i){ld+=dnnz[(std::size_t)i];lo+=onnz[(std::size_t)i];}
       PetscInt gd=0,go=0; PetscCallMPI(MPI_Allreduce(&ld,&gd,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lo,&go,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
       PetscCall(PetscPrintf(PETSC_COMM_WORLD,
         "P1BF3_B1_COMPACT_PREALLOC mode=native_face diagNnz=%" PetscInt_FMT " offdiagNnz=%" PetscInt_FMT " totalNnz=%" PetscInt_FMT " avgNnzPerRow=%.6f allocationError=ON graph=cell_plus_face_neighbours\n",
-        gd,go,gd+go,(double)(gd+go)/(double)nc));
+        gd,go,gd+go,(double)(gd+go)/(double)globalNc));
     } else {
-      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,5,nullptr,5,nullptr,&P.Pcompact));
+      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,5,nullptr,5,nullptr,&P.Pcompact));
       PetscCall(MatSetOption(P.Pcompact,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_FALSE));
       PetscCall(MatSetOption(P.Pcompact,MAT_SYMMETRIC,PETSC_TRUE));
     }
@@ -534,11 +661,11 @@ static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,
     P.globalSchurNnz=(PetscInt)gc;
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_SCHUR_PLAN cachedTopology=1 storage=%s pressureRows=%" PetscInt_FMT " uniqueRowColumns=%llu algebraicTerms=%llu update=batched_row_MatSetValues\n",
-      pPmatMode=="full"?"flat_CSR_terms":"nested_legacy",nc,gc,gt));
+      pPmatMode=="full"?"flat_CSR_terms":"nested_legacy",globalNc,gc,gt));
   } else {
     P.globalSchurNnz=-1;
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "P1BF3_SCHUR_PLAN cachedTopology=0 pressureRows=%" PetscInt_FMT " explicitExpandedSchur=NOT_MATERIALIZED operator=factored_B_rAU_Bt\n",nc));
+      "P1BF3_SCHUR_PLAN cachedTopology=0 pressureRows=%" PetscInt_FMT " explicitExpandedSchur=NOT_MATERIALIZED operator=factored_B_rAU_Bt\n",globalNc));
   }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -649,7 +776,7 @@ static PetscErrorCode updatePressureCompactNative(const Mesh& M,const Discrete& 
   PetscBool sym=PETSC_FALSE; PetscCall(MatIsSymmetric(P.Pcompact,1e-12,&sym));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
     "P1BF3_B1_COMPACT_VALUES mode=native_face p1Strength=%.6g pmatNnz=%.0f pmatAllocated=%.0f avgNnzPerRow=%.6f exactDiagSum=%.12e p1DiagSum=%.12e redistributedDirectedDegree=%.12e redistributedFraction=%.6f bf3OffAbsRowSum=%.12e symmetric=%d exactOperator=custom_FP64_B_rAU_Bt compactRole=GAMG_preconditioner_only\n",
-    p1Strength,mi.nz_used,mi.nz_allocated,mi.nz_used/(double)nc,gDiag,gP1,gRed,gP1>0.0?gRed/gP1:0.0,gBF3,(int)sym));
+    p1Strength,mi.nz_used,mi.nz_allocated,mi.nz_used/(double)distributedGlobalCellCount(D),gDiag,gP1,gRed,gP1>0.0?gRed/gP1:0.0,gBF3,(int)sym));
   if(!sym) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 native compact pressure Pmat lost symmetry");
   PetscFunctionReturn(PETSC_SUCCESS);
 }
@@ -815,7 +942,7 @@ static PetscErrorCode updatePressureCompactFeFaceEnergy(const Mesh& M,const Disc
 
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
     "P1BF3_GATE9G_FE_FACE_KP_VALUES rows=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f internalFaces=%" PetscInt_FMT " outletFaces=%" PetscInt_FMT " coeffMin=%.12e coeffMean=%.12e coeffMax=%.12e anchorMin=%.12e anchorMean=%.12e anchorMax=%.12e exactDiagSum=%.12e compactDiagBeforeScale=%.12e traceScale=%.12e positiveExactSharedPair=%" PetscInt_FMT " exactSharedOffAbs=%.12e energyEdgeSumScaled=%.12e symmetric=%d nonfinite=%" PetscInt_FMT " formula=quarter_shared_FE_jump_energy graph=cell_plus_face_neighbours exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt\n",
-    nc,mi.nz_used,mi.nz_used/(double)nc,audit.internalFaces,gOutlet,(double)audit.coeffMin,(double)audit.coeffMean,(double)audit.coeffMax,
+    distributedGlobalCellCount(D),mi.nz_used,mi.nz_used/(double)distributedGlobalCellCount(D),audit.internalFaces,gOutlet,(double)audit.coeffMin,(double)audit.coeffMean,(double)audit.coeffMax,
     (double)audit.anchorMin,(double)audit.anchorMean,(double)audit.anchorMax,(double)audit.exactDiagSum,(double)audit.compactDiagSumBeforeScale,
     (double)audit.traceScale,audit.positiveExactPair,(double)audit.exactSharedOffAbs,(double)audit.energyEdgeSum,(int)sym,audit.nonfinite));
   if(gNonfinite) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9G FE-face Kp contained invalid conductances");
