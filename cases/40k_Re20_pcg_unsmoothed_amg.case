@@ -1,0 +1,88 @@
+# NodalS native custom AMG example: minimum-memory pressure backend.
+# Validated combination: native FP64 PCG + unsmoothed aggregation AMG.
+
+[run]
+name = 40k_Re20_pcg_unsmoothed_amg
+ranks = 16
+timeout_seconds = 0
+map_by = core
+bind_to = core
+report_bindings = true
+output_root = auto
+
+[solver]
+mesh = meshes/pipe/40k/constant/polyMesh
+problem = pipe
+re = 20
+convection = central
+
+[boundary]
+wall_patch = patch_0_0
+wall_type = wall
+inlet_patch = patch_2_0
+inlet_type = parabolic
+bulk_velocity = 1.0
+outlet_patch = patch_1_0
+outlet_type = pressure0
+
+[supg]
+enabled = false
+
+[simple]
+variant = simple
+rtol = 1e-3
+max_iterations = 2000
+alpha_u = 0.5
+alpha_p = 0.5
+u_relax_mode = row_l1
+rau_mode = diag
+rau_scale = 1
+
+[momentum]
+rtol = 1e-8
+atol = 0
+relative_drop = 0.1
+max_iterations = 20000
+check_every = 1
+local_sweeps = 1
+sor_omega = 1
+
+[pressure]
+# Public custom-AMG modes:
+#   pcg_unsmoothed | pcg_smoothed | richardson_smoothed
+mode = pcg_unsmoothed
+refresh = 100
+rtol = 0.5
+atol = 1e-12
+divtol = 1e8
+max_iterations = 20
+
+[pressure_amg]
+# Connected rank-local aggregation.
+target_aggregate = 8
+min_aggregate = 6
+soft_max_aggregate = 10
+
+# Symmetric scaled Chebyshev/Jacobi smoothing used inside every V-cycle.
+chebyshev_degree = 2
+power_iterations = 16
+lambda_safety = 1.50
+lambda_low_fraction = 0.05
+
+# Stop recursive aggregation at this global coarse size and use the final LU.
+coarse_target_rows = 1000
+
+# The following two controls affect smoothed aggregation.  They are retained in
+# this unsmoothed example so switching mode requires changing only one line.
+interpolation_max_row_nnz = 8
+sa_damping = 1.3333333333333333
+
+# Used only by richardson_smoothed.
+richardson_omega = 1.0
+
+[output]
+write_vtu = false
+vtu_velocity_mode = cell_average
+resource_profile = true
+memory_audit = false
+mesh_audit_only = false
