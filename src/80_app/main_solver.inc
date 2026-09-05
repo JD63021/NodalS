@@ -157,8 +157,75 @@ int main(int argc,char **argv) {
   char pressureSolveModeName[32]="custom_pcg";
   PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pressure_solve_mode",pressureSolveModeName,sizeof(pressureSolveModeName),nullptr));
   const std::string pressureSolveMode(pressureSolveModeName);
-  if(pressureSolveMode!="custom_pcg" && pressureSolveMode!="petsc_fgmres" && pressureSolveMode!="gamg_richardson")
-    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode must be custom_pcg, gamg_richardson, or petsc_fgmres");
+  if(pressureSolveMode!="custom_pcg" && pressureSolveMode!="custom_richardson" && pressureSolveMode!="petsc_fgmres" && pressureSolveMode!="gamg_richardson")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode must be custom_pcg, custom_richardson, gamg_richardson, or petsc_fgmres");
+  // Pressure-preconditioner backend selector.
+  //
+  // PETSc full-Schur/GAMG remains the default/fallback architecture.  The two
+  // custom aggregation backends share the exact same matrix-free fine Schur
+  // action and differ only in their transfer construction:
+  //   custom_agg_unsmoothed : P = tentative aggregate injection
+  //   custom_agg_smoothed   : P = (I - omega D^{-1} A) P_t
+  //
+  // scripts/nodals_case.py maps the public case modes pcg_unsmoothed,
+  // pcg_smoothed and richardson_smoothed onto this low-level selector plus the
+  // corresponding native FP64 outer pressure iteration.
+  char pressurePcBackendOption[48]="petsc_full_gamg";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pressure_pc_backend",pressurePcBackendOption,sizeof(pressurePcBackendOption),nullptr));
+  PressurePCBackendKind pressurePcBackend=PressurePCBackendKind::PetscFullGAMG;
+  PetscCall(pressurePCBackendParse(pressurePcBackendOption,&pressurePcBackend));
+  PetscBool customAMGGate1Probe=PETSC_FALSE,customAMGGate2Probe=PETSC_FALSE,customAMGGate3Probe=PETSC_FALSE,customAMGGate4Probe=PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_amg_gate1_probe",&customAMGGate1Probe,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_amg_gate2_probe",&customAMGGate2Probe,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_amg_gate3_probe",&customAMGGate3Probe,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_amg_gate4_probe",&customAMGGate4Probe,nullptr));
+  // Custom AMG numerical/structural knobs.  Defaults live in
+  // CustomPressureAMGConfig; every field below can be set from the public
+  // [pressure_amg] case section.  Keeping option parsing here makes the AMG
+  // module callable both from .case files and directly from PETSc-style CLI
+  // options without duplicating numerical state.
+  CustomPressureAMGConfig customAMGConfig;
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_target_aggregate",&customAMGConfig.targetAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_min_aggregate",&customAMGConfig.minAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_soft_max_aggregate",&customAMGConfig.softMaxAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_cheb_degree",&customAMGConfig.chebyshevDegree,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_power_its",&customAMGConfig.powerIterations,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_lambda_safety",&customAMGConfig.lambdaSafety,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_lambda_low_fraction",&customAMGConfig.lambdaLowFraction,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_coarse_target",&customAMGConfig.coarseTargetRows,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_interp_max_nnz",&customAMGConfig.interpolationMaxRowNnz,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_sa_damping",&customAMGConfig.smoothedAggregationDamping,nullptr));
+  if(customAMGConfig.targetAggregateSize<2 || customAMGConfig.minAggregateSize<1 || customAMGConfig.softMaxAggregateSize<customAMGConfig.minAggregateSize ||
+     customAMGConfig.chebyshevDegree<1 || customAMGConfig.powerIterations<2 || customAMGConfig.lambdaSafety<=1.0 ||
+     customAMGConfig.lambdaLowFraction<=0.0 || customAMGConfig.lambdaLowFraction>=1.0 || customAMGConfig.coarseTargetRows<16 ||
+     customAMGConfig.interpolationMaxRowNnz<1 || !(customAMGConfig.smoothedAggregationDamping>0.0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"invalid custom AMG configuration");
+  const PetscBool customPressureBackend=pressurePCBackendIsCustom(pressurePcBackend);
+  customAMGConfig.smoothedAggregation=(pressurePcBackend==PressurePCBackendKind::CustomAggSmoothed)?PETSC_TRUE:PETSC_FALSE;
+  if(customPressureBackend && pressureSolveMode!="custom_pcg" && pressureSolveMode!="custom_richardson")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"custom AMG live backend requires -pressure_solve_mode custom_pcg or custom_richardson");
+  if(!customPressureBackend && pressureSolveMode=="custom_richardson")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode custom_richardson requires a custom AMG backend");
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PC_BACKEND backend=%s customRegistered=1 customRunnable=%d developmentGate=5 liveSimpleAttachment=%s petscFallback=UNCHANGED roadmapGates=6\n",
+    pressurePCBackendName(pressurePcBackend),(int)customPressureBackend,customPressureBackend?"ACTIVE":"AVAILABLE"));
+  PetscReal customLivePRtol=0.5,customLivePAtol=1e-12,customLivePDtol=1e8; PetscInt customLivePMaxIts=20;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_ksp_rtol",&customLivePRtol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_ksp_atol",&customLivePAtol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_ksp_divtol",&customLivePDtol,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-p_ksp_max_it",&customLivePMaxIts,nullptr));
+  PetscReal customRichardsonOmega=1.0;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_richardson_omega",&customRichardsonOmega,nullptr));
+  if(customLivePRtol<0.0 || customLivePAtol<0.0 || customLivePDtol<0.0 || customLivePMaxIts<1)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"invalid custom AMG live pressure tolerances");
+  if(!(customRichardsonOmega>0.0) || !std::isfinite((double)customRichardsonOmega))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_amg_richardson_omega must be finite and > 0");
+  if(customPressureBackend) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_CUSTOM_AMG_CONFIG backend=%s outer=%s targetAggregate=%" PetscInt_FMT " minAggregate=%" PetscInt_FMT " softMaxAggregate=%" PetscInt_FMT " chebDegree=%" PetscInt_FMT " powerIts=%" PetscInt_FMT " lambdaSafety=%.8g lambdaLowFraction=%.8g coarseTargetRows=%" PetscInt_FMT " interpolationMaxRowNnz=%" PetscInt_FMT " saDamping=%.12g richardsonOmega=%.12g refresh=%" PetscInt_FMT " pRtol=%.8g pAtol=%.8g pMaxIts=%" PetscInt_FMT "\n",
+    pressurePCBackendName(pressurePcBackend),pressureSolveMode.c_str(),customAMGConfig.targetAggregateSize,customAMGConfig.minAggregateSize,customAMGConfig.softMaxAggregateSize,
+    customAMGConfig.chebyshevDegree,customAMGConfig.powerIterations,(double)customAMGConfig.lambdaSafety,(double)customAMGConfig.lambdaLowFraction,
+    customAMGConfig.coarseTargetRows,customAMGConfig.interpolationMaxRowNnz,(double)customAMGConfig.smoothedAggregationDamping,(double)customRichardsonOmega,
+    pPreconditionerRefresh,(double)customLivePRtol,(double)customLivePAtol,customLivePMaxIts));
   PetscBool gate1ComparePcg=PETSC_TRUE;
   PetscReal gate1SolutionTol=5e-8,gate1TrueResidualTol=1e-8;
   PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate1_compare_pcg",&gate1ComparePcg,nullptr));
@@ -258,6 +325,10 @@ int main(int argc,char **argv) {
   if(gate4KpProbe && pressureSolveMode!="petsc_fgmres" && !gate9eNgfv)
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-4/5/6/7/8/9 Kp/PCD requires -pressure_solve_mode petsc_fgmres");
   if(gate9LivePcd && problem=="mms") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 live PCD is a pipe/flow gate, not MMS");
+  if(customPressureBackend && (customAMGGate1Probe || customAMGGate2Probe || customAMGGate3Probe || customAMGGate4Probe ||
+     gate3MpProbe || gate4KpProbe || gate5KpGamgProbe || gate6DiffusionPcdProbe || gate7CpProbe || gate8EswBcProbe ||
+     gate9LivePcd || gate9dGamgOnly || gate9eNgfv || gate9gFeFace || gate9gRichardson || gate9hChebyshev || gate9iAutoChebyshev))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"custom AMG live backend cannot be combined with legacy pressure-development probes; disable Gate1-4/PCD/Gate9 pressure probes");
   char pPmatName[32]="full";
   PetscCall(PetscOptionsGetString(nullptr,nullptr,"-p_pmat",pPmatName,sizeof(pPmatName),nullptr));
   const std::string pPmatMode(pPmatName);
@@ -268,9 +339,13 @@ int main(int argc,char **argv) {
   const std::string pOperatorMode(pOperatorName);
   if(pOperatorMode!="explicit" && pOperatorMode!="factored")
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_operator must be explicit or factored");
+  if(customPressureBackend && pOperatorMode!="factored")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"custom AMG requires -p_operator factored; the fine Schur remains matrix-free B rAU Bt");
   if(pPmatMode=="native_face" && pOperatorMode!="factored")
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_pmat native_face requires -p_operator factored so the exact custom B rAU Bt remains the Krylov operator");
   PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-pressure_factored_benchmark",&factoredBenchmark,nullptr));
+  if(customPressureBackend && factoredBenchmark)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"custom AMG low-memory path does not materialize the fine Schur benchmark matrix");
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_factored_benchmark_at",&factoredBenchmarkAt,nullptr));
   if(pPmatMode=="native_face" && factoredBenchmark) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_pmat native_face does not materialize the exact Schur benchmark matrix; disable -pressure_factored_benchmark");
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_factored_benchmark_reps",&factoredBenchmarkReps,nullptr));
@@ -286,7 +361,11 @@ int main(int argc,char **argv) {
   if(fvLsqTpfaFloor<0.0 || fvLsqTpfaFloor>1.0)
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_fv_lsq_tpfa_floor must satisfy 0 <= floor <= 1");
   PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-pressure_profile",&pressureProfile,nullptr));
+  if(customPressureBackend && pressureProfile)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"legacy PETSc pressure_profile is not available on custom AMG; use Gate-5 resource/timing markers");
   PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m10_pcg_profile",&m10PcgProfile,nullptr));
+  if(customPressureBackend && m10PcgProfile)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"legacy m10 PETSc-PC pressure profile is not available on custom AMG; use Gate-5 timing/resource markers");
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_at",&pressureProfileAt,nullptr));
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_fine_reps",&pressureProfileFineReps,nullptr));
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_pc_reps",&pressureProfilePcReps,nullptr));
@@ -378,13 +457,13 @@ int main(int argc,char **argv) {
       PetscCall(PetscTime(&tProblem1));
       PetscCall(printSetupPhase("problem_boundary_config_and_global_ownership_root",tProblem1-tProblem0,reportCells));
 
-      DistProductionPacket localPacket; PetscLogDouble tDist0=0,tDist1=0;PetscCall(PetscTime(&tDist0));PetscCall(distributeProductionMeshRoot(MrootGlobal,DrootGlobal,rank,size,localPacket,pPmatMode=="full"?PETSC_TRUE:PETSC_FALSE));PetscCall(PetscTime(&tDist1));
+      DistProductionPacket localPacket; PetscLogDouble tDist0=0,tDist1=0;PetscCall(PetscTime(&tDist0));PetscCall(distributeProductionMeshRoot(MrootGlobal,DrootGlobal,rank,size,localPacket,(!customPressureBackend && pPmatMode=="full")?PETSC_TRUE:PETSC_FALSE));PetscCall(PetscTime(&tDist1));
       M=std::move(localPacket.M);D=std::move(localPacket.D);rootGlobalRetained=(rank==0)?PETSC_TRUE:PETSC_FALSE;
       PetscInt lc=(PetscInt)M.tets.size(),lf=(PetscInt)M.faces.size(),lp=(PetscInt)M.points.size(),sc=0,sf=0,sp=0,minc=0,maxc=0;
       PetscCallMPI(MPI_Allreduce(&lc,&sc,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lf,&sf,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lp,&sp,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lc,&minc,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lc,&maxc,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
       PetscCall(PetscPrintf(PETSC_COMM_WORLD,
         "P1BF3_DIST_ACTIVE ranks=%d rootOnlyRead=1 rootGlobalRetained=1 nonrootGlobalRetained=0 localCellMin=%" PetscInt_FMT " localCellMax=%" PetscInt_FMT " aggregateLocalCells=%" PetscInt_FMT " supportDuplication=%.6f aggregateLocalPoints=%" PetscInt_FMT " aggregateLocalFaces=%" PetscInt_FMT " pressureSupport=%s\n",
-        size,minc,maxc,sc,reportCells?((double)sc/(double)reportCells):0.0,sp,sf,pPmatMode=="full"?"owned_pressure_vertex_stars_plus_base":"base_compact"));
+        size,minc,maxc,sc,reportCells?((double)sc/(double)reportCells):0.0,sp,sf,(!customPressureBackend && pPmatMode=="full")?"owned_pressure_vertex_stars_plus_base":"base_compact"));
       PetscCall(printSetupPhase("distributed_pack_scatter",tDist1-tDist0,reportCells));
       if(resourceProfile) PetscCall(printResourceMark("after_distributed_local_mesh",reportCells,tDist1-tDist0,tTotal0));
       if(memoryAudit){PetscCall(auditMeshMemory(M,reportCells,"distributed_rank_local_support"));PetscCall(auditRootGlobalMeshMemory(MrootGlobal,rank,reportCells));}
@@ -431,9 +510,12 @@ int main(int argc,char **argv) {
     PetscCall(PetscTime(&tGhost1));
     PetscCall(printSetupPhase("velocity_ghost_plan",tGhost1-tGhost0,reportCells));
     PressureAssemblyPlan PSchur;
-    const PetscBool buildExpandedSchur = (pOperatorMode=="explicit" || pPmatMode=="full" || factoredBenchmark) ? PETSC_TRUE : PETSC_FALSE;
+    const PetscBool buildExpandedSchur = (!customPressureBackend && (pOperatorMode=="explicit" || pPmatMode=="full" || factoredBenchmark)) ? PETSC_TRUE : PETSC_FALSE;
     PetscCall(PetscTime(&tPPlan0));
-    PetscCall(buildPressureAssemblyPlan(M,D,rank,G,pPmatMode,buildExpandedSchur,PSchur));
+    if(customPressureBackend) {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_CUSTOM_AMG_GATE5_PRESSURE_PLAN status=PASS explicitFineSchur=SKIPPED flatSchurPlan=SKIPPED PETScPmat=SKIPPED GAMG=SKIPPED exactFineOperator=matrix_free_B_rAU_Bt\n"));
+    } else PetscCall(buildPressureAssemblyPlan(M,D,rank,G,pPmatMode,buildExpandedSchur,PSchur));
     PetscCall(PetscTime(&tPPlan1));
     PetscCall(printSetupPhase("pressure_assembly_plan",tPPlan1-tPPlan0,reportCells));
     CentralAssemblyPlan CPlan; SupgAssemblyPlan SupgPlan; // empty legacy plans in M2B
@@ -482,7 +564,7 @@ int main(int argc,char **argv) {
       const bool ok=worst<=customMomentumShadowTol;PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M6B_VELOCITY_STATE_REFERENCE staticRhsRel=%.3e staticRhsMaxAbs=%.3e tol=%.3e status=%s action=destroy_PETSc_velocity_rhs_before_live_solve\n",worst,maxAbs,(double)customMomentumShadowTol,ok?"PASS":"CHECK"));
       if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6B native static momentum RHS parity failed");for(int d=0;d<3;++d)PetscCall(VecDestroy(&D.rhs[d]));
     } else PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M6B_VELOCITY_STATE_REFERENCE status=SKIPPED_PRODUCTION PETScVelocityRhs=never_created\n"));
-    PetscCall(reindexFlatSchurRauToCustom(PSchur,G,customMom));
+    if(!customPressureBackend) PetscCall(reindexFlatSchurRauToCustom(PSchur,G,customMom));
 
     unsigned long long lnnz=(unsigned long long)customMom.rowPtr.back(),gnnz=0;
     PetscCallMPI(MPI_Allreduce(&lnnz,&gnnz,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
@@ -543,7 +625,7 @@ int main(int argc,char **argv) {
     PetscCall(PetscTime(&tbp1)); PetscCall(printSetupPhase("custom_pressure_B_live_plan",tbp1-tbp0,reportCells));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_M4B_CONFIG mode=live_custom_pressure physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI physicalSchur=custom_FP64_MPI PETScB=%s Pmat=%s reference=%s tol=%.3e\n",
-      m4bBReference?"destroyed_after_reference":"never_created",pPmatMode=="native_face"?"PETSc_PetscScalar_native_face_compact_GAMG":"PETSc_PetscScalar_full_GAMG",bReferenceStatus,(double)customPressureBShadowTol));
+      m4bBReference?"destroyed_after_reference":"never_created",customPressureBackend?"NONE_custom_AMG":(pPmatMode=="native_face"?"PETSc_PetscScalar_native_face_compact_GAMG":"PETSc_PetscScalar_full_GAMG"),bReferenceStatus,(double)customPressureBShadowTol));
 
     const double feScalarNnz=(double)gnnz;
     const double fvmScalarNnz=(double)reportCells+2.0*(double)reportInternalFaces;
@@ -571,15 +653,25 @@ int main(int argc,char **argv) {
     // now only two bridge buffers used by GAMG PCApply (and the optional first
     // reference KSPSolve); no physical p/r/dp state lives in PetscScalar.
     Vec pcIn=nullptr,pcOut=nullptr;
-    PetscCall(VecDuplicate(D.volumes,&pcIn)); PetscCall(VecSet(pcIn,0));
-    PetscCall(VecDuplicate(D.volumes,&pcOut)); PetscCall(VecSet(pcOut,0));
+    if(!customPressureBackend) {
+      PetscCall(VecDuplicate(D.volumes,&pcIn)); PetscCall(VecSet(pcIn,0));
+      PetscCall(VecDuplicate(D.volumes,&pcOut)); PetscCall(VecSet(pcOut,0));
+    }
     std::vector<double> pressureState((std::size_t)customPressureB.pressureHalo.nOwned,0.0);
     std::vector<double> pressureResidual((std::size_t)customPressureB.pressureHalo.nOwned,0.0);
     CustomPressurePCGWorkspace pressurePcgW;
-    pressurePcgW.x.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
-    pressurePcgW.r.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
-    pressurePcgW.z.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
-    pressurePcgW.p.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    if(!customPressureBackend) {
+      pressurePcgW.x.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+      pressurePcgW.r.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+      pressurePcgW.z.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+      pressurePcgW.p.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    }
+    CustomPressureAMGRuntime customAMGLive;
+    CustomPressureAMGLivePCGWorkspace customAMGLiveW;
+    CustomPressureAMGLivePCGResult customAMGLiveResult;
+    CustomPressureAMGLiveRichardsonWorkspace customAMGRichW;
+    CustomPressureAMGLiveRichardsonResult customAMGRichResult;
+    PetscBool customAMGLiveReady=PETSC_FALSE,customAMGLiveConfigPrinted=PETSC_FALSE,customAMGGaugePrinted=PETSC_FALSE;
     PetscBool pressurePcgReferenceDone=PETSC_FALSE;
     M10PressurePCGProfile m10PcgTotal,m10PcgWarm; m10PcgTotal.enabled=m10PcgProfile; m10PcgWarm.enabled=m10PcgProfile;
 
@@ -588,6 +680,7 @@ int main(int argc,char **argv) {
     PetscCall(createCustomFactoredPressure(customPressureB,customMom,D.volumes,factoredCtx,&factoredSchur));
     Mat pressureOperator = (pOperatorMode=="factored") ? factoredSchur : PSchur.S;
     PetscBool factoredBenchmarkDone=PETSC_FALSE,customPressureLiveSchurParityDone=PETSC_FALSE;
+    PetscBool customAMGGate1ProbeDone=PETSC_FALSE,customAMGGate2ProbeDone=PETSC_FALSE,customAMGGate3ProbeDone=PETSC_FALSE,customAMGGate4ProbeDone=PETSC_FALSE;
     PetscBool gate1FgmresParityDone=PETSC_FALSE;
 
     MatNullSpace nsp=nullptr;
@@ -613,7 +706,7 @@ int main(int argc,char **argv) {
     // The pressure preconditioning matrix object is fixed for the solve.  With
     // a factored exact operator and p_pmat=full, the explicit Schur is a lagged
     // GAMG snapshot: its values change only when the preconditioner is refreshed.
-    Mat pressurePmat = (pPmatMode=="full") ? PSchur.S : PSchur.Pcompact;
+    Mat pressurePmat = customPressureBackend ? nullptr : ((pPmatMode=="full") ? PSchur.S : PSchur.Pcompact);
     if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_GATE9G_CONFIG enabled=1 Kp=compact_FE_face_jump_energy graph=cell_plus_face_neighbours coefficient=quarter_sum_shared_rAU_norm_Bp_minus_Bn_sq outletAnchor=FE_trace_energy traceMatch=exact_Schur_diagonal_sum exactOperator=custom_FP64_B_rAU_Bt tests=%s\n",
       gate9iAutoChebyshev?"AUTO_Chebyshev_power_estimate_plus_one_GAMG_no_outer_Krylov":(gate9hChebyshev?"Chebyshev_plus_one_GAMG_no_outer_Krylov":(gate9gRichardson?"Richardson_plus_one_GAMG_no_outer_Krylov":"custom_PCG_plus_one_GAMG"))));
@@ -690,25 +783,25 @@ int main(int argc,char **argv) {
         "P1BF3_GATE3_MP_CONFIG enabled=1 attachment=shadow_only action=Mp_inverse mass=P0_exact_cell_volume_diagonal exactPressureOperator=custom_FP64_B_rAU_Bt liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG Kp=NONE Fp=NONE pressureBC=UNCHANGED_NOT_USED algebraTol=%.3e\n",
         (double)gate3MpAlgebraTol));
     }
-    const PetscBool lagFullPmat = (pOperatorMode=="factored" && pPmatMode=="full" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
-    const PetscBool lagNativeCompactPmat = (pOperatorMode=="factored" && pPmatMode=="native_face" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
+    const PetscBool lagFullPmat = (!customPressureBackend && pOperatorMode=="factored" && pPmatMode=="full" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
+    const PetscBool lagNativeCompactPmat = (!customPressureBackend && pOperatorMode=="factored" && pPmatMode=="native_face" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
     if(lagNativeCompactPmat) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_B2_COMPACT_LAG_CONFIG enabled=1 interval=%" PetscInt_FMT " exactOperator=factored_B_rAU_Bt pmat=native_face_compact semantics=assemble_compact_only_on_GAMG_refresh\n",
       pPreconditionerRefresh));
     if(lagFullPmat) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_FULL_PMAT_LAG_CONFIG enabled=1 interval=%" PetscInt_FMT " exactOperator=factored_B_rAU_Bt pmat=full_explicit_Schur_snapshot semantics=assemble_Pmat_only_on_GAMG_refresh\n",
       pPreconditionerRefresh));
-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    if(!customPressureBackend && pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_M4B_PRESSURE_ARCH physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI exactOperator=custom_FP64_B_rAU_Bt PETScB=none_live Pmat=PETSc_PetscScalar_full GAMG=PETSc_PetscScalar outerKrylov=custom_FP64_or_Richardson PETScKSPRole=GAMG_PC_owner_only\n"));
-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M5A_CONFIG Bcell=eliminated schurStorage=flat_CSR_terms pmatRefresh=analytic_B_coefficients CustomOuterPCG=FP64 PETScGAMG=PetscScalar\n"));
-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    if(!customPressureBackend && pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M5A_CONFIG Bcell=eliminated schurStorage=flat_CSR_terms pmatRefresh=analytic_B_coefficients CustomOuterPCG=FP64 PETScGAMG=PetscScalar\n"));
+    if(!customPressureBackend && pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_M5B_PCG_CONFIG outer=custom_FP64_MPI_PCG exactOperator=custom_FP64_B_rAU_Bt preconditioner=PETSc_PetscScalar_GAMG_PCApply PETScKSPSolve=%s referenceTol=%.3e\n",
       m5bPcgReference?"first_solve_reference_only":"never_called_in_production",(double)customPressurePcgReferenceTol));
-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    if(!customPressureBackend && pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_M6A_PRESSURE_STATE_CONFIG physicalP=native_CPP_FP64 continuity=native_CPP_FP64 pressureRhs=native_CPP_FP64 correction=custom_PCG_FP64 PETScPressureVecs=pcIn_pcOut_bridge_only staticVolumeFixedDiv=native_FP64_plus_layout_bridge eventualFP32SafePressureState=1\n"));
-    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    if(!customPressureBackend && pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_M6B_VELOCITY_STATE_CONFIG physicalU=native_CPP_FP64 staticMomentumRhs=native_CPP_FP64 dynamicMomentumRhs=native_CPP_FP64 momentumWork=native_CPP_FP64 diagMetricRau=custom_CPP_FP64 PETScVelocityVecs=none_live PETScPhysicalState=none_live eventualFP32SafeVelocityState=1 reference=%s\n",m6bVelocityReference?"PASS":"SKIPPED_PRODUCTION"));
-    if(pPmatMode=="native_face") {
+    if(!customPressureBackend && pPmatMode=="native_face") {
       PetscCall(PetscPrintf(PETSC_COMM_WORLD,
         "P1BF3_B2_PRESSURE_ARCH exactOperator=custom_FP64_B_rAU_Bt outerKrylov=%s preconditioner=PETSc_PetscScalar_GAMG pmat=native_face_compact graph=cell_plus_face_neighbours exactFullSchur=never_materialized flatSchurPlan=eliminated Bcell=eliminated vertexCells=eliminated p1RedistributionStrength=%.6g refresh=%" PetscInt_FMT "\n",
         pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES":(gate9iAutoChebyshev?"FP64_Chebyshev_no_outer_Krylov":"custom_FP64_PCG"),(double)feFvP1Strength,pPreconditionerRefresh));
@@ -716,6 +809,10 @@ int main(int argc,char **argv) {
         "P1BF3_M5B_PCG_CONFIG outer=custom_FP64_MPI_PCG exactOperator=custom_FP64_B_rAU_Bt preconditioner=PETSc_PetscScalar_GAMG_PCApply PETScKSPSolve=%s referenceTol=%.3e\n",
         m5bPcgReference?"first_solve_reference_only":"never_called_in_production",(double)customPressurePcgReferenceTol));
     }
+
+    if(customPressureBackend) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_CUSTOM_AMG_GATE5_ARCH status=PASS fineOperator=matrix_free_B_rAU_Bt pressureState=native_FP64 outer=%s preconditioner=ONE_%s_Vcycle fineSchurCSR=NONE flatSchurPlan=NONE PETScPmat=NONE PETScGAMG=NONE PETScKSP=NONE refresh=%" PetscInt_FMT " generalFlow=1 followOnSA=%d\n",
+      pressureSolveMode=="custom_richardson"?"custom_FP64_Richardson":"custom_FP64_PCG",pressurePCBackendName(pressurePcBackend),pPreconditionerRefresh,(int)customAMGConfig.smoothedAggregation));
 
     double localVolsum=std::accumulate(D.volumesOwnedFP64.begin(),D.volumesOwnedFP64.end(),0.0),volsum=0.0;
     PetscCallMPI(MPI_Allreduce(&localVolsum,&volsum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
@@ -742,10 +839,11 @@ int main(int argc,char **argv) {
       "P1BF3_SIMPLE_CONFIG ranks=%d variant=%s alphaU=%.6g alphaP=%.6g uRelaxMode=%s rauScale=%.6g rauMode=%s "
       "simplecBlend=%.6g simplecFloorFraction=%.3e simplecFallback=%s rAU=rauScale/correction_metric simpleRtol=%.3e maxOuter=%" PetscInt_FMT
       " velocitySolver=processorBlockJacobi+localSGS precision=FP64 uRtol=%.3e uAtol=%.3e uRelDrop=%.3g uOmega=%.3g uLocalSweeps=%" PetscInt_FMT " uCheckEvery=%" PetscInt_FMT
-      " outerGate=all_initial_residuals_Ux_Uy_Uz_plus_continuity pressureSolver=custom_FP64_PCG_plus_PETSc_PCApply pressureState=native_FP64 pPcRefresh=%" PetscInt_FMT "\n",
+      " outerGate=all_initial_residuals_Ux_Uy_Uz_plus_continuity pressureSolver=%s pressureState=native_FP64 pPcRefresh=%" PetscInt_FMT "\n",
       size,simpleVariant.c_str(),(double)au,(double)ap,uRelaxMode.c_str(),(double)rauScale,rauMode.c_str(),
       (double)simplecBlend,(double)simplecFloorFraction,simplecFallback.c_str(),(double)simpleTol,maxOuter,
-      (double)uTol,(double)uAtol,(double)uRelDrop,(double)uOmega,uLocalSweeps,uCheck,pPreconditionerRefresh));
+      (double)uTol,(double)uAtol,(double)uRelDrop,(double)uOmega,uLocalSweeps,uCheck,
+      customPressureBackend?(pressureSolveMode=="custom_richardson"?(customAMGConfig.smoothedAggregation?"custom_FP64_Richardson_plus_custom_smoothed_AMG":"custom_FP64_Richardson_plus_custom_unsmoothed_AMG"):(customAMGConfig.smoothedAggregation?"custom_FP64_PCG_plus_custom_smoothed_AMG":"custom_FP64_PCG_plus_custom_unsmoothed_AMG")):(pressureSolveMode=="custom_pcg"?"custom_FP64_PCG_plus_PETSc_PCApply":(pressureSolveMode=="gamg_richardson"?"custom_FP64_Richardson_plus_PETSc_PCApply":"PETSc_FGMRES")),pPreconditionerRefresh));
     if(simpleVariant=="simplec") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_SIMPLEC_CONFIG metric=relaxed_signed_row_sum formula=Dc=(1-blend)*diag(Ar)+blend*(Ar*1) standardBlend=1 "
       "pressureUnderRelaxation=alphaP userControlled note=alphaP_1_is_typical_SIMPLEC_test positiveGuard=%s floorFraction=%.3e\n",
@@ -783,8 +881,8 @@ int main(int argc,char **argv) {
         sizeof(PetscInt),sizeof(PetscScalar),sizeof(void*),sizeof(std::vector<int>),sizeof(CentralCellPlan),sizeof(SupgCellPlan),sizeof(SupgReferencePoint)));
     }
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-      "P1BF3_OPTIMIZATION affineGeometryCached=1 centralTensorDegree=8 centralTensorRule=collapsed_5x5x5 staticDiffusion=nuK_reintegrated_into_active_CSR schurTopologyCached=1 physicalOperatorMode=%s supgFastPath=%s supgAffineGradCached=%d supgViscStrongCached=%d supgOuterProduct=1 supgTauLagged=1 supgForm=%s supgQuad=%" PetscInt_FMT "\n",
-      staticPhysicalOperator?"static_once":"convection_values_only",useSupg?supgKernel.c_str():"OFF_no_SUPG_work",
+      "P1BF3_OPTIMIZATION affineGeometryCached=1 centralTensorDegree=8 centralTensorRule=collapsed_5x5x5 staticDiffusion=nuK_reintegrated_into_active_CSR schurTopologyCached=%d physicalOperatorMode=%s supgFastPath=%s supgAffineGradCached=%d supgViscStrongCached=%d supgOuterProduct=1 supgTauLagged=1 supgForm=%s supgQuad=%" PetscInt_FMT "\n",
+      customPressureBackend?0:1,staticPhysicalOperator?"static_once":"convection_values_only",useSupg?supgKernel.c_str():"OFF_no_SUPG_work",
       0,0,supgForm.c_str(),supgQuadPoints));
 
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -846,18 +944,52 @@ int main(int argc,char **argv) {
         PetscCall(PetscTime(&ts1));
         derivedUpdateSeconds += (double)(ts1-ts0);
 
+        if(customAMGGate1Probe && !customAMGGate1ProbeDone) {
+          PetscCall(customPressureAMGGate1Probe(customPressureB,customMom,reportCells,P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE));
+          customAMGGate1ProbeDone=PETSC_TRUE;
+        }
+
+        if(customAMGGate3Probe && !customAMGGate3ProbeDone) {
+          PetscCall(customPressureAMGGate3Probe(M,D,rank,customPressureB,customMom,reportCells,
+            P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE));
+          customAMGGate3ProbeDone=PETSC_TRUE;
+        }
+        if(customAMGGate4Probe && !customAMGGate4ProbeDone) {
+          PetscLogDouble ta0=0,ta1=0; PetscCall(PetscTime(&ta0));
+          if(resourceProfile) PetscCall(printResourceMark("before_custom_amg_gate4_setup",reportCells,0.0,tTotal0));
+          PetscCall(customPressureAMGGate4Probe(M,D,rank,customPressureB,customMom,reportCells,
+            P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE,customAMGConfig));
+          PetscCall(PetscTime(&ta1));
+          if(resourceProfile) PetscCall(printResourceMark("after_custom_amg_gate4_setup_and_probe",reportCells,ta1-ta0,tTotal0));
+          customAMGGate4ProbeDone=PETSC_TRUE;
+        }
+
         PetscCall(PetscTime(&ts0));
-        const PetscBool pcRefreshStep = (!pksp || (pPreconditionerRefresh>0 && (((it-1)%pPreconditionerRefresh)==0))) ? PETSC_TRUE : PETSC_FALSE;
-        const PetscBool needExplicitSchur = (pOperatorMode=="explicit" ||
+        const PetscBool pcRefreshStep = customPressureBackend
+          ? ((!customAMGLiveReady || pPreconditionerRefresh==0 || (pPreconditionerRefresh>0 && (((it-1)%pPreconditionerRefresh)==0))) ? PETSC_TRUE : PETSC_FALSE)
+          : ((!pksp || (pPreconditionerRefresh>0 && (((it-1)%pPreconditionerRefresh)==0))) ? PETSC_TRUE : PETSC_FALSE);
+        if(customPressureBackend && pcRefreshStep) {
+          PetscLogDouble tcg0=0,tcg1=0; PetscCall(PetscTime(&tcg0));
+          if(resourceProfile) PetscCall(printResourceMark("before_custom_amg_gate5_refresh",reportCells,0.0,tTotal0));
+          PetscCall(customPressureAMGBuildHierarchy(M,D,rank,customPressureB,customMom,reportCells,
+            P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE,customAMGConfig,customAMGLive));
+          PetscCall(PetscTime(&tcg1));
+          customAMGLiveReady=PETSC_TRUE; pressurePcRefreshes++; pressurePcRefreshSeconds+=(double)(tcg1-tcg0);
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_CUSTOM_AMG_GATE5_HIERARCHY_REFRESH status=PASS it=%" PetscInt_FMT " interval=%" PetscInt_FMT " refreshCount=%" PetscInt_FMT " setupSeconds=%.6f levels=%zu retainedEstimateMiB=%.3f fineSchurCSR=0 PETScGAMG=0\n",
+            it,pPreconditionerRefresh,pressurePcRefreshes,(double)(tcg1-tcg0),customAMGLive.amg.levels.size(),customAMGLive.retainedMiB));
+          if(resourceProfile) PetscCall(printResourceMark("after_custom_amg_gate5_refresh",reportCells,tcg1-tcg0,tTotal0));
+        } else if(customPressureBackend) pressurePcReuses++;
+        const PetscBool needExplicitSchur = (!customPressureBackend && (pOperatorMode=="explicit" ||
           (pPmatMode=="full" && (!lagFullPmat || pcRefreshStep)) ||
-          (factoredBenchmark && !factoredBenchmarkDone && it==factoredBenchmarkAt)) ? PETSC_TRUE : PETSC_FALSE;
-        const PetscBool needNativeCompact = (pPmatMode=="native_face" && (!lagNativeCompactPmat || pcRefreshStep)) ? PETSC_TRUE : PETSC_FALSE;
+          (factoredBenchmark && !factoredBenchmarkDone && it==factoredBenchmarkAt))) ? PETSC_TRUE : PETSC_FALSE;
+        const PetscBool needNativeCompact = (!customPressureBackend && pPmatMode=="native_face" && (!lagNativeCompactPmat || pcRefreshStep)) ? PETSC_TRUE : PETSC_FALSE;
         if(needExplicitSchur) PetscCall(updatePressureSchurFullNative(customMom,PETSC_TRUE,PSchur));
         if(needNativeCompact) {
           if(gate9gFeFace) PetscCall(updatePressureCompactFeFaceEnergy(M,D,P,rank,customPressureB,customMom,PSchur,gate9gAudit));
           else PetscCall(updatePressureCompactNative(M,D,rank,customPressureB,customMom,(double)feFvP1Strength,PSchur));
         }
-        if(pPmatMode!="full" && pPmatMode!="native_face")
+        if(!customPressureBackend && pPmatMode!="full" && pPmatMode!="native_face")
           SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M11 native velocity path supports production pressure Pmat modes full or native_face only");
         if(lagFullPmat && needExplicitSchur) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
           "P1BF3_FULL_PMAT_VALUE_REFRESH it=%" PetscInt_FMT " interval=%" PetscInt_FMT " pmat=full_explicit_Schur_snapshot exactOperator=factored currentRauSnapshot=1\n",
@@ -877,11 +1009,53 @@ int main(int argc,char **argv) {
             fullPmatOracleTol,sizeof(PetscReal)));
           customPressureLiveSchurParityDone=PETSC_TRUE;
         }
+        if(customAMGGate2Probe && !customAMGGate2ProbeDone) {
+          if(!needExplicitSchur || !PSchur.S)
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"custom AMG Gate-2 debug probe requires the PETSc full-Schur oracle on its first refresh");
+          PetscCall(customPressureAMGGate2Probe(M,D,rank,customPressureB,customMom,PSchur.S,reportCells,
+            P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE));
+          customAMGGate2ProbeDone=PETSC_TRUE;
+        }
         if(pPmatMode=="native_face" && it==1) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
           "P1BF3_B2_EXACT_OPERATOR_GUARD status=PASS physicalSchur=custom_FP64_B_rAU_Bt compactPmatNeverUsedForMatMult=1 previousExactParityValidated=1\n"));
 
         PetscCall(PetscTime(&ts0));
-        if(!pksp) {
+        if(customPressureBackend) {
+          if(!customAMGLiveReady) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom AMG Gate-5 hierarchy was not built before pressure solve setup");
+          if(!customAMGGaugePrinted) {
+            if(P.mode==ProblemMode::MMS) {
+              PetscCall(MatNullSpaceCreate(PETSC_COMM_WORLD,PETSC_TRUE,0,nullptr,&nsp));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_NULLSPACE constantMode=PASS gauge=mean_zero operator=custom_matrix_free_B_rAU_Bt backend=%s\n",pressurePCBackendName(pressurePcBackend)));
+            } else {
+              std::vector<double> one((std::size_t)customPressureB.pressureHalo.nOwned,1.0),act;
+              PetscCall(customPressureSchurApply(customPressureB,customMom,one,act));
+              double an=0.0; PetscCall(customPressureNorm2(act,&an));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_GAUGE mode=physical_flow_boundary pressureNullspace=OFF constantActionNorm=%.12e operator=custom_matrix_free_B_rAU_Bt backend=%s\n",an,pressurePCBackendName(pressurePcBackend)));
+              if(!(an>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom AMG pressure operator did not anchor constant mode for flow-in/flow-out problem");
+            }
+            customAMGGaugePrinted=PETSC_TRUE;
+          }
+          if(!customAMGLiveConfigPrinted) {
+            if(pressureSolveMode=="custom_richardson") {
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_SOLVER ksp=custom_FP64_Richardson pc=%s pmat=NONE operator=factored_matrix_free pressureOperatorUpdate=every_SIMPLE_iteration_values_only preconditionerRefresh=%" PetscInt_FMT " refreshSemantics=0_refresh_every_iteration_else_initial_then_every_N_SIMPLE PETScKSP=NONE PETScPC=NONE\n",
+                pressurePCBackendName(pressurePcBackend),pPreconditionerRefresh));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_OUTER_CONFIG mode=custom_richardson pc=%s configuredKsp=native_FP64_Richardson rtol=%.3e atol=%.3e dtol=%.3e maxIts=%" PetscInt_FMT " omega=%.12e oneVcyclePerStep=1\n",
+                pressurePCBackendName(pressurePcBackend),(double)customLivePRtol,(double)customLivePAtol,(double)customLivePDtol,customLivePMaxIts,(double)customRichardsonOmega));
+            } else {
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_SOLVER ksp=custom_FP64_PCG pc=%s pmat=NONE operator=factored_matrix_free pressureOperatorUpdate=every_SIMPLE_iteration_values_only preconditionerRefresh=%" PetscInt_FMT " refreshSemantics=0_refresh_every_iteration_else_initial_then_every_N_SIMPLE PETScKSP=NONE PETScPC=NONE\n",
+                pressurePCBackendName(pressurePcBackend),pPreconditionerRefresh));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_OUTER_CONFIG mode=custom_pcg pc=%s configuredKsp=native_FP64_PCG rtol=%.3e atol=%.3e dtol=%.3e maxIts=%" PetscInt_FMT "\n",
+                pressurePCBackendName(pressurePcBackend),(double)customLivePRtol,(double)customLivePAtol,(double)customLivePDtol,customLivePMaxIts));
+            }
+            customAMGLiveConfigPrinted=PETSC_TRUE;
+          }
+        } else if(!pksp) {
           if(P.mode==ProblemMode::MMS) {
             PetscCall(MatNullSpaceCreate(PETSC_COMM_WORLD,PETSC_TRUE,0,nullptr,&nsp));
             PetscCall(MatSetNullSpace(pressureOperator,nsp));
@@ -1004,10 +1178,15 @@ int main(int argc,char **argv) {
           PetscCall(PetscPrintf(PETSC_COMM_WORLD,
             "P1BF3_INITIAL_OPERATOR_SETUP seconds=%.6f convection=%.6f supg=%.6f derived=%.6f schur=%.6f kspAndPc=%.6f cells=%zu\n",
             (double)(top1-top0),convectionUpdateSeconds,supgUpdateSeconds,derivedUpdateSeconds,schurUpdateSeconds,kspOperatorSeconds,(std::size_t)reportCells));
-          if(resourceProfile) PetscCall(printResourceMark("after_initial_operator_gamg",reportCells,top1-top0,tTotal0));
+          if(resourceProfile) PetscCall(printResourceMark(customPressureBackend?"after_initial_operator_custom_amg":"after_initial_operator_gamg",reportCells,top1-top0,tTotal0));
           if(memoryAudit) {
-            PetscCall(printMemoryAuditMat("after_initial_operator_gamg","pressure.Pmat_active",pressurePmat,reportCells));
-            PetscCall(auditGAMGMemory(pksp,reportCells));
+            if(customPressureBackend) {
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_CUSTOM_AMG_GATE5_MEMORY_AUDIT status=PASS pressurePmat=NONE PETScGAMG=NONE hierarchyRetainedMiB=%.6f livePCGWorkspaceAllocatedOnDemand=1\n",customAMGLive.retainedMiB));
+            } else {
+              PetscCall(printMemoryAuditMat("after_initial_operator_gamg","pressure.Pmat_active",pressurePmat,reportCells));
+              PetscCall(auditGAMGMemory(pksp,reportCells));
+            }
             PetscCall(printResourceMark("memory_audit_complete",reportCells,0.0,tTotal0));
           }
         }
@@ -1074,10 +1253,12 @@ int main(int argc,char **argv) {
       double prhsNorm=0.0; PetscCall(customPressureNorm2(pressureResidual,&prhsNorm));
       if(!std::isfinite(prhsNorm)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"pressure-correction RHS became NaN/Inf at SIMPLE it %" PetscInt_FMT,it);
       PetscReal pcgRtol=0,pcgAtol=0,pcgDtol=0; PetscInt pcgMaxIts=0;
-      PetscCall(KSPGetTolerances(pksp,&pcgRtol,&pcgAtol,&pcgDtol,&pcgMaxIts));
+      if(customPressureBackend) {
+        pcgRtol=customLivePRtol; pcgAtol=customLivePAtol; pcgDtol=customLivePDtol; pcgMaxIts=customLivePMaxIts;
+      } else PetscCall(KSPGetTolerances(pksp,&pcgRtol,&pcgAtol,&pcgDtol,&pcgMaxIts));
 
       PetscInt petscRefIts=-1; std::vector<double> petscRefSolution;
-      if(m5bPcgReference && !pressurePcgReferenceDone) {
+      if(!customPressureBackend && m5bPcgReference && !pressurePcgReferenceDone) {
         PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,pressureResidual));
         PetscCall(VecSet(pcOut,0)); PetscCall(KSPSetInitialGuessNonzero(pksp,PETSC_FALSE));
         PetscCall(KSPSolve(pksp,pcIn,pcOut));
@@ -1399,24 +1580,58 @@ int main(int argc,char **argv) {
             it,statCycles,statTrueRel,(double)pcgRtol));
           break;
         }
-      } else if(pressureSolveMode=="custom_pcg") {
-        PetscCall(customPressurePCG(customPressureB,customMom,ppc,pcIn,pcOut,pressureResidual,
-          (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,nsp?PETSC_TRUE:PETSC_FALSE,pressurePcgW,pcgRes,m10PcgProfile?&m10This:nullptr));
-        if(!pcgRes.converged) {
-          solveFailed=PETSC_TRUE; pressureFailureReason=-901;
+      } else if(pressureSolveMode=="custom_richardson") {
+        if(!customPressureBackend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom Richardson selected without custom AMG backend");
+        const PetscInt vcyclesBefore=customAMGLive.vcycleApplyCount;
+        PetscCall(customPressureAMGLiveRichardsonSolve(customAMGLive,customPressureB,customMom,pressureResidual,
+          (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,(double)customRichardsonOmega,customAMGRichW,customAMGRichResult));
+        if(!customAMGRichResult.converged) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-952;
           PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-            "P1BF3_SOLVE_FAILURE stage=custom_pressure_pcg it=%" PetscInt_FMT " its=%" PetscInt_FMT " relPrec=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
-            it,pcgRes.its,pcgRes.finalPreconditionedRel));
+            "P1BF3_SOLVE_FAILURE stage=custom_amg_live_richardson it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " trueRel=%.3e finite=%d omega=%.6e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+            it,customAMGRichResult.its,customAMGRichResult.trueRel,(int)customAMGRichResult.finite,(double)customRichardsonOmega));
           break;
         }
-        pits=pcgRes.its;
-        pressureCorrection=pressurePcgW.x;
-        if(gate9eNgfv) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-          "P1BF3_GATE9E_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_nodal_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
-          it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
-        if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-          "P1BF3_GATE9G_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_FE_face_energy_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
-          it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
+        pits=customAMGRichResult.its;
+        pressureCorrection=customAMGRichW.x;
+        if(it<=10 || it%10==0 || allInitialResidualsMet) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_CUSTOM_AMG_RICHARDSON_PRESSURE it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " converged=1 trueRel=%.6e rtol=%.3e atol=%.3e omega=%.6e vcyclesThisSolve=%" PetscInt_FMT " hierarchyRefreshes=%" PetscInt_FMT " exactOperator=matrix_free_B_rAU_Bt fineSchurCSR=0 PETScGAMG=0 outerKrylov=Richardson\n",
+          it,pits,customAMGRichResult.trueRel,(double)pcgRtol,(double)pcgAtol,(double)customRichardsonOmega,customAMGLive.vcycleApplyCount-vcyclesBefore,pressurePcRefreshes));
+      } else if(pressureSolveMode=="custom_pcg") {
+        if(customPressureBackend) {
+          PetscCall(customPressureAMGLivePCGSolve(customAMGLive,customPressureB,customMom,pressureResidual,
+            (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,customAMGLiveW,customAMGLiveResult));
+          if(!customAMGLiveResult.converged) {
+            solveFailed=PETSC_TRUE; pressureFailureReason=-951;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_SOLVE_FAILURE stage=custom_amg_live_pcg it=%" PetscInt_FMT " its=%" PetscInt_FMT " trueRel=%.3e finite=%d action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+              it,customAMGLiveResult.its,customAMGLiveResult.trueRel,(int)customAMGLiveResult.finite));
+            break;
+          }
+          pits=customAMGLiveResult.its;
+          pressureCorrection=customAMGLiveW.x;
+          if(it<=10 || it%10==0 || allInitialResidualsMet) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_CUSTOM_AMG_GATE5_PRESSURE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=1 trueRel=%.6e rtol=%.3e atol=%.3e vcyclesApplied=%" PetscInt_FMT " hierarchyRefreshes=%" PetscInt_FMT " exactOperator=matrix_free_B_rAU_Bt fineSchurCSR=0 PETScGAMG=0\n",
+            it,pits,customAMGLiveResult.trueRel,(double)pcgRtol,(double)pcgAtol,customAMGLive.vcycleApplyCount,pressurePcRefreshes));
+        } else {
+          PetscCall(customPressurePCG(customPressureB,customMom,ppc,pcIn,pcOut,pressureResidual,
+            (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,nsp?PETSC_TRUE:PETSC_FALSE,pressurePcgW,pcgRes,m10PcgProfile?&m10This:nullptr));
+          if(!pcgRes.converged) {
+            solveFailed=PETSC_TRUE; pressureFailureReason=-901;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_SOLVE_FAILURE stage=custom_pressure_pcg it=%" PetscInt_FMT " its=%" PetscInt_FMT " relPrec=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+              it,pcgRes.its,pcgRes.finalPreconditionedRel));
+            break;
+          }
+          pits=pcgRes.its;
+          pressureCorrection=pressurePcgW.x;
+          if(gate9eNgfv) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9E_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_nodal_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
+            it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
+          if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9G_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_FE_face_energy_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
+            it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
+        }
       } else {
         // Gate 1 live path: PETSc FGMRES sees the exact factored Schur as A and
         // exactly the same existing pressure Pmat/GAMG as the old custom PCG.
@@ -1563,8 +1778,8 @@ int main(int argc,char **argv) {
         }
       }
       PetscCall(PetscTime(&tps1)); pressureSolveSeconds += (double)(tps1-tps0);
-      if(pressureSolveMode=="custom_pcg" && m10PcgProfile) { m10This.solves=1; m10This.totalPcg=(double)(tps1-tps0); m10ProfileAdd(m10PcgTotal,m10This); if(it>1) m10ProfileAdd(m10PcgWarm,m10This); }
-      if(pressureSolveMode=="custom_pcg" && m5bPcgReference && !pressurePcgReferenceDone) {
+      if(!customPressureBackend && pressureSolveMode=="custom_pcg" && m10PcgProfile) { m10This.solves=1; m10This.totalPcg=(double)(tps1-tps0); m10ProfileAdd(m10PcgTotal,m10This); if(it>1) m10ProfileAdd(m10PcgWarm,m10This); }
+      if(!customPressureBackend && pressureSolveMode=="custom_pcg" && m5bPcgReference && !pressurePcgReferenceDone) {
         if(petscRefSolution.size()!=pressurePcgW.x.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A reference solution size mismatch");
         std::vector<double> diff(pressurePcgW.x.size()); for(std::size_t i=0;i<diff.size();++i) diff[i]=pressurePcgW.x[i]-petscRefSolution[i];
         double dn=0.0,rnRef=0.0; PetscCall(customPressureNorm2(diff,&dn)); PetscCall(customPressureNorm2(petscRefSolution,&rnRef));
@@ -1618,6 +1833,16 @@ int main(int argc,char **argv) {
       "P1BF3_WORK outerIts=%" PetscInt_FMT " avgUIts=[%.3f,%.3f,%.3f] avgPCG=%.3f pSolves=%" PetscInt_FMT " operatorUpdateSeconds=%.6f\n",
       finalIt,finalIt?double(sumU[0])/finalIt:0.0,finalIt?double(sumU[1])/finalIt:0.0,finalIt?double(sumU[2])/finalIt:0.0,
       pSolves?double(sumP)/pSolves:0.0,pSolves,operatorUpdateSeconds));
+    if(customPressureBackend) {
+      unsigned long long lw=(pressureSolveMode=="custom_richardson")?customPressureAMGLiveRichardsonWorkspaceBytes(customAMGRichW):customPressureAMGLivePCGWorkspaceBytes(customAMGLiveW),gw=0;
+      PetscCallMPI(MPI_Allreduce(&lw,&gw,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_CUSTOM_AMG_GATE5_MEMORY hierarchyRetainedMiB=%.6f livePressureWorkspaceMiB=%.6f livePCGWorkspaceMiB=%.6f explicitFineSchurMiB=0 flatSchurPlanMiB=0 PETScGAMGMiB=0 PETScPressureBridgeVecsMiB=0 customHierarchyRefreshes=%" PetscInt_FMT "\n",
+        customAMGLive.retainedMiB,(double)gw/(1024.0*1024.0),pressureSolveMode=="custom_pcg"?(double)gw/(1024.0*1024.0):0.0,pressurePcRefreshes));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_CUSTOM_AMG_GATE5_RESULT status=%s roadmapGates=6 liveSimpleBackend=%s exactFineOperator=matrix_free_B_rAU_Bt fineSchurCSR=NONE flatSchurPlan=NONE PETScPmat=NONE PETScGAMG=NONE PETScKSP=NONE outerPressure=%s generalFlowContract=PASS outerIts=%" PetscInt_FMT " avgPressureIts=%.6f followOnSA=%d\n",
+        converged?"PASS":"FAIL",pressurePCBackendName(pressurePcBackend),pressureSolveMode=="custom_richardson"?"RICHARDSON":"PCG",finalIt,pSolves?double(sumP)/pSolves:0.0,(int)customAMGConfig.smoothedAggregation));
+    }
     if(gate9iAutoChebyshev) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
       "P1BF3_GATE9I_SUMMARY pressureSolves=%" PetscInt_FMT " totalChebSteps=%" PetscInt_FMT " avgChebSteps=%.6f spectrumEstimates=%" PetscInt_FMT " totalPowerIts=%" PetscInt_FMT " finalLambdaHat=%.12e finalLambdaMin=%.12e finalLambdaMax=%.12e powerSeconds=%.6f chebSeconds=%.6f rtol=%.3e atol=%.3e pcRefresh=%" PetscInt_FMT " spectrumRefresh=%" PetscInt_FMT " fixedSteps=%" PetscInt_FMT " requireTarget=%d\n",
       gate9iPressureSolves,gate9iTotalChebSteps,gate9iPressureSolves?double(gate9iTotalChebSteps)/gate9iPressureSolves:0.0,

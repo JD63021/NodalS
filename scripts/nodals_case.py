@@ -57,6 +57,23 @@ def _require(cp, section, key):
     return v
 
 
+def _get_amg(cp, key: str, default: str, legacy_pressure_key: str | None = None) -> str:
+    """Read a custom-AMG knob from [pressure_amg].
+
+    The dedicated section is the public case-file interface.  A small set of
+    historical [pressure] keys is still accepted so old benchmark cases keep
+    translating to the same PETSc options.
+    """
+    v = _get(cp, "pressure_amg", key, None)
+    if v is not None:
+        return v
+    if legacy_pressure_key:
+        v = _get(cp, "pressure", legacy_pressure_key, None)
+        if v is not None:
+            return v
+    return default
+
+
 def _opt(args: List[str], key: str, value) -> None:
     args.extend([f"-{key}", str(value)])
 
@@ -157,27 +174,62 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
     _opt(a, "u_local_sweeps", _get(cp, "momentum", "local_sweeps", "1"))
     _opt(a, "u_sor_omega", _get(cp, "momentum", "sor_omega", "1"))
 
-    # Pressure backend. NodalS exposes both accepted production architectures:
-    #   fast_full_gamg  : full explicit Schur snapshot as Pmat + PETSc GAMG-preconditioned Richardson
-    #   compact_cheb    : compact FE-face-energy Pmat + GAMG PC + custom FP64 Chebyshev
-    # compact_pcg remains available as the legacy low-memory custom-PCG alternative.
+    # Pressure solver / preconditioner selection.
+    #
+    # The three native custom-AMG combinations exposed to .case files are the
+    # combinations that survived the large-mesh validation campaign:
+    #
+    #   pcg_unsmoothed       native FP64 PCG + unsmoothed aggregation AMG
+    #   pcg_smoothed         native FP64 PCG + Jacobi-smoothed aggregation AMG
+    #   richardson_smoothed  native FP64 Richardson + smoothed aggregation AMG
+    #
+    # Unsmoothed Richardson remains possible only through direct expert PETSc
+    # options; it is intentionally not a public case mode because it failed the
+    # matched stationary-solver robustness test on larger meshes.
+    #
+    # PETSc/full-Schur and the older compact routes remain available unchanged.
     raw_psolver = _get(cp, "pressure", "mode", _get(cp, "pressure", "solver", "fast_full_gamg")).lower()
     aliases = {
         "fast_full_gamg": "fast_full_gamg",
         "full_gamg": "fast_full_gamg",
         "full_gamg_richardson": "fast_full_gamg",
         "gamg_richardson": "fast_full_gamg",
+        "full_pcg_gamg": "full_pcg_gamg",
+        "pcg_full_gamg": "full_pcg_gamg",
+        "pcg_gamg_full": "full_pcg_gamg",
         "compact_cheb": "compact_cheb",
         "cheb_gamg": "compact_cheb",
         "low_memory": "compact_cheb",
         "low_memory_cheb": "compact_cheb",
         "compact_pcg": "compact_pcg",
         "pcg_gamg": "compact_pcg",
+
+        # Canonical native-AMG names.
+        "pcg_unsmoothed": "pcg_unsmoothed",
+        "pcg_smoothed": "pcg_smoothed",
+        "richardson_smoothed": "richardson_smoothed",
+
+        # Backward-compatible names used during Gate-5 / scaling development.
+        "custom_amg": "pcg_unsmoothed",
+        "custom_agg_unsmoothed": "pcg_unsmoothed",
+        "custom_unsmoothed": "pcg_unsmoothed",
+        "native_amg": "pcg_unsmoothed",
+        "custom_amg_smoothed": "pcg_smoothed",
+        "custom_agg_smoothed": "pcg_smoothed",
+        "custom_smoothed": "pcg_smoothed",
+        # Historical custom_amg_richardson is deliberately routed to the
+        # validated smoothed Richardson combination.
+        "custom_amg_richardson": "richardson_smoothed",
+        "custom_richardson": "richardson_smoothed",
     }
     if raw_psolver not in aliases:
-        raise ValueError("[pressure] mode must be fast_full_gamg, compact_cheb, or compact_pcg")
+        raise ValueError(
+            "[pressure] mode must be fast_full_gamg, full_pcg_gamg, compact_cheb, "
+            "compact_pcg, pcg_unsmoothed, pcg_smoothed, or richardson_smoothed"
+        )
     psolver = aliases[raw_psolver]
 
+    custom_modes = {"pcg_unsmoothed", "pcg_smoothed", "richardson_smoothed"}
     requested_pmat = _get(cp, "pressure", "pmat", "").lower().strip()
     if psolver == "fast_full_gamg":
         if requested_pmat and requested_pmat != "full":
@@ -186,6 +238,15 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
         solve_mode = "gamg_richardson"
         default_refresh, default_prtol, default_pmax = "100", "0.5", "20"
         default_pksp = "richardson"
+    elif psolver == "full_pcg_gamg":
+        # Exact FP64 matrix-free Schur residual/action, explicit full-Schur PETSc
+        # Pmat + GAMG PCApply, native FP64 PCG outer.
+        if requested_pmat and requested_pmat != "full":
+            raise ValueError("full_pcg_gamg requires [pressure] pmat = full")
+        pmat = "full"
+        solve_mode = "custom_pcg"
+        default_refresh, default_prtol, default_pmax = "100", "0.5", "20"
+        default_pksp = "cg"
     elif psolver == "compact_cheb":
         if requested_pmat and requested_pmat != "compact":
             raise ValueError("compact_cheb requires [pressure] pmat = compact")
@@ -193,7 +254,73 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
         solve_mode = "custom_pcg"
         default_refresh, default_prtol, default_pmax = "1", "0.1", "300"
         default_pksp = "cg"
+    elif psolver in custom_modes:
+        # Native low-memory pressure path.  No explicit fine Schur CSR, PETSc
+        # pressure Pmat, PETSc GAMG hierarchy, or PETSc pressure KSP is created.
+        if requested_pmat and requested_pmat not in {"full", "none", "custom"}:
+            raise ValueError("custom AMG accepts [pressure] pmat = full/none/custom (all mean no PETSc pressure Pmat)")
+        pmat = "full"  # compatibility token consumed by the legacy option layer
+        solve_mode = "custom_richardson" if psolver == "richardson_smoothed" else "custom_pcg"
+        expected_backend = "custom_agg_unsmoothed" if psolver == "pcg_unsmoothed" else "custom_agg_smoothed"
+        default_refresh, default_prtol, default_pmax = "100", "0.5", "20"
+        default_pksp = "richardson" if psolver == "richardson_smoothed" else "cg"
+
+        # [pressure] backend is retained as an expert/backward-compatibility key,
+        # but a canonical mode may not silently select a contradictory hierarchy.
+        pc_backend_raw = _get(cp, "pressure", "backend", None)
+        if pc_backend_raw is not None:
+            pc_backend_aliases = {
+                "custom_agg_unsmoothed": "custom_agg_unsmoothed",
+                "custom_unsmoothed": "custom_agg_unsmoothed",
+                "custom_agg_smoothed": "custom_agg_smoothed",
+                "custom_smoothed": "custom_agg_smoothed",
+            }
+            key = pc_backend_raw.lower().strip()
+            if key not in pc_backend_aliases:
+                raise ValueError("custom AMG [pressure] backend must be custom_agg_unsmoothed or custom_agg_smoothed")
+            selected_backend = pc_backend_aliases[key]
+            if selected_backend != expected_backend:
+                raise ValueError(f"[pressure] mode={psolver} requires backend={expected_backend}")
+        _opt(a, "pressure_pc_backend", expected_backend)
+
+        # Public custom-AMG controls.  These defaults are the frozen settings
+        # used by the 768k/1.1M/2M/7M validation runs.
+        amg_target = _get_amg(cp, "target_aggregate", "8")
+        amg_min = _get_amg(cp, "min_aggregate", "6")
+        amg_soft_max = _get_amg(cp, "soft_max_aggregate", "10")
+        amg_cheb_degree = _get_amg(cp, "chebyshev_degree", "2")
+        amg_power_its = _get_amg(cp, "power_iterations", "16")
+        amg_lambda_safety = _get_amg(cp, "lambda_safety", "1.50")
+        amg_lambda_low = _get_amg(cp, "lambda_low_fraction", "0.05")
+        amg_coarse_target = _get_amg(cp, "coarse_target_rows", "1000")
+        amg_interp_nnz = _get_amg(cp, "interpolation_max_row_nnz", "8", "sa_interp_max_nnz")
+        amg_sa_damping = _get_amg(cp, "sa_damping", "1.3333333333333333", "sa_damping")
+        amg_richardson_omega = _get_amg(cp, "richardson_omega", "1.0", "richardson_omega")
+
+        # Fail early in the case translator rather than several seconds into an
+        # MPI setup if a human-edited case contains an impossible AMG setting.
+        if int(amg_target) < 2 or int(amg_min) < 1 or int(amg_soft_max) < int(amg_min):
+            raise ValueError("[pressure_amg] aggregate sizes require target>=2, min>=1, soft_max>=min")
+        if int(amg_cheb_degree) < 1 or int(amg_power_its) < 2 or int(amg_coarse_target) < 16 or int(amg_interp_nnz) < 1:
+            raise ValueError("[pressure_amg] invalid Chebyshev/power/coarse/interpolation integer control")
+        if float(amg_lambda_safety) <= 1.0 or not (0.0 < float(amg_lambda_low) < 1.0):
+            raise ValueError("[pressure_amg] requires lambda_safety>1 and 0<lambda_low_fraction<1")
+        if float(amg_sa_damping) <= 0.0 or float(amg_richardson_omega) <= 0.0:
+            raise ValueError("[pressure_amg] sa_damping and richardson_omega must be >0")
+
+        _opt(a, "custom_amg_target_aggregate", amg_target)
+        _opt(a, "custom_amg_min_aggregate", amg_min)
+        _opt(a, "custom_amg_soft_max_aggregate", amg_soft_max)
+        _opt(a, "custom_amg_cheb_degree", amg_cheb_degree)
+        _opt(a, "custom_amg_power_its", amg_power_its)
+        _opt(a, "custom_amg_lambda_safety", amg_lambda_safety)
+        _opt(a, "custom_amg_lambda_low_fraction", amg_lambda_low)
+        _opt(a, "custom_amg_coarse_target", amg_coarse_target)
+        _opt(a, "custom_amg_interp_max_nnz", amg_interp_nnz)
+        _opt(a, "custom_amg_sa_damping", amg_sa_damping)
+        _opt(a, "custom_amg_richardson_omega", amg_richardson_omega)
     else:
+        # Legacy compact custom-PCG route using PETSc PCApply.
         pmat = requested_pmat or "compact"
         if pmat not in {"compact", "full"}:
             raise ValueError("[pressure] pmat must be compact or full")
@@ -205,17 +332,18 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
     _opt(a, "p_pmat", "native_face" if pmat == "compact" else "full")
     _opt(a, "p_operator", "factored")
     _opt(a, "p_preconditioner_refresh", _get(cp, "pressure", "refresh", default_refresh))
-    _opt(a, "p_ksp_type", _get(cp, "pressure", "ksp_type", default_pksp))
     prtol = _get(cp, "pressure", "rtol", default_prtol)
     patol = _get(cp, "pressure", "atol", "1e-12")
     _opt(a, "p_ksp_rtol", prtol)
     _opt(a, "p_ksp_atol", patol)
     _opt(a, "p_ksp_divtol", _get(cp, "pressure", "divtol", "1e8"))
     _opt(a, "p_ksp_max_it", _get(cp, "pressure", "max_iterations", default_pmax))
-    _opt(a, "p_pc_type", _get(cp, "pressure", "pc_type", "gamg"))
-    _opt(a, "p_mg_levels_ksp_type", _get(cp, "pressure", "mg_level_ksp", "richardson"))
-    _opt(a, "p_mg_levels_pc_type", _get(cp, "pressure", "mg_level_pc", "jacobi"))
-    _opt(a, "p_mg_levels_ksp_max_it", _get(cp, "pressure", "mg_level_iterations", "1"))
+    if psolver not in custom_modes:
+        _opt(a, "p_ksp_type", _get(cp, "pressure", "ksp_type", default_pksp))
+        _opt(a, "p_pc_type", _get(cp, "pressure", "pc_type", "gamg"))
+        _opt(a, "p_mg_levels_ksp_type", _get(cp, "pressure", "mg_level_ksp", "richardson"))
+        _opt(a, "p_mg_levels_pc_type", _get(cp, "pressure", "mg_level_pc", "jacobi"))
+        _opt(a, "p_mg_levels_ksp_max_it", _get(cp, "pressure", "mg_level_iterations", "1"))
 
     # Compact FE-face-energy and Chebyshev controls are enabled only for the low-memory route.
     compact_fe = (psolver in {"compact_cheb", "compact_pcg"} and pmat == "compact")
