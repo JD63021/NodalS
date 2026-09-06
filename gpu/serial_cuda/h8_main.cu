@@ -211,7 +211,7 @@ struct G4PressureFine {
   }
   void apply_live(const StateReal*x,StateReal*y){
     if(physicalUseCurrentCSR){
-      static_assert(std::is_same<StateReal,AMGReal>::value,"H2B physical CSR requires matching FP32 state/AMG types");
+      static_assert(std::is_same<StateReal,AMGReal>::value,"H2B physical CSR requires matching StateReal/AMGReal types");
       if(!csr_pc)throw std::runtime_error("H2B physical CSR pointer null");
       int qt=h0_begin(H0_FINE_LIVE_TOTAL);csr_pc->apply((const AMGReal*)x,(AMGReal*)y);h0_end(qt);
     } else apply_with_rau(x,y,rau_live,true);
@@ -880,10 +880,10 @@ static void h8_select_precomputed_b(G4Gpu&G,const char*tag)
   constexpr int reps=8;
   std::printf(
     "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu totalMiB=%.3f "
-    "build=SETUP_ONCE storage=FP32 status=PASS\n",
+    "build=SETUP_ONCE storage=OperatorReal precision=%s status=PASS\n",
     tag,H8_BCOEFF_PER_CELL,
     (std::size_t)H8_BCOEFF_PER_CELL*sizeof(OperatorReal),
-    (double)G.bcoeff.bytes()/(1024.0*1024.0));
+    (double)G.bcoeff.bytes()/(1024.0*1024.0),kPrecisionName);
 
   // ---- Exact fine CSR numeric refresh ----
   DeviceBuffer<AMGReal> valRef(G.fineCsr.val.size());
@@ -1088,7 +1088,7 @@ static void h0_print_profile(const char*tag,int outer,double pressureStageMs,dou
 }
 
 int main(int argc,char**argv){try{
-  std::string mesh,tag="40k_fp32_tune",wall="patch_0_0",inlet="patch_2_0",outlet="patch_1_0";
+  std::string mesh,tag="h8",wall="patch_0_0",inlet="patch_2_0",outlet="patch_1_0";
   double re=20,bulk=1,simpleTol=1e-6;
   double alphaU=.5,alphaP=.5;
   double momRtol=1e-6,momAtol=1e-12,momDrop=.1,momOmega=1.0;
@@ -1129,7 +1129,6 @@ int main(int argc,char**argv){try{
   if(!(snapshotTol>0.0))throw std::runtime_error("H8 snapshot tolerance must be positive");
   if(fineCsrRefreshEvery!=1)throw std::runtime_error("H8 requires fine CSR refreshEvery=1");
   if(momentumWork!="fgs1")throw std::runtime_error("H8 requires momentum-work=fgs1");
-  if(runMode!="fixed10")throw std::runtime_error("H8 is fixed10-only");
   if(!(runMode=="fixed10"||runMode=="converge"))throw std::runtime_error("H8 run-mode must be fixed10 or converge");
   if(runMode=="fixed10"&&maxOuter!=10)throw std::runtime_error("H8 fixed10 requires maxOuter=10");
   const bool physicalUseCurrentCSR=true;
@@ -1143,8 +1142,9 @@ int main(int argc,char**argv){try{
   auto H=build_sa_hierarchy(M,S.pressure,16,6,18,1000,8,16,1.5,0.05,4.0/3.0);
   auto FH=build_h2_fine_csr_host(S);
 
-  std::printf("NODALS_GPU_H8_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_FP32_CSR_warp coarseAMGSpMV=per_level_scalar_vs_warp_hybrid fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ momentumAssemblyExec=SETUP_SELECT_SCALAR_VS_WARP BGeometry=SETUP_PRECOMPUTED_24FP32_PER_CELL_AUTOSELECT alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=FP32 operator=FP32 amg=FP32\n",
-    tag.c_str(),kPrecisionName,prop.name,prop.major,prop.minor,M.tets.size(),runMode.c_str(),momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",alphaU,alphaP,simpleTol,maxOuter,momOmega,pRtol,pAtol,pMax);
+  std::printf("NODALS_GPU_H8_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_%s_CSR_warp coarseAMGSpMV=per_level_scalar_vs_warp_hybrid fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ momentumAssemblyExec=SETUP_SELECT_SCALAR_VS_WARP BGeometry=SETUP_PRECOMPUTED_24_%s_PER_CELL_AUTOSELECT alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=%s operator=%s amg=%s\n",
+    tag.c_str(),kPrecisionName,prop.name,prop.major,prop.minor,M.tets.size(),runMode.c_str(),momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",
+    kPrecisionName,kPrecisionName,alphaU,alphaP,simpleTol,maxOuter,momOmega,pRtol,pAtol,pMax,kPrecisionName,kPrecisionName,kPrecisionName);
   std::printf("NODALS_GPU_H8_TUNING alphaU=%.8g alphaP=%.8g momentumWork=%s momentumOmega=%.8g momentumAdaptiveTol=DISABLED momentumResidualPolicy=%s pRtol=%.3e pAtol=%.3e pMax=%d simpleTol=%.3e maxOuter=%d snapshotTol=%.3e fineCsrRefreshEvery=1 status=PASS\n",
     alphaU,alphaP,momentumWork.c_str(),momOmega,runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",pRtol,pAtol,pMax,simpleTol,maxOuter,snapshotTol);
   std::printf("NODALS_GPU_H8_FINE_CSR_TOPOLOGY tag=%s cells=%zu nnz=%zu rowMean=%.6f rowMax=%u directedContrib=%llu csrMiB=%.3f compactRefreshMetadataMiB=%.3f totalFineCsrMiB=%.3f bytesPerCell=%.3f status=PASS\n",
@@ -1207,7 +1207,7 @@ int main(int argc,char**argv){try{
       ++fineCsrRefreshCount;
     }
     auto pr=pressure_pcg(G.pf,G.amg,G.cont.data(),pRtol,pAtol,pMax,G.pcg,G.dotScratch);
-    pressureAll=pressureAll&&pr.ok;if(!pr.ok)throw std::runtime_error("H8 pressure PCG failed requested FP32 inexact target");sumP+=pr.its;E.rec(4);
+    pressureAll=pressureAll&&pr.ok;if(!pr.ok)throw std::runtime_error("H8 pressure PCG failed requested inexact target");sumP+=pr.its;E.rec(4);
     g4_axpy_kernel<<<g4grid(G.nc),G4B>>>(G.nc,alphaP,G.pcg.x.data(),G.p.data());NODALS_CUDA(cudaGetLastError());E.rec(5);
     NODALS_CUDA(cudaEventSynchronize(E.e[5]));H0P.collect();
 
@@ -1244,9 +1244,9 @@ int main(int argc,char**argv){try{
   h0_print_profile(tag.c_str(),finalIt,tPressure,tMomentum,H0P);
   std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_convergence cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f runtimeDriftMiB=%.3f totalMiB=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),baselineUsed,usedEnd,usedEnd-baselineUsed,explicitMiB,usedEnd-uploadUsed,(double)memEnd.total_bytes/(1024.0*1024.0));
-  std::printf("NODALS_GPU_H8_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=FP32 physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID H8_scope=PRECOMPUTED_B_GEOMETRY status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
+  std::printf("NODALS_GPU_H8_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=%s physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID H8_scope=PRECOMPUTED_B_GEOMETRY status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",kPrecisionName,momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
   const bool finalPass=(runMode=="fixed10")?(finalIt==10&&pressureAll&&finiteAll):converged;
-  std::printf("NODALS_GPU_RESULT gate=H8 tag=%s cells=%zu precision=fp32 runMode=%s momentumWork=%s outer=%d simpleTol=%.3e fineCsrRefreshEvery=1 physicalOperator=current_exact_CSR pressureAll=%s finite=%s noPetsc=1 noMPI=1 status=%s\n",
-    tag.c_str(),M.tets.size(),runMode.c_str(),momentumWork.c_str(),finalIt,simpleTol,pressureAll?"PASS":"FAIL",finiteAll?"PASS":"FAIL",finalPass?"PASS":"FAIL");
+  std::printf("NODALS_GPU_RESULT gate=H8 tag=%s cells=%zu precision=%s runMode=%s momentumWork=%s outer=%d simpleTol=%.3e fineCsrRefreshEvery=1 physicalOperator=current_exact_CSR pressureAll=%s finite=%s noPetsc=1 noMPI=1 status=%s\n",
+    tag.c_str(),M.tets.size(),kPrecisionName,runMode.c_str(),momentumWork.c_str(),finalIt,simpleTol,pressureAll?"PASS":"FAIL",finiteAll?"PASS":"FAIL",finalPass?"PASS":"FAIL");
   return finalPass?0:35;
 }catch(const std::exception&e){std::fprintf(stderr,"NODALS_GPU_H8_EXCEPTION what=%s\n",e.what());return 90;}}
