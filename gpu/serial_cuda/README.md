@@ -68,3 +68,21 @@ This is currently a serial single-GPU experimental solver.
 The GPU execution path does not use PETSc, HYPRE or MPI.
 
 The existing CPU NodalS implementation remains independent and unchanged.
+
+## Preserved FP64 reference
+
+`fp64_reference/` contains the validated G5D full-FP64 CUDA implementation.
+
+Its precision contract is:
+
+- StateReal = FP64
+- OperatorReal = FP64
+- AMGReal = FP64
+- reductions = FP64
+
+This is the validated FP64 SA + power-iteration + Chebyshev/Jacobi AMG
+checkpoint from before the subsequent FP32 H2/H3/H4 optimization campaign.
+
+The current H4 implementation in this directory is the faster FP32 development
+path. The FP64 reference is retained independently so subsequent optimization
+work can be ported to FP64 without losing the validated implementation.
