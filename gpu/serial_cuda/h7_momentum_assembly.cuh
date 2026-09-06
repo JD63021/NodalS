@@ -104,7 +104,7 @@ __global__ void h7_finalize_relax_warp_row_kernel(
   for(int i=warpGlobal;i<n;i+=warpStride){
     OperatorReal m=0;
     for(std::int64_t k=rp[i]+lane;k<rp[i+1];k+=32)
-      m += fabsf(av[k]);
+      m += fabs(av[k]);
 
     for(int off=16;off>0;off>>=1)
       m += __shfl_down_sync(0xffffffffu,m,off);

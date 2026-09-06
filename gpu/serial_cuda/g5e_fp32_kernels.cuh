@@ -10,9 +10,17 @@
 namespace nodals_gpu {
 
 using DeviceReal = StateReal;
-static_assert(std::is_same<DeviceReal,float>::value,"G5E requires full FP32 state");
-static_assert(std::is_same<OperatorReal,float>::value,"G5E requires FP32 operator");
-static_assert(std::is_same<AMGReal,float>::value,"G5E requires FP32 AMG");
+// H8 uses the same kernels for FP32 and FP64.  The precision aliases are
+// selected by precision.hpp; CUDA double atomicAdd is supported on CC >= 6.0.
+static_assert(
+  (std::is_same<DeviceReal,float>::value || std::is_same<DeviceReal,double>::value),
+  "unsupported DeviceReal");
+static_assert(
+  (std::is_same<OperatorReal,float>::value || std::is_same<OperatorReal,double>::value),
+  "unsupported OperatorReal");
+static_assert(
+  (std::is_same<AMGReal,float>::value || std::is_same<AMGReal,double>::value),
+  "unsupported AMGReal");
 
 constexpr int G4B=256;
 inline int g4grid(std::size_t n){return (int)((n+G4B-1)/G4B);}
@@ -61,7 +69,7 @@ __global__ void g4_finalize_relax_kernel(int n,const std::int64_t*rp,const std::
                                           const std::int32_t*diagPos,OperatorReal alpha,
                                           OperatorReal*av,OperatorReal*delta,OperatorReal*diag,OperatorReal*rau){
   int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);if(i>=n)return;OperatorReal m=0;
-  for(std::int64_t k=rp[i];k<rp[i+1];++k)m+=fabsf(av[k]);
+  for(std::int64_t k=rp[i];k<rp[i+1];++k)m+=fabs(av[k]);
   OperatorReal de=(OperatorReal(1)/alpha-OperatorReal(1))*m;int dp=diagPos[i];
   delta[i]=de;av[dp]+=de;diag[i]=av[dp];rau[i]=OperatorReal(1)/av[dp];
 }
@@ -130,8 +138,17 @@ __global__ void g5_sa_restrict_kernel(int n,const std::int64_t*rp,const std::int
 __global__ void g5_sa_prolong_add_kernel(int n,const std::int64_t*rp,const std::int32_t*ci,const AMGReal*pv,const AMGReal*c,AMGReal*f){
   int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);if(i>=n)return;AMGReal s=0;for(std::int64_t k=rp[i];k<rp[i+1];++k)s+=pv[k]*c[ci[k]];f[i]+=s;
 }
-__global__ void g5_power_init_kernel(int n,AMGReal*v){int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);if(i<n){float g=(float)(i+1);v[i]=sinf(.731f*g)+.27f*cosf(1.117f*g);}}
-__global__ void g5_div_sqrt_diag_kernel(int n,const AMGReal*x,const AMGReal*d,AMGReal*y){int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);if(i<n)y[i]=x[i]/sqrtf(d[i]);}
+__global__ void g5_power_init_kernel(int n,AMGReal*v){
+  int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);
+  if(i<n){
+    const AMGReal g=AMGReal(i+1);
+    v[i]=sin(AMGReal(0.731)*g)+AMGReal(0.27)*cos(AMGReal(1.117)*g);
+  }
+}
+__global__ void g5_div_sqrt_diag_kernel(int n,const AMGReal*x,const AMGReal*d,AMGReal*y){
+  int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);
+  if(i<n)y[i]=x[i]/sqrt(d[i]);
+}
 __global__ void g5_diff_kernel(int n,const OperatorReal*a,const OperatorReal*b,OperatorReal*y){int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);if(i<n)y[i]=a[i]-b[i];}
 
 } // namespace nodals_gpu

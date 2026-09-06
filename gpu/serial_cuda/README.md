@@ -117,3 +117,53 @@ The serial CUDA path has no PETSc, HYPRE or MPI runtime dependency.
 
 The FP64 implementation is retained as the numerical reference while the
 optimized FP32 CUDA path continues to evolve.
+
+## Full-FP64 cumulative H8 mode
+
+The cumulative H8 CUDA source is precision-generic and can now be built in
+either full FP32 or full FP64 without maintaining a second copy of the H8
+implementation.
+
+Build targets:
+
+- `make fp32` / `nodals_gpu_h8_fp32`: FP32 state, operator and AMG with FP64 reductions.
+- `make fp64` / `nodals_gpu_h8_fp64`: FP64 state, operator, AMG and reductions.
+
+Both precision modes retain the same cumulative H8 execution structure:
+
+- H6 per-level scalar/warp coarse AMG SpMV selection
+- H7 cooperative warp-per-cell momentum convection assembly
+- H8 persistent precomputed B geometry
+- exact fine pressure CSR refreshed every SIMPLE iteration
+- PCG + smoothed-aggregation AMG
+- FGS1 momentum path
+- no PETSc, HYPRE or MPI dependency
+
+### Validated FP64 checkpoints
+
+111,183-cell Re=20 convergence gate (`simpleTol=1e-3`):
+
+- 407 SIMPLE iterations
+- final continuity residual: `3.6751e-6`
+- final momentum initial residuals: `[9.851e-4, 9.885e-4, 8.333e-6]`
+- pressure drop: `16.0643006` vs exact `16.0000012`
+- pressure-drop relative error: `0.40187%`
+- 13.006 ms/SIMPLE, 8.549 MIUPS
+- explicit VRAM: 275.7 MiB
+
+Fixed-10 FP64 scaling:
+
+| Cells | ms/SIMPLE | MIUPS | Explicit VRAM |
+| ---: | ---: | ---: | ---: |
+| 768,530 | 100.373 | 7.657 | 2004.3 MiB |
+| 1,143,041 | 144.073 | 7.934 | 3003.8 MiB |
+| 2,104,005 | 271.305 | 7.755 | 5583.8 MiB |
+
+The existing `fp64_reference/` subtree is intentionally retained unchanged as
+the earlier historical FP64 checkpoint. Current H8 FP32 and FP64 builds share
+the live `gpu/serial_cuda/` source.
+
+Validation runners:
+
+- `RUN_H8_FP64_111K_CONVERGENCE.sh`
+- `RUN_H8_FP64_FIXED10_3MESH.sh`
