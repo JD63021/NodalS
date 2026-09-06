@@ -2,110 +2,81 @@
 
 ## Scope
 
-The custom pressure AMG is the native low-memory preconditioner for the P1+BF3/P0 SIMPLE/SIMPLEC pressure-correction equation. The fine pressure operator remains the exact NodalS matrix-free Schur action
+The native custom pressure AMG is the low-memory preconditioner for the P1+BF3/P0 SIMPLE/SIMPLEC pressure-correction equation. The exact fine pressure operator remains matrix-free:
 
 `A_p = B diag(rAU) B^T`.
 
-The custom path does not build an explicit fine Schur CSR, the legacy flat pressure assembly plan, a PETSc pressure Pmat, PETSc GAMG, or a PETSc pressure KSP. PETSc full-Schur + GAMG remains a separate selectable fallback.
+The custom path does not build an explicit fine Schur CSR, a PETSc pressure Pmat, PETSc GAMG, or a PETSc pressure KSP. Coarse AMG levels are explicit custom FP64 CSR matrices and the terminal coarse problem is solved by rank-0 dense LU. The PETSc pressure paths remain separately selectable.
 
-The AMG module is geometry-agnostic. It consumes distributed pressure ownership, pressure-cell adjacency, the exact Schur action/diagonal, and the pressure gauge policy. It does not contain pipe dimensions, patch names, inlet profiles, or other problem-specific logic.
+The fused pressure and momentum kernels are structural execution optimizations and do not change the discrete operator. The pressure Schur action shares the `B^T` traversal across x/y/z, keeps the three scalar velocity halo exchanges, and shares the forward `B` traversal. The native momentum predictor shares CSR traversals across Ux/Uy/Uz while keeping the established scalar halo semantics.
 
-## Public case modes
+## Default low-memory path
 
-The normal `.case` interface exposes three validated combinations through `[pressure] mode`:
+If a case omits `[pressure] mode`, the case translator selects native FP64 PCG with unsmoothed custom AMG. The default custom-AMG settings are:
 
-- `pcg_unsmoothed` — native FP64 PCG + unsmoothed aggregation AMG. Lowest memory.
-- `pcg_smoothed` — native FP64 PCG + Jacobi-smoothed aggregation AMG. Stronger preconditioner.
-- `richardson_smoothed` — native FP64 Richardson + smoothed aggregation AMG. Useful both as a production-capable stationary solve and as a clean AMG-vs-AMG comparison mode.
+- connected rank-local aggregation: target `16`, minimum `6`, soft maximum `18`;
+- processor-block symmetric Gauss-Seidel smoothing;
+- one SGS correction before and one after the coarse correction; each SGS correction is forward + backward, giving four triangular sweeps per V-cycle on every non-terminal level;
+- exact matrix-free fine Schur and explicit custom coarse levels;
+- terminal coarse target of `1000` global rows.
 
-Richardson + unsmoothed aggregation is intentionally not a public case preset because the matched large-mesh stationary test showed that combination was not robust enough. Low-level command-line options remain available for developer diagnostics.
+The aggregate sizes are tuning parameters, not discretization constants. They remain case-file options because mesh topology, partitioning and hierarchy depth can change the best value.
 
-## Transfer and coarse operators
+## Public modes and smoothers
 
-### Unsmoothed aggregation
+`[pressure] mode = pcg_unsmoothed` is the default custom path. Its V-cycle smoother is selected independently by `[pressure_amg] smoother` and defaults to `sgs`.
 
-Fine cells are grouped into deterministic connected rank-local aggregates. The tentative transfer injects one fine pressure unknown into one aggregate:
+For an unsmoothed hierarchy, `smoother` accepts:
 
-`P = P_t`, `R = P^T`.
+- `sgs` — processor-block SGS; default;
+- `jacobi` — one undamped Jacobi correction before and after coarse correction; no spectral power iterations;
+- `chebyshev` — the previous symmetric scaled Chebyshev/Jacobi smoother.
 
-The first coarse operator is built directly from the factored fine operator without materializing `A_0`:
+Convenience presets remain available as `pcg_unsmoothed_sgs`, `pcg_unsmoothed_jacobi`, and `pcg_unsmoothed_chebyshev`, with aliases `custom_sgs`, `custom_jacobi`, and `custom_chebyshev`.
 
-`A_1 = P_t^T B diag(rAU) B^T P_t`.
-
-### Smoothed aggregation
-
-The tentative transfer is Jacobi-smoothed:
-
-`P = (I - omega D^{-1} A) P_t`, `R = P^T`.
-
-with
-
-`omega = sa_damping / lambda_max(D^{-1} A)`.
-
-The first smoothed transfer and first Galerkin coarse operator are streamed from the factored `B diag(rAU) B^T` representation, so a fine Schur CSR and generic fine-grid PtAP are still avoided. Subsequent levels use the custom explicit coarse CSR matrices already produced by the hierarchy.
-
-## V-cycle
-
-Each non-coarsest level applies a symmetric scaled Chebyshev/Jacobi correction before and after the coarse correction. Restriction is the transpose of prolongation. The final small coarse problem is gathered and solved with a rank-0 dense LU.
-
-The fixed symmetric V-cycle is suitable for the native FP64 PCG outer iteration. The same V-cycle can also be used in stationary Richardson mode.
+`pcg_smoothed` and `richardson_smoothed` remain available. Smoothed aggregation currently requires `smoother = chebyshev` because transfer smoothing uses the estimated spectral upper bound.
 
 ## Case-file controls
 
-The hierarchy controls belong in a dedicated `[pressure_amg]` section. The defaults below are the values used in the validated 768k, 1.1M, 2M and 7.18M large-mesh campaigns.
+The custom hierarchy controls belong in `[pressure_amg]`:
 
 | Key | Default | Meaning |
 | --- | ---: | --- |
-| `target_aggregate` | `8` | Preferred connected cells per rank-local aggregate |
+| `target_aggregate` | `16` | Preferred connected pressure cells per rank-local aggregate |
 | `min_aggregate` | `6` | Merge smaller aggregates through local face adjacency when possible |
-| `soft_max_aggregate` | `10` | Diagnostic/preferred upper aggregate size |
-| `chebyshev_degree` | `2` | Degree of each symmetric Chebyshev/Jacobi smoothing correction |
-| `power_iterations` | `16` | Power iterations for the level spectral estimate |
+| `soft_max_aggregate` | `18` | Preferred/diagnostic upper aggregate size |
+| `smoother` | `sgs` | `sgs`, `jacobi`, or `chebyshev` for unsmoothed AMG |
+| `chebyshev_degree` | `2` | Degree of each Chebyshev/Jacobi correction |
+| `power_iterations` | `16` | Power iterations for the spectral estimate |
 | `lambda_safety` | `1.50` | Safety multiplier on estimated `lambda_max` |
 | `lambda_low_fraction` | `0.05` | Lower spectral endpoint as a fraction of `lambda_max` |
-| `coarse_target_rows` | `1000` | Global row target below which the final coarse LU is used |
-| `interpolation_max_row_nnz` | `8` | Maximum retained interpolation entries per row after SA pruning |
+| `coarse_target_rows` | `1000` | Global row target below which terminal LU is used |
+| `interpolation_max_row_nnz` | `8` | Maximum retained interpolation entries after SA pruning |
 | `sa_damping` | `1.3333333333333333` | Smoothed-aggregation Jacobi damping numerator |
 | `richardson_omega` | `1.0` | Stationary Richardson correction scale |
 
-The pressure outer solve controls remain in `[pressure]`:
-
-- `refresh` — hierarchy/preconditioner refresh interval; validated default `100`.
-- `rtol`, `atol`, `divtol`, `max_iterations` — native pressure outer stopping controls.
+For `sgs` and `jacobi`, the Chebyshev spectral controls are not used by the V-cycle. They may remain in a case so the smoother can be switched without rewriting the rest of the configuration.
 
 ## Example
 
 ```ini
 [pressure]
-mode = pcg_smoothed
+mode = pcg_unsmoothed
 refresh = 100
 rtol = 0.5
 atol = 1e-12
-divtol = 1e8
 max_iterations = 20
 
 [pressure_amg]
-target_aggregate = 8
+target_aggregate = 16
 min_aggregate = 6
-soft_max_aggregate = 10
-chebyshev_degree = 2
-power_iterations = 16
-lambda_safety = 1.50
-lambda_low_fraction = 0.05
+soft_max_aggregate = 18
+smoother = sgs
 coarse_target_rows = 1000
-interpolation_max_row_nnz = 8
-sa_damping = 1.3333333333333333
-richardson_omega = 1.0
 ```
 
-Change only `mode` to `pcg_unsmoothed` or `richardson_smoothed` to select the other validated combinations while keeping the hierarchy controls visible in the case.
+To test mesh-dependent coarsening, change `target_aggregate`, `min_aggregate`, and `soft_max_aggregate`. For example, target `12` with soft maximum `14` remains a valid runtime choice. To compare smoothers without changing the pressure operator or transfer family, keep `mode = pcg_unsmoothed` and change only `smoother`.
 
 ## Runtime diagnostics
 
-A custom run prints `P1BF3_CUSTOM_AMG_CONFIG`, which echoes the effective aggregation, smoother, spectral, interpolation and refresh controls. The existing hierarchy diagnostics also report level count, fine/final row counts, coarse/transfer nnz, retained hierarchy estimate and transfer family.
-
-## Current scaling observations
-
-The present implementation has been exercised through approximately 7.18 million tetrahedra on 16 MPI ranks. The large-mesh tests established that both custom variants remove the large PETSc full-Schur/GAMG setup-memory spike. Unsmoothed aggregation is the minimum-memory mode; smoothed aggregation retains a substantially larger hierarchy in exchange for roughly halving PCG iteration counts in the tested large-mesh regime.
-
-These measurements are implementation observations, not hard-coded assumptions in the AMG module.
+Custom runs report `P1BF3_CUSTOM_AMG_CONFIG`, hierarchy sizes, retained hierarchy estimates, selected smoother, and whether spectral power iterations are enabled. The fine operator continues to report `fineSchurCSR=0`. Fused pressure and momentum execution paths are reported by `P1BF3_M4B_SCHUR_FUSION` and `P1BF3_MOMENTUM_FUSION`.
