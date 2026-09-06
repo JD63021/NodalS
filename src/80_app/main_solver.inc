@@ -185,6 +185,22 @@ int main(int argc,char **argv) {
   // module callable both from .case files and directly from PETSc-style CLI
   // options without duplicating numerical state.
   CustomPressureAMGConfig customAMGConfig;
+  char customAMGSmootherOption[32]="sgs";
+  PetscBool customAMGSmootherWasSet=PETSC_FALSE;
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-custom_amg_smoother",customAMGSmootherOption,sizeof(customAMGSmootherOption),&customAMGSmootherWasSet));
+  if(!customAMGSmootherWasSet && pressurePcBackend==PressurePCBackendKind::CustomAggSmoothed)
+    std::snprintf(customAMGSmootherOption,sizeof(customAMGSmootherOption),"chebyshev");
+  const std::string customAMGSmoother(customAMGSmootherOption);
+  if(customAMGSmoother=="chebyshev") {
+    customAMGConfig.directJacobiSmoother=PETSC_FALSE;
+    customAMGConfig.directSGSSmoother=PETSC_FALSE;
+  } else if(customAMGSmoother=="jacobi") {
+    customAMGConfig.directJacobiSmoother=PETSC_TRUE;
+    customAMGConfig.directSGSSmoother=PETSC_FALSE;
+  } else if(customAMGSmoother=="sgs") {
+    customAMGConfig.directJacobiSmoother=PETSC_FALSE;
+    customAMGConfig.directSGSSmoother=PETSC_TRUE;
+  } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_amg_smoother must be chebyshev, jacobi, or sgs");
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_target_aggregate",&customAMGConfig.targetAggregateSize,nullptr));
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_min_aggregate",&customAMGConfig.minAggregateSize,nullptr));
   PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_soft_max_aggregate",&customAMGConfig.softMaxAggregateSize,nullptr));
@@ -202,6 +218,11 @@ int main(int argc,char **argv) {
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"invalid custom AMG configuration");
   const PetscBool customPressureBackend=pressurePCBackendIsCustom(pressurePcBackend);
   customAMGConfig.smoothedAggregation=(pressurePcBackend==PressurePCBackendKind::CustomAggSmoothed)?PETSC_TRUE:PETSC_FALSE;
+  // Current smoothed-aggregation transfer itself uses lambdaMax to choose its
+  // Jacobi transfer damping.  Therefore the no-spectrum experimental smoother
+  // is intentionally paired only with unsmoothed injection transfer.
+  if((customAMGConfig.directJacobiSmoother || customAMGConfig.directSGSSmoother) && customAMGConfig.smoothedAggregation)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"direct Jacobi/SGS custom AMG smoothers currently require custom_agg_unsmoothed so all power iterations can be removed");
   if(customPressureBackend && pressureSolveMode!="custom_pcg" && pressureSolveMode!="custom_richardson")
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"custom AMG live backend requires -pressure_solve_mode custom_pcg or custom_richardson");
   if(!customPressureBackend && pressureSolveMode=="custom_richardson")
@@ -221,8 +242,8 @@ int main(int argc,char **argv) {
   if(!(customRichardsonOmega>0.0) || !std::isfinite((double)customRichardsonOmega))
     SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_amg_richardson_omega must be finite and > 0");
   if(customPressureBackend) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-    "P1BF3_CUSTOM_AMG_CONFIG backend=%s outer=%s targetAggregate=%" PetscInt_FMT " minAggregate=%" PetscInt_FMT " softMaxAggregate=%" PetscInt_FMT " chebDegree=%" PetscInt_FMT " powerIts=%" PetscInt_FMT " lambdaSafety=%.8g lambdaLowFraction=%.8g coarseTargetRows=%" PetscInt_FMT " interpolationMaxRowNnz=%" PetscInt_FMT " saDamping=%.12g richardsonOmega=%.12g refresh=%" PetscInt_FMT " pRtol=%.8g pAtol=%.8g pMaxIts=%" PetscInt_FMT "\n",
-    pressurePCBackendName(pressurePcBackend),pressureSolveMode.c_str(),customAMGConfig.targetAggregateSize,customAMGConfig.minAggregateSize,customAMGConfig.softMaxAggregateSize,
+    "P1BF3_CUSTOM_AMG_CONFIG backend=%s outer=%s smoother=%s targetAggregate=%" PetscInt_FMT " minAggregate=%" PetscInt_FMT " softMaxAggregate=%" PetscInt_FMT " chebDegree=%" PetscInt_FMT " powerIts=%" PetscInt_FMT " lambdaSafety=%.8g lambdaLowFraction=%.8g coarseTargetRows=%" PetscInt_FMT " interpolationMaxRowNnz=%" PetscInt_FMT " saDamping=%.12g richardsonOmega=%.12g refresh=%" PetscInt_FMT " pRtol=%.8g pAtol=%.8g pMaxIts=%" PetscInt_FMT "\n",
+    pressurePCBackendName(pressurePcBackend),pressureSolveMode.c_str(),customAMGSmoother.c_str(),customAMGConfig.targetAggregateSize,customAMGConfig.minAggregateSize,customAMGConfig.softMaxAggregateSize,
     customAMGConfig.chebyshevDegree,customAMGConfig.powerIterations,(double)customAMGConfig.lambdaSafety,(double)customAMGConfig.lambdaLowFraction,
     customAMGConfig.coarseTargetRows,customAMGConfig.interpolationMaxRowNnz,(double)customAMGConfig.smoothedAggregationDamping,(double)customRichardsonOmega,
     pPreconditionerRefresh,(double)customLivePRtol,(double)customLivePAtol,customLivePMaxIts));
@@ -1214,20 +1235,91 @@ int main(int argc,char **argv) {
       // initial residual BEFORE its inner solve.  These are distinct from ur[],
       // which are the final inner-solve residuals.
       // M6B: all momentum RHS algebra and velocity iterates remain native FP64.
-      for(int d=0;d<3;++d) {
-        std::vector<double>& mb=customMom.workB; mb=D.rhsOwnedFP64[(std::size_t)d];
-        if(centralConvection) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.convRhs[(std::size_t)d][i];
-        if(useSupg) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.supgRhs[(std::size_t)d][i];
-        PetscCall(customPressureBtApply(customPressureB,d,pressureState,customPressureB.velocityWork));
-        if(customPressureB.velocityWork.size()!=mb.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B B^T/velocity ownership mismatch");
-        for(std::size_t i=0;i<mb.size();++i) mb[i]+=customPressureB.velocityWork[i]+customMom.relaxDelta[i]*U[(std::size_t)d][i];
-        double ubn=0.0,urn0=0.0; PetscCall(customMomentumNorm2(mb,ubn)); if(ubn==0.0) ubn=1.0;
-        PetscCall(customMomentumResidualNorm(customMom,mb,U[(std::size_t)d],urn0));
-        uInitRel[d]=(PetscReal)(urn0/ubn); finalUInitRel[d]=uInitRel[d];
-        PetscLogDouble tms0,tms1; PetscCall(PetscTime(&tms0)); double relu=0.0;
-        PetscCall(smoothSolveCustomMomentumNative(customMom,mb,U[(std::size_t)d],(double)uTol,(double)uAtol,(double)uRelDrop,uMax,uCheck,(double)uOmega,uLocalSweeps,&uits[d],&relu)); ur[d]=(PetscReal)relu;
-        PetscCall(PetscTime(&tms1)); momentumSolveSeconds += (double)(tms1-tms0); sumU[d]+=uits[d];
-        if(uRelDrop<=0.0 && ((double)ur[d]*ubn)>1.2*std::max((double)uAtol,(double)uTol*ubn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,"momentum processor-block SGS failed at SIMPLE it %" PetscInt_FMT " comp %d relres %.3e",it,d,(double)ur[d]);
+      {
+        PetscCall(customPressureBtApply3Fused(
+          customPressureB,pressureState,
+          customPressureB.velOwned,customPressureB.velocityWork,customPressureB.velocityWork2));
+
+        std::array<const std::vector<double>*,3> momBt={
+          &customPressureB.velOwned,
+          &customPressureB.velocityWork,
+          &customPressureB.velocityWork2
+        };
+
+        static PetscBool mom3BtParityDone=PETSC_FALSE;
+        const char *mom3ParityEnv=std::getenv("NODALS_MOMENTUM_FUSION_PARITY");
+        if(!mom3BtParityDone && mom3ParityEnv && std::string(mom3ParityEnv)=="1") {
+          double worst=0.0,maxAbs=0.0;
+          for(int d=0;d<3;++d) {
+            std::vector<double> ref;
+            PetscCall(customPressureBtApply(customPressureB,d,pressureState,ref));
+            CustomParityNorm q;
+            PetscCall(customMomentumCompareArrays(*momBt[(std::size_t)d],ref,q));
+            worst=std::max(worst,q.rel);
+            maxAbs=std::max(maxAbs,q.maxAbs);
+          }
+          const double tol=(sizeof(PetscReal)<=4)?2e-5:5e-13;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_MOMENTUM_FUSION_BT_PARITY status=%s rel=%.3e maxAbs=%.3e tol=%.3e reference=3_scalar_Bt experiment=fused_Bt_xyz_for_momentum_RHS\\n",
+            worst<=tol?"PASS":"FAIL",worst,maxAbs,tol));
+          if(worst>tol)
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"MOM3 fused momentum B^T RHS parity failed");
+          mom3BtParityDone=PETSC_TRUE;
+        }
+
+        for(int d=0;d<3;++d) {
+          auto& mb=customMom.fieldOwned[(std::size_t)d];
+          mb=D.rhsOwnedFP64[(std::size_t)d];
+          if(centralConvection)
+            for(std::size_t i=0;i<mb.size();++i)
+              mb[i]+=customMom.convRhs[(std::size_t)d][i];
+          if(useSupg)
+            for(std::size_t i=0;i<mb.size();++i)
+              mb[i]+=customMom.supgRhs[(std::size_t)d][i];
+          if(momBt[(std::size_t)d]->size()!=mb.size())
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"MOM3 B^T/velocity ownership mismatch");
+          for(std::size_t i=0;i<mb.size();++i)
+            mb[i]+=(*momBt[(std::size_t)d])[i]+
+                   customMom.relaxDelta[i]*U[(std::size_t)d][i];
+        }
+
+        std::array<double,3> ubn={0.0,0.0,0.0},urn0={0.0,0.0,0.0};
+        PetscCall(customMomentumNorm23(customMom.fieldOwned,ubn));
+        for(int d=0;d<3;++d) if(ubn[(std::size_t)d]==0.0) ubn[(std::size_t)d]=1.0;
+        std::array<PetscBool,3> allMom3={PETSC_TRUE,PETSC_TRUE,PETSC_TRUE};
+        PetscCall(customMomentumResidualNorm3(
+          customMom,customMom.fieldOwned,U,allMom3,urn0));
+        for(int d=0;d<3;++d) {
+          uInitRel[d]=(PetscReal)(urn0[(std::size_t)d]/ubn[(std::size_t)d]);
+          finalUInitRel[d]=uInitRel[d];
+        }
+
+        static PetscBool mom3ConfigPrinted=PETSC_FALSE;
+        if(!mom3ConfigPrinted) {
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_MOMENTUM_FUSION status=ACTIVE rhs=UxUyUz pressureBt=one_fused_xyz pressureHaloExchanges=1 SGSbeffCSRTraversalsPerApplication=1 SGSforwardCSRTraversalsPerApplication=1 SGSbackwardCSRTraversalsPerApplication=1 momentumHalo=3_scalar_component_exchanges packedMomentumHalo=0 residualCSRTraversals=1_for_all3 residualReduction=MPI_Allreduce_3doubles scratch=reuse_existing_no_new_owned_vectors\\n"));
+          mom3ConfigPrinted=PETSC_TRUE;
+        }
+
+        PetscLogDouble tms0,tms1;
+        PetscCall(PetscTime(&tms0));
+        double relu3[3]={0.0,0.0,0.0};
+        PetscCall(smoothSolveCustomMomentumNative3(
+          customMom,customMom.fieldOwned,U,
+          (double)uTol,(double)uAtol,(double)uRelDrop,
+          uMax,uCheck,(double)uOmega,uLocalSweeps,uits,relu3));
+        PetscCall(PetscTime(&tms1));
+        momentumSolveSeconds += (double)(tms1-tms0);
+
+        for(int d=0;d<3;++d) {
+          ur[d]=(PetscReal)relu3[d];
+          sumU[d]+=uits[d];
+          if(uRelDrop<=0.0 &&
+             ((double)ur[d]*ubn[(std::size_t)d])>
+               1.2*std::max((double)uAtol,(double)uTol*ubn[(std::size_t)d]))
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,
+              "momentum processor-block SGS failed requested tolerance");
+        }
       }
 
       pressureResidual=D.fixedDivOwnedFP64;
