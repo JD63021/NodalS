@@ -332,7 +332,8 @@ struct CustomPressureBPlan {
   CustomPeerHalo velocityHalo,pressureHalo;
   std::vector<CustomPressureForwardCell> forwardCells;
   std::vector<CustomPressureTransposeCell> transposeCells;
-  std::vector<double> velOwned,pOwned,pressureWork,velocityWork;
+  std::vector<double> velOwned,pOwned,pressureWork,velocityWork,velocityWork2;
+  std::array<std::vector<double>,2> bFusedGhost01;
 };
 
 static inline double customPressureBCoeff(double vol,const double gradLambda[4][3],int d,int a) {
@@ -406,14 +407,16 @@ static PetscErrorCode buildCustomPressureBPlan(const Mesh& M,const Discrete& D,i
   }
   if(jt!=P.transposeCells.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A Bt support fill mismatch");
   P.velOwned.assign((std::size_t)(vEnd-vStart),0.0); P.pOwned.assign((std::size_t)(pEnd-pStart),0.0);
-  P.pressureWork.assign((std::size_t)(pEnd-pStart),0.0); P.velocityWork.assign((std::size_t)(vEnd-vStart),0.0);
+  P.pressureWork.assign((std::size_t)(pEnd-pStart),0.0); P.velocityWork.assign((std::size_t)(vEnd-vStart),0.0); P.velocityWork2.assign((std::size_t)(vEnd-vStart),0.0);
+  for(auto& g:P.bFusedGhost01) g.assign(P.velocityHalo.ghostGid.size(),0.0);
   unsigned long long lf=(unsigned long long)P.forwardCells.size(),lt=(unsigned long long)P.transposeCells.size(),gf=0,gt=0;
   PetscCallMPI(MPI_Allreduce(&lf,&gf,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lt,&gt,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
   unsigned long long lb=(unsigned long long)P.forwardCells.capacity()*sizeof(CustomPressureForwardCell)+(unsigned long long)P.transposeCells.capacity()*sizeof(CustomPressureTransposeCell);
   auto haloBytes=[](const CustomPeerHalo& H)->unsigned long long{return (unsigned long long)(H.ghostGid.capacity()+H.reqRecvGid.capacity()+H.reqRecvLocalOffset.capacity())*sizeof(PetscInt)+(unsigned long long)(H.reqSendCounts.capacity()+H.reqSendDispls.capacity()+H.reqRecvCounts.capacity()+H.reqRecvDispls.capacity())*sizeof(int)+(unsigned long long)(H.exchangeSend.capacity()+H.ghostValues.capacity())*sizeof(double);};
-  lb+=haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)+(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity())*sizeof(double);
+  lb+=haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)+(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity()+P.velocityWork2.capacity()+P.bFusedGhost01[0].capacity()+P.bFusedGhost01[1].capacity())*sizeof(double);
   unsigned long long gb=0; PetscCallMPI(MPI_Allreduce(&lb,&gb,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_PLAN pressureRows=%llu transposeSupportCells=%llu transposeSupportReplication=%.6f retainedMiB=%.3f semantics=custom_FP64_owned_rows_peer_halo\n",gf,gt,distributedGlobalCellCount(D)?(double)gt/(double)distributedGlobalCellCount(D):0.0,(double)gb/(1024.0*1024.0)));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_SCHUR_FUSION fusedBtXYZ=1 pressureHaloExchangesPerSchur=1 BtCellTraversalsPerSchur=1 fusedBXYZ=1 velocityHaloExchangesPerSchur=3 packedVelocityHalo=0 BCellTraversalsPerSchur=1 fineSchurCSR=0\n"));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -427,7 +430,7 @@ static unsigned long long customPressurePlanLocalBytes(const CustomPressureBPlan
   return (unsigned long long)P.forwardCells.capacity()*sizeof(CustomPressureForwardCell)
     +(unsigned long long)P.transposeCells.capacity()*sizeof(CustomPressureTransposeCell)
     +haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)
-    +(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity())*sizeof(double);
+    +(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity()+P.velocityWork2.capacity()+P.bFusedGhost01[0].capacity()+P.bFusedGhost01[1].capacity())*sizeof(double);
 }
 
 static PetscErrorCode customPressureBApply(CustomPressureBPlan& P,int d,const std::vector<double>& xOwned,std::vector<double>& yOwned) {
@@ -437,12 +440,87 @@ static PetscErrorCode customPressureBApply(CustomPressureBPlan& P,int d,const st
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+// EXPERIMENT #5: mirror fused B^T on the B side while preserving the three
+// original scalar velocity-halo exchanges.  Only the forwardCells arithmetic
+// traversal is fused.
+//
+// After d=0 and d=1 exchanges their ghost values are copied into two retained
+// scratch vectors.  d=2 remains in velocityHalo.ghostValues.  Then a single
+// cell/support walk accumulates B0*x0 + B1*x1 + B2*x2 directly.
+static PetscErrorCode customPressureBApply3ScalarExchangeFusedTraversal(CustomPressureBPlan& P,
+  const std::vector<double>& x0,const std::vector<double>& x1,const std::vector<double>& x2,
+  std::vector<double>& yOwned) {
+  PetscFunctionBeginUser;
+  const PetscInt nOwned=P.velocityHalo.nOwned;
+  if((PetscInt)x0.size()!=nOwned || (PetscInt)x1.size()!=nOwned || (PetscInt)x2.size()!=nOwned)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"fused B xyz owned size mismatch");
+  if(P.bFusedGhost01[0].size()!=P.velocityHalo.ghostGid.size() ||
+     P.bFusedGhost01[1].size()!=P.velocityHalo.ghostGid.size())
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"fused B xyz ghost workspace size mismatch");
+
+  // Deliberately retain the original three scalar exchanges.
+  PetscCall(customPeerExchange(P.velocityHalo,x0,48201));
+  P.bFusedGhost01[0]=P.velocityHalo.ghostValues;
+  PetscCall(customPeerExchange(P.velocityHalo,x1,48202));
+  P.bFusedGhost01[1]=P.velocityHalo.ghostValues;
+  PetscCall(customPeerExchange(P.velocityHalo,x2,48203));
+  // d=2 ghost values now reside in P.velocityHalo.ghostValues.
+
+  yOwned.assign((std::size_t)P.pressureHalo.nOwned,0.0);
+
+  auto value=[&](int d,const std::vector<double>& owned,PetscInt li)->double {
+    if(li<nOwned) return owned[(std::size_t)li];
+    const std::size_t g=(std::size_t)(li-nOwned);
+    if(d==0) return P.bFusedGhost01[0][g];
+    if(d==1) return P.bFusedGhost01[1][g];
+    return P.velocityHalo.ghostValues[g];
+  };
+
+  for(const auto& cp:P.forwardCells) {
+    double s0=0.0,s1=0.0,s2=0.0;
+    for(int a=0;a<8;++a) if(cp.velLocal[a]>=0) {
+      const PetscInt li=cp.velLocal[a];
+      s0+=customPressureBCoeff(cp.vol,cp.gradLambda,0,a)*value(0,x0,li);
+      s1+=customPressureBCoeff(cp.vol,cp.gradLambda,1,a)*value(1,x1,li);
+      s2+=customPressureBCoeff(cp.vol,cp.gradLambda,2,a)*value(2,x2,li);
+    }
+    yOwned[(std::size_t)cp.pLocal]=(s0+s1)+s2;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
 static PetscErrorCode customPressureBtApply(CustomPressureBPlan& P,int d,const std::vector<double>& pOwned,std::vector<double>& yOwned) {
   PetscFunctionBeginUser; PetscCall(customPeerExchange(P.pressureHalo,pOwned,48211+d));
   yOwned.assign((std::size_t)P.velocityHalo.nOwned,0.0);
   for(const auto& cp:P.transposeCells) { const double pv=customPeerValue(P.pressureHalo,pOwned,cp.pLocal); for(PetscInt j=0;j<cp.nOwnedVel;++j) { const int a=(int)cp.basis[j]; yOwned[(std::size_t)cp.velOwnedLocal[j]]+=customPressureBCoeff(cp.vol,cp.gradLambda,d,a)*pv; } }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
+
+// EXPERIMENT #1: fuse the three B_d^T actions.
+// Old: 3 pressure-halo exchanges + 3 transpose-cell traversals.
+// New: 1 pressure-halo exchange + 1 transpose-cell traversal.
+// The three B_d velocity-halo exchanges remain separate by design.
+static PetscErrorCode customPressureBtApply3Fused(CustomPressureBPlan& P,
+  const std::vector<double>& pOwned,
+  std::vector<double>& y0,std::vector<double>& y1,std::vector<double>& y2) {
+  PetscFunctionBeginUser;
+  PetscCall(customPeerExchange(P.pressureHalo,pOwned,48219));
+  const std::size_t nv=(std::size_t)P.velocityHalo.nOwned;
+  y0.assign(nv,0.0); y1.assign(nv,0.0); y2.assign(nv,0.0);
+  for(const auto& cp:P.transposeCells) {
+    const double pv=customPeerValue(P.pressureHalo,pOwned,cp.pLocal);
+    for(PetscInt j=0;j<cp.nOwnedVel;++j) {
+      const int a=(int)cp.basis[j];
+      const std::size_t i=(std::size_t)cp.velOwnedLocal[j];
+      y0[i]+=customPressureBCoeff(cp.vol,cp.gradLambda,0,a)*pv;
+      y1[i]+=customPressureBCoeff(cp.vol,cp.gradLambda,1,a)*pv;
+      y2[i]+=customPressureBCoeff(cp.vol,cp.gradLambda,2,a)*pv;
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 
 struct CustomPressureParityNorm { double rel=0.0,maxAbs=0.0; };
 static PetscErrorCode customPressureCompareOwned(const std::vector<double>& got,Vec ref,CustomPressureParityNorm& out) {
@@ -491,22 +569,82 @@ static PetscErrorCode customPressureSchurApply(CustomPressureBPlan& P,const Cust
   PetscFunctionBeginUser;
   PetscLogDouble tall0=0,tall1=0,t0=0,t1=0;
   if(prof && prof->enabled) { PetscCall(PetscTime(&tall0)); prof->schurCalls++; }
+
   if(prof && prof->enabled) PetscCall(PetscTime(&t0));
   yOwned.assign((std::size_t)P.pressureHalo.nOwned,0.0);
-  std::vector<double> partP;
-  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->schurAccum += (double)(t1-t0); }
-  for(int d=0;d<3;++d) {
-    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
-    PetscCall(customPressureBtApply(P,d,xOwned,P.velocityWork));
-    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->bt += (double)(t1-t0); prof->btCalls++; PetscCall(PetscTime(&t0)); }
-    for(std::size_t i=0;i<P.velocityWork.size();++i) P.velocityWork[i]*=M.rAU[i];
-    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->rau += (double)(t1-t0); PetscCall(PetscTime(&t0)); }
-    PetscCall(customPressureBApply(P,d,P.velocityWork,partP));
-    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->b += (double)(t1-t0); prof->bCalls++; PetscCall(PetscTime(&t0)); }
-    for(std::size_t i=0;i<yOwned.size();++i) yOwned[i]+=partP[i];
-    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->schurAccum += (double)(t1-t0); }
+  if(prof && prof->enabled) {
+    PetscCall(PetscTime(&t1));
+    prof->schurAccum += (double)(t1-t0);
+    PetscCall(PetscTime(&t0));
   }
-  if(prof && prof->enabled) { PetscCall(PetscTime(&tall1)); prof->schurTotal += (double)(tall1-tall0); }
+
+  // Optimization #1 retained.
+  PetscCall(customPressureBtApply3Fused(P,xOwned,P.velOwned,P.velocityWork,P.velocityWork2));
+  if(prof && prof->enabled) {
+    PetscCall(PetscTime(&t1));
+    prof->bt += (double)(t1-t0);
+    prof->btCalls += 3;
+    PetscCall(PetscTime(&t0));
+  }
+
+  // Same three component-wise rAU multiplications.
+  std::array<std::vector<double>*,3> v = {&P.velOwned,&P.velocityWork,&P.velocityWork2};
+  for(int d=0;d<3;++d) {
+    auto& vd=*v[(std::size_t)d];
+    for(std::size_t i=0;i<vd.size();++i) vd[i]*=M.rAU[i];
+  }
+  if(prof && prof->enabled) {
+    PetscCall(PetscTime(&t1));
+    prof->rau += (double)(t1-t0);
+    PetscCall(PetscTime(&t0));
+  }
+
+  // Optimization #5:
+  //   3 scalar velocity exchanges, unchanged
+  //   1 fused forwardCells traversal, replacing 3 traversals
+  PetscCall(customPressureBApply3ScalarExchangeFusedTraversal(
+    P,P.velOwned,P.velocityWork,P.velocityWork2,yOwned));
+  if(prof && prof->enabled) {
+    PetscCall(PetscTime(&t1));
+    prof->b += (double)(t1-t0);
+    prof->bCalls += 3; // preserve historical component-action semantics
+  }
+
+  // One-shot parity against Optimization #1's original scalar-B path.
+  static PetscBool parityDone=PETSC_FALSE;
+  const char *penv=std::getenv("NODALS_EXP_BFUSED_PARITY");
+  if(!parityDone && penv && std::string(penv)=="1") {
+    std::vector<double> ref(yOwned.size(),0.0),part;
+    for(int d=0;d<3;++d) {
+      PetscCall(customPressureBApply(P,d,*v[(std::size_t)d],part));
+      for(std::size_t i=0;i<ref.size();++i) ref[i]+=part[i];
+    }
+
+    double ld2=0.0,lr2=0.0,lmax=0.0;
+    for(std::size_t i=0;i<ref.size();++i) {
+      const double e=yOwned[i]-ref[i];
+      ld2+=e*e;
+      lr2+=ref[i]*ref[i];
+      lmax=std::max(lmax,std::abs(e));
+    }
+    double gd2=0.0,gr2=0.0,gmax=0.0;
+    PetscCallMPI(MPI_Allreduce(&ld2,&gd2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&lr2,&gr2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&lmax,&gmax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+    const double rel=std::sqrt(gd2)/std::max(std::sqrt(gr2),1e-300);
+    const double tol=(sizeof(PetscReal)<=4)?2e-5:5e-13;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_EXP_BFUSED_PARITY status=%s rel=%.3e maxAbs=%.3e tol=%.3e reference=three_scalar_B_traversals experiment=one_fused_B_xyz_traversal scalarVelocityHaloExchanges=3\\n",
+      rel<=tol?"PASS":"FAIL",rel,gmax,tol));
+    if(rel>tol)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"fused B xyz traversal parity failed");
+    parityDone=PETSC_TRUE;
+  }
+
+  if(prof && prof->enabled) {
+    PetscCall(PetscTime(&tall1));
+    prof->schurTotal += (double)(tall1-tall0);
+  }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -1057,6 +1195,234 @@ static PetscErrorCode smoothSolveCustomMomentumMPI(CustomMomentumCSR& A,Vec b,Ve
   }
   PetscCall(customMomentumWriteOwned(x,A,A.workX));
   *parallelIts=it; *relres=(PetscReal)(rn/bn);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// Fused three-RHS native momentum solver.
+// -----------------------------------------------------------------------------
+// Matrix/index traffic is shared across Ux/Uy/Uz. MPI halo traffic deliberately
+// remains three scalar exchanges so this experiment isolates CSR traversal
+// fusion. Existing solver scratch is reused; no new velocity-sized arrays.
+static PetscErrorCode customMomentumNorm23(
+  const std::array<std::vector<double>,3>& x,std::array<double,3>& nrm) {
+  PetscFunctionBeginUser;
+  double local[3]={0.0,0.0,0.0},global[3]={0.0,0.0,0.0};
+  const std::size_t n=x[0].size();
+  if(x[1].size()!=n || x[2].size()!=n)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"MOM3 norm vector size mismatch");
+  for(std::size_t i=0;i<n;++i)
+    for(int d=0;d<3;++d) local[d]+=x[(std::size_t)d][i]*x[(std::size_t)d][i];
+  PetscCallMPI(MPI_Allreduce(local,global,3,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  for(int d=0;d<3;++d) nrm[(std::size_t)d]=std::sqrt(global[d]);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumExchange3Scalar(
+  CustomMomentumCSR& A,const std::array<std::vector<double>,3>& x,
+  const std::array<PetscBool,3>& active) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) if(active[(std::size_t)d]) {
+    if((PetscInt)x[(std::size_t)d].size()!=A.nOwned)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"MOM3 exchange owned size mismatch");
+    PetscCall(customMomentumExchange(A,x[(std::size_t)d]));
+    A.fieldGhost[(std::size_t)d]=A.ghostValues;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumResidualNorm3(
+  CustomMomentumCSR& A,const std::array<std::vector<double>,3>& b,
+  const std::array<std::vector<double>,3>& x,const std::array<PetscBool,3>& active,
+  std::array<double,3>& rn) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d)
+    if((PetscInt)b[(std::size_t)d].size()!=A.nOwned ||
+       (PetscInt)x[(std::size_t)d].size()!=A.nOwned)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"MOM3 residual vector size mismatch");
+
+  PetscCall(customMomentumExchange3Scalar(A,x,active));
+
+  double local[3]={0.0,0.0,0.0},global[3]={0.0,0.0,0.0};
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    double ax[3]={0.0,0.0,0.0};
+    for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+      const PetscInt li=A.colLocal[(std::size_t)k];
+      const double av=A.aRel[(std::size_t)k];
+      if(li<A.nOwned) {
+        for(int d=0;d<3;++d) if(active[(std::size_t)d])
+          ax[d]+=av*x[(std::size_t)d][(std::size_t)li];
+      } else {
+        const std::size_t g=(std::size_t)(li-A.nOwned);
+        for(int d=0;d<3;++d) if(active[(std::size_t)d])
+          ax[d]+=av*A.fieldGhost[(std::size_t)d][g];
+      }
+    }
+    for(int d=0;d<3;++d) if(active[(std::size_t)d]) {
+      const double r=b[(std::size_t)d][(std::size_t)i]-ax[d];
+      local[d]+=r*r;
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(local,global,3,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  for(int d=0;d<3;++d)
+    rn[(std::size_t)d]=active[(std::size_t)d]?std::sqrt(global[d]):0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumSymmetricGS3(
+  CustomMomentumCSR& A,const std::array<std::vector<double>,3>& b,
+  std::array<std::vector<double>,3>& x,double omega,PetscInt localSweeps,
+  const std::array<PetscBool,3>& active) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d)
+    if((PetscInt)b[(std::size_t)d].size()!=A.nOwned ||
+       (PetscInt)x[(std::size_t)d].size()!=A.nOwned)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"MOM3 SGS vector size mismatch");
+
+  PetscCall(customMomentumExchange3Scalar(A,x,active));
+
+  std::array<std::vector<double>*,3> beff={
+    &A.workBeff,&A.workX,&A.workY
+  };
+  for(int d=0;d<3;++d)
+    if((PetscInt)beff[(std::size_t)d]->size()!=A.nOwned)
+      beff[(std::size_t)d]->assign((std::size_t)A.nOwned,0.0);
+
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    for(int d=0;d<3;++d) if(active[(std::size_t)d])
+      (*beff[(std::size_t)d])[(std::size_t)i]=b[(std::size_t)d][(std::size_t)i];
+
+    for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+      const PetscInt li=A.colLocal[(std::size_t)k];
+      if(li<A.nOwned) continue;
+      const double av=A.aRel[(std::size_t)k];
+      const std::size_t g=(std::size_t)(li-A.nOwned);
+      for(int d=0;d<3;++d) if(active[(std::size_t)d])
+        (*beff[(std::size_t)d])[(std::size_t)i]-=
+          av*A.fieldGhost[(std::size_t)d][g];
+    }
+  }
+
+  for(PetscInt sweep=0;sweep<localSweeps;++sweep) {
+    for(PetscInt i=0;i<A.nOwned;++i) {
+      const double diag=A.aRel[(std::size_t)A.diagPos[(std::size_t)i]];
+      double rhs[3]={0.0,0.0,0.0};
+      for(int d=0;d<3;++d) if(active[(std::size_t)d])
+        rhs[d]=(*beff[(std::size_t)d])[(std::size_t)i];
+
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+        const PetscInt li=A.colLocal[(std::size_t)k];
+        if(li>=A.nOwned || li==i) continue;
+        const double av=A.aRel[(std::size_t)k];
+        for(int d=0;d<3;++d) if(active[(std::size_t)d])
+          rhs[d]-=av*x[(std::size_t)d][(std::size_t)li];
+      }
+      for(int d=0;d<3;++d) if(active[(std::size_t)d]) {
+        const double old=x[(std::size_t)d][(std::size_t)i];
+        x[(std::size_t)d][(std::size_t)i]=(1.0-omega)*old+omega*(rhs[d]/diag);
+      }
+    }
+
+    for(PetscInt ii=A.nOwned;ii>0;--ii) {
+      const PetscInt i=ii-1;
+      const double diag=A.aRel[(std::size_t)A.diagPos[(std::size_t)i]];
+      double rhs[3]={0.0,0.0,0.0};
+      for(int d=0;d<3;++d) if(active[(std::size_t)d])
+        rhs[d]=(*beff[(std::size_t)d])[(std::size_t)i];
+
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+        const PetscInt li=A.colLocal[(std::size_t)k];
+        if(li>=A.nOwned || li==i) continue;
+        const double av=A.aRel[(std::size_t)k];
+        for(int d=0;d<3;++d) if(active[(std::size_t)d])
+          rhs[d]-=av*x[(std::size_t)d][(std::size_t)li];
+      }
+      for(int d=0;d<3;++d) if(active[(std::size_t)d]) {
+        const double old=x[(std::size_t)d][(std::size_t)i];
+        x[(std::size_t)d][(std::size_t)i]=(1.0-omega)*old+omega*(rhs[d]/diag);
+      }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode smoothSolveCustomMomentumNative3(
+  CustomMomentumCSR& A,const std::array<std::vector<double>,3>& b,
+  std::array<std::vector<double>,3>& x,double rtol,double atol,double relDrop,
+  PetscInt maxIts,PetscInt checkEvery,double omega,PetscInt localSweeps,
+  PetscInt parallelIts[3],double relres[3]) {
+  PetscFunctionBeginUser;
+
+  std::array<double,3> bn={0.0,0.0,0.0},rn={0.0,0.0,0.0},rnInitial={0.0,0.0,0.0};
+  PetscCall(customMomentumNorm23(b,bn));
+  for(int d=0;d<3;++d) {
+    if(!std::isfinite(bn[(std::size_t)d]))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"MOM3 RHS norm NaN/Inf");
+    if(bn[(std::size_t)d]==0.0) bn[(std::size_t)d]=1.0;
+  }
+
+  std::array<PetscBool,3> all={PETSC_TRUE,PETSC_TRUE,PETSC_TRUE};
+  PetscCall(customMomentumResidualNorm3(A,b,x,all,rn));
+  rnInitial=rn;
+
+  std::array<double,3> target={0.0,0.0,0.0};
+  std::array<PetscBool,3> active={PETSC_FALSE,PETSC_FALSE,PETSC_FALSE};
+  for(int d=0;d<3;++d) {
+    if(!std::isfinite(rnInitial[(std::size_t)d]))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"MOM3 initial residual NaN/Inf");
+    target[(std::size_t)d]=std::max(atol,rtol*bn[(std::size_t)d]);
+    parallelIts[d]=0;
+    relres[d]=rnInitial[(std::size_t)d]/bn[(std::size_t)d];
+    active[(std::size_t)d]=(rnInitial[(std::size_t)d]>target[(std::size_t)d])?PETSC_TRUE:PETSC_FALSE;
+  }
+
+  static PetscBool parityDone=PETSC_FALSE;
+  const char *penv=std::getenv("NODALS_MOMENTUM_FUSION_PARITY");
+  if(!parityDone && penv && std::string(penv)=="1") {
+    std::array<std::vector<double>,3> xf=x,xr=x;
+    std::array<PetscBool,3> pa={PETSC_TRUE,PETSC_TRUE,PETSC_TRUE};
+    PetscCall(customMomentumSymmetricGS3(A,b,xf,omega,localSweeps,pa));
+
+    double worst=0.0,maxAbs=0.0;
+    for(int d=0;d<3;++d) {
+      PetscCall(customMomentumSymmetricGS(A,b[(std::size_t)d],xr[(std::size_t)d],omega,localSweeps));
+      CustomParityNorm q;
+      PetscCall(customMomentumCompareArrays(xf[(std::size_t)d],xr[(std::size_t)d],q));
+      worst=std::max(worst,q.rel);
+      maxAbs=std::max(maxAbs,q.maxAbs);
+    }
+    const double tol=(sizeof(PetscReal)<=4)?2e-5:5e-13;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_MOMENTUM_FUSION_SGS_PARITY status=%s rel=%.3e maxAbs=%.3e tol=%.3e reference=3_scalar_SGS experiment=1_shared_CSR_SGS3 halo=3_scalar_exchanges\\n",
+      worst<=tol?"PASS":"FAIL",worst,maxAbs,tol));
+    if(worst>tol)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"MOM3 fused SGS parity failed");
+    parityDone=PETSC_TRUE;
+  }
+
+  auto anyActive=[&](){ return active[0] || active[1] || active[2]; };
+
+  PetscInt it=0;
+  while(anyActive() && it<maxIts) {
+    const PetscInt chunk=PetscMin(checkEvery,maxIts-it);
+    for(PetscInt q=0;q<chunk;++q)
+      PetscCall(customMomentumSymmetricGS3(A,b,x,omega,localSweeps,active));
+    it+=chunk;
+
+    PetscCall(customMomentumResidualNorm3(A,b,x,active,rn));
+    for(int d=0;d<3;++d) if(active[(std::size_t)d]) {
+      parallelIts[d]=it;
+      relres[d]=rn[(std::size_t)d]/bn[(std::size_t)d];
+      if(!std::isfinite(rn[(std::size_t)d]))
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"MOM3 SGS residual NaN/Inf");
+      if(rn[(std::size_t)d]<=target[(std::size_t)d] ||
+         (relDrop>0.0 && rnInitial[(std::size_t)d]>0.0 &&
+          rn[(std::size_t)d]<=relDrop*rnInitial[(std::size_t)d]))
+        active[(std::size_t)d]=PETSC_FALSE;
+    }
+  }
+
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 

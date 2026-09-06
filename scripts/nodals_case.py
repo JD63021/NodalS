@@ -57,7 +57,7 @@ def _require(cp, section, key):
     return v
 
 
-def _get_amg(cp, key: str, default: str, legacy_pressure_key: str | None = None) -> str:
+def _get_amg(cp, key: str, default: str | None, legacy_pressure_key: str | None = None) -> str | None:
     """Read a custom-AMG knob from [pressure_amg].
 
     The dedicated section is the public case-file interface.  A small set of
@@ -188,7 +188,7 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
     # matched stationary-solver robustness test on larger meshes.
     #
     # PETSc/full-Schur and the older compact routes remain available unchanged.
-    raw_psolver = _get(cp, "pressure", "mode", _get(cp, "pressure", "solver", "fast_full_gamg")).lower()
+    raw_psolver = _get(cp, "pressure", "mode", _get(cp, "pressure", "solver", "pcg_unsmoothed")).lower()
     aliases = {
         "fast_full_gamg": "fast_full_gamg",
         "full_gamg": "fast_full_gamg",
@@ -206,6 +206,12 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
 
         # Canonical native-AMG names.
         "pcg_unsmoothed": "pcg_unsmoothed",
+        "pcg_unsmoothed_chebyshev": "pcg_unsmoothed_chebyshev",
+        "custom_chebyshev": "pcg_unsmoothed_chebyshev",
+        "pcg_unsmoothed_jacobi": "pcg_unsmoothed_jacobi",
+        "custom_jacobi": "pcg_unsmoothed_jacobi",
+        "pcg_unsmoothed_sgs": "pcg_unsmoothed_sgs",
+        "custom_sgs": "pcg_unsmoothed_sgs",
         "pcg_smoothed": "pcg_smoothed",
         "richardson_smoothed": "richardson_smoothed",
 
@@ -225,11 +231,11 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
     if raw_psolver not in aliases:
         raise ValueError(
             "[pressure] mode must be fast_full_gamg, full_pcg_gamg, compact_cheb, "
-            "compact_pcg, pcg_unsmoothed, pcg_smoothed, or richardson_smoothed"
+            "compact_pcg, pcg_unsmoothed, pcg_unsmoothed_jacobi, pcg_unsmoothed_sgs, pcg_smoothed, or richardson_smoothed"
         )
     psolver = aliases[raw_psolver]
 
-    custom_modes = {"pcg_unsmoothed", "pcg_smoothed", "richardson_smoothed"}
+    custom_modes = {"pcg_unsmoothed", "pcg_unsmoothed_chebyshev", "pcg_unsmoothed_jacobi", "pcg_unsmoothed_sgs", "pcg_smoothed", "richardson_smoothed"}
     requested_pmat = _get(cp, "pressure", "pmat", "").lower().strip()
     if psolver == "fast_full_gamg":
         if requested_pmat and requested_pmat != "full":
@@ -261,7 +267,7 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
             raise ValueError("custom AMG accepts [pressure] pmat = full/none/custom (all mean no PETSc pressure Pmat)")
         pmat = "full"  # compatibility token consumed by the legacy option layer
         solve_mode = "custom_richardson" if psolver == "richardson_smoothed" else "custom_pcg"
-        expected_backend = "custom_agg_unsmoothed" if psolver == "pcg_unsmoothed" else "custom_agg_smoothed"
+        expected_backend = "custom_agg_unsmoothed" if psolver in {"pcg_unsmoothed", "pcg_unsmoothed_chebyshev", "pcg_unsmoothed_jacobi", "pcg_unsmoothed_sgs"} else "custom_agg_smoothed"
         default_refresh, default_prtol, default_pmax = "100", "0.5", "20"
         default_pksp = "richardson" if psolver == "richardson_smoothed" else "cg"
 
@@ -285,9 +291,9 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
 
         # Public custom-AMG controls.  These defaults are the frozen settings
         # used by the 768k/1.1M/2M/7M validation runs.
-        amg_target = _get_amg(cp, "target_aggregate", "8")
+        amg_target = _get_amg(cp, "target_aggregate", "16")
         amg_min = _get_amg(cp, "min_aggregate", "6")
-        amg_soft_max = _get_amg(cp, "soft_max_aggregate", "10")
+        amg_soft_max = _get_amg(cp, "soft_max_aggregate", "18")
         amg_cheb_degree = _get_amg(cp, "chebyshev_degree", "2")
         amg_power_its = _get_amg(cp, "power_iterations", "16")
         amg_lambda_safety = _get_amg(cp, "lambda_safety", "1.50")
@@ -296,6 +302,20 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
         amg_interp_nnz = _get_amg(cp, "interpolation_max_row_nnz", "8", "sa_interp_max_nnz")
         amg_sa_damping = _get_amg(cp, "sa_damping", "1.3333333333333333", "sa_damping")
         amg_richardson_omega = _get_amg(cp, "richardson_omega", "1.0", "richardson_omega")
+        preset_smoother = ("chebyshev" if psolver == "pcg_unsmoothed_chebyshev"
+                           else "jacobi" if psolver == "pcg_unsmoothed_jacobi"
+                           else "sgs" if psolver == "pcg_unsmoothed_sgs"
+                           else None)
+        requested_smoother = _get_amg(cp, "smoother", None)
+        if requested_smoother is not None:
+            requested_smoother = requested_smoother.lower().strip()
+            if requested_smoother not in {"sgs", "jacobi", "chebyshev"}:
+                raise ValueError("[pressure_amg] smoother must be sgs, jacobi, or chebyshev")
+        if preset_smoother is not None and requested_smoother is not None and requested_smoother != preset_smoother:
+            raise ValueError(f"[pressure] mode={psolver} fixes [pressure_amg] smoother={preset_smoother}")
+        amg_smoother = preset_smoother or requested_smoother or ("sgs" if psolver == "pcg_unsmoothed" else "chebyshev")
+        if expected_backend == "custom_agg_smoothed" and amg_smoother != "chebyshev":
+            raise ValueError("smoothed custom AMG requires [pressure_amg] smoother=chebyshev")
 
         # Fail early in the case translator rather than several seconds into an
         # MPI setup if a human-edited case contains an impossible AMG setting.
@@ -311,10 +331,12 @@ def build_solver_options(cp: configparser.ConfigParser) -> List[str]:
         _opt(a, "custom_amg_target_aggregate", amg_target)
         _opt(a, "custom_amg_min_aggregate", amg_min)
         _opt(a, "custom_amg_soft_max_aggregate", amg_soft_max)
-        _opt(a, "custom_amg_cheb_degree", amg_cheb_degree)
-        _opt(a, "custom_amg_power_its", amg_power_its)
-        _opt(a, "custom_amg_lambda_safety", amg_lambda_safety)
-        _opt(a, "custom_amg_lambda_low_fraction", amg_lambda_low)
+        _opt(a, "custom_amg_smoother", amg_smoother)
+        if amg_smoother == "chebyshev":
+            _opt(a, "custom_amg_cheb_degree", amg_cheb_degree)
+            _opt(a, "custom_amg_power_its", amg_power_its)
+            _opt(a, "custom_amg_lambda_safety", amg_lambda_safety)
+            _opt(a, "custom_amg_lambda_low_fraction", amg_lambda_low)
         _opt(a, "custom_amg_coarse_target", amg_coarse_target)
         _opt(a, "custom_amg_interp_max_nnz", amg_interp_nnz)
         _opt(a, "custom_amg_sa_damping", amg_sa_damping)

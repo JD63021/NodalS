@@ -1,5 +1,5 @@
-# NodalS native custom AMG example: minimum-memory pressure backend.
-# Validated combination: native FP64 PCG + unsmoothed aggregation AMG.
+# NodalS native custom AMG example: low-memory pressure backend.
+# Native FP64 PCG + unsmoothed aggregation AMG.
 
 [run]
 name = 40k_Re20_pcg_unsmoothed_amg
@@ -34,7 +34,7 @@ rtol = 1e-3
 max_iterations = 2000
 alpha_u = 0.5
 alpha_p = 0.5
-u_relax_mode = row_l1
+nu_relax_mode = row_l1
 rau_mode = diag
 rau_scale = 1
 
@@ -48,8 +48,8 @@ local_sweeps = 1
 sor_omega = 1
 
 [pressure]
-# Public custom-AMG modes:
-#   pcg_unsmoothed | pcg_smoothed | richardson_smoothed
+# Public custom-AMG modes include pcg_unsmoothed, pcg_smoothed and
+# richardson_smoothed.  pcg_unsmoothed is the default when mode is omitted.
 mode = pcg_unsmoothed
 refresh = 100
 rtol = 0.5
@@ -58,12 +58,17 @@ divtol = 1e8
 max_iterations = 20
 
 [pressure_amg]
-# Connected rank-local aggregation.
-target_aggregate = 8
+# Connected rank-local aggregation.  These are tuning knobs: different meshes
+# and MPI partitions may prefer target 12, 16, or another value.
+target_aggregate = 16
 min_aggregate = 6
-soft_max_aggregate = 10
+soft_max_aggregate = 18
 
-# Symmetric scaled Chebyshev/Jacobi smoothing used inside every V-cycle.
+# V-cycle smoother for the unsmoothed hierarchy.  Options: sgs, jacobi,
+# chebyshev.  sgs is the default low-memory/fast path.
+smoother = sgs
+
+# Used only when smoother = chebyshev (and by smoothed aggregation transfer).
 chebyshev_degree = 2
 power_iterations = 16
 lambda_safety = 1.50
