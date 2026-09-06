@@ -1,0 +1,5 @@
+nodals_gpu_g5d
+*.o
+*.log
+*.time
+__pycache__/

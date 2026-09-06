@@ -1,0 +1,6 @@
+nodals_gpu_h4_fp32
+*.o
+h4_results/
+*.log
+*.time
+__pycache__/
