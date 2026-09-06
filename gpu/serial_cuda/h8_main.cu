@@ -10,6 +10,9 @@
 #include "g5e_fp32_kernels.cuh"
 #include "h2b_fine_csr.cuh"
 #include "h4_kernels.cuh"
+#include "h6_coarse_spmv.cuh"
+#include "h7_momentum_assembly.cuh"
+#include "h8_precomputed_b.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -80,9 +83,32 @@ static std::vector<G4CellPlanDevice> g5e_cast_cells(const std::vector<G4CellPlan
 }
 
 struct G4GpuCSR {
-  int n=0;DeviceBuffer<std::int64_t> row;DeviceBuffer<std::int32_t> col,diagPos;DeviceBuffer<AMGReal> val,diag,b,x,r,tmp,corr;
-  void apply(const AMGReal*a,AMGReal*y,int level=-1){int q=h0_begin(H0_COARSE_SPMV,level);g4_csr_spmv_kernel<<<g4grid(n),G4B>>>(n,row.data(),col.data(),val.data(),a,y);NODALS_CUDA(cudaGetLastError());h0_end(q);}
-  std::size_t bytes()const{return row.bytes()+col.bytes()+diagPos.bytes()+val.bytes()+diag.bytes()+b.bytes()+x.bytes()+r.bytes()+tmp.bytes()+corr.bytes();}
+  int n=0;
+  bool useWarp=false;
+  DeviceBuffer<std::int64_t> row;
+  DeviceBuffer<std::int32_t> col,diagPos;
+  DeviceBuffer<AMGReal> val,diag,b,x,r,tmp,corr;
+
+  void apply_scalar_raw(const AMGReal*a,AMGReal*y)const{
+    g4_csr_spmv_kernel<<<g4grid(n),G4B>>>(
+      n,row.data(),col.data(),val.data(),a,y);
+    NODALS_CUDA(cudaGetLastError());
+  }
+  void apply_warp_raw(const AMGReal*a,AMGReal*y)const{
+    constexpr int B=256;
+    h6_coarse_csr_spmv_warp_kernel<<<h6_warp_grid(n),B>>>(
+      n,row.data(),col.data(),val.data(),a,y);
+    NODALS_CUDA(cudaGetLastError());
+  }
+  void apply(const AMGReal*a,AMGReal*y,int level=-1){
+    int q=h0_begin(H0_COARSE_SPMV,level);
+    if(useWarp)apply_warp_raw(a,y); else apply_scalar_raw(a,y);
+    h0_end(q);
+  }
+  std::size_t bytes()const{
+    return row.bytes()+col.bytes()+diagPos.bytes()+val.bytes()+diag.bytes()+
+           b.bytes()+x.bytes()+r.bytes()+tmp.bytes()+corr.bytes();
+  }
 };
 static std::vector<std::int32_t> g4_csr_diag_positions(const CSRHost&A){std::vector<std::int32_t>d((std::size_t)A.n,-1);for(int i=0;i<A.n;++i){auto first=A.col.begin()+A.row[(std::size_t)i],last=A.col.begin()+A.row[(std::size_t)i+1];auto it=std::lower_bound(first,last,i);if(it==last||*it!=i)throw std::runtime_error("G4B coarse diagonal absent");auto k=(std::int64_t)(it-A.col.begin());if(k>INT32_MAX)throw std::runtime_error("G4B coarse diagonal slot exceeds int32");d[(std::size_t)i]=(std::int32_t)k;}return d;}
 static G4GpuCSR upload_g4_csr(const CSRHost&A){G4GpuCSR G;G.n=A.n;G.row.allocate(A.row.size());G.col.allocate(A.col.size());G.val.allocate(A.val.size());G.diag.allocate(A.diag.size());G.diagPos.allocate(A.n);G.b.allocate(A.n);G.x.allocate(A.n);G.r.allocate(A.n);G.tmp.allocate(A.n);G.corr.allocate(A.n);G.row.upload(A.row.data(),A.row.size());G.col.upload(A.col.data(),A.col.size());auto vv=g5e_cast_vec<AMGReal>(A.val),dd=g5e_cast_vec<AMGReal>(A.diag);G.val.upload(vv.data(),vv.size());G.diag.upload(dd.data(),dd.size());auto dp=g4_csr_diag_positions(A);G.diagPos.upload(dp.data(),dp.size());return G;}
@@ -90,18 +116,34 @@ static G4GpuCSR upload_g4_csr(const CSRHost&A){G4GpuCSR G;G.n=A.n;G.row.allocate
 
 struct H2FineCSRDevice {
   int n=0;
+  bool usePrecomputedB=false;
+  const OperatorReal* bcoeff=nullptr;
   DeviceBuffer<std::int32_t> row,col,diagPos,incOff,contribOff;
   DeviceBuffer<std::uint32_t> packed;
   DeviceBuffer<std::uint8_t> slot;
   DeviceBuffer<AMGReal> val;
 
-  void refresh(const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
-    int q=h0_begin(H0_FINE_CSR_REFRESH);
+  void refresh_dynamic_raw(
+      const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
     constexpr int B=256;
     h2b_fine_csr_refresh_warp_kernel<<<h2_warp_grid(n),B>>>(
       n,cells,rau,row.data(),diagPos.data(),incOff.data(),packed.data(),
       contribOff.data(),slot.data(),val.data(),diag);
     NODALS_CUDA(cudaGetLastError());
+  }
+  void refresh_precomputed_raw(
+      const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
+    if(!bcoeff)throw std::runtime_error("H8 fine CSR bcoeff pointer null");
+    constexpr int B=256;
+    h8_fine_csr_refresh_warp_kernel<<<h2_warp_grid(n),B>>>(
+      n,cells,bcoeff,rau,row.data(),diagPos.data(),incOff.data(),packed.data(),
+      contribOff.data(),slot.data(),val.data(),diag);
+    NODALS_CUDA(cudaGetLastError());
+  }
+  void refresh(const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
+    int q=h0_begin(H0_FINE_CSR_REFRESH);
+    if(usePrecomputedB)refresh_precomputed_raw(cells,rau,diag);
+    else refresh_dynamic_raw(cells,rau,diag);
     h0_end(q);
   }
   void refresh_serial_reference(const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
@@ -133,13 +175,39 @@ static H2FineCSRDevice upload_h2_fine_csr(const H2FineCSRHost&H){
 }
 
 struct G4PressureFine {
-  int nc=0,nv=0;const G4CellPlanDevice*cells=nullptr;const OperatorReal*rau_live=nullptr;H2FineCSRDevice*csr_pc=nullptr;bool physicalUseCurrentCSR=false;DeviceBuffer<AMGReal> rau_pc,diag_pc,v0,v1,v2;
+  int nc=0,nv=0;
+  const G4CellPlanDevice*cells=nullptr;
+  const OperatorReal*bcoeff=nullptr;
+  const OperatorReal*rau_live=nullptr;
+  H2FineCSRDevice*csr_pc=nullptr;
+  bool physicalUseCurrentCSR=false;
+  bool usePrecomputedBT=false;
+  bool usePrecomputedBAction=false;
+  DeviceBuffer<AMGReal> rau_pc,diag_pc,v0,v1,v2;
   void apply_with_rau(const StateReal*x,StateReal*y,const OperatorReal*r,bool live){
     int qt=h0_begin(live?H0_FINE_LIVE_TOTAL:H0_FINE_PC_TOTAL);
     int q=h0_begin(live?H0_FINE_LIVE_ZERO:H0_FINE_PC_ZERO);NODALS_CUDA(cudaMemset(v0.data(),0,v0.bytes()));NODALS_CUDA(cudaMemset(v1.data(),0,v1.bytes()));NODALS_CUDA(cudaMemset(v2.data(),0,v2.bytes()));h0_end(q);
-    q=h0_begin(live?H0_FINE_LIVE_BT:H0_FINE_PC_BT);g4_bt3_kernel<<<g4grid(nc),G4B>>>(cells,x,nc,v0.data(),v1.data(),v2.data());NODALS_CUDA(cudaGetLastError());h0_end(q);
+    q=h0_begin(live?H0_FINE_LIVE_BT:H0_FINE_PC_BT);
+    if(usePrecomputedBT){
+      if(!bcoeff)throw std::runtime_error("H8 pressure BT bcoeff pointer null");
+      h8_bt3_kernel<<<g4grid(nc),G4B>>>(
+        cells,bcoeff,x,nc,v0.data(),v1.data(),v2.data());
+    }else{
+      g4_bt3_kernel<<<g4grid(nc),G4B>>>(
+        cells,x,nc,v0.data(),v1.data(),v2.data());
+    }
+    NODALS_CUDA(cudaGetLastError());h0_end(q);
     q=h0_begin(live?H0_FINE_LIVE_RAU:H0_FINE_PC_RAU);g4_rau3_kernel<<<g4grid(nv),G4B>>>(v0.data(),v1.data(),v2.data(),r,nv);NODALS_CUDA(cudaGetLastError());h0_end(q);
-    q=h0_begin(live?H0_FINE_LIVE_B:H0_FINE_PC_B);g4_b3_kernel<<<g4grid(nc),G4B>>>(cells,nc,v0.data(),v1.data(),v2.data(),y);NODALS_CUDA(cudaGetLastError());h0_end(q);h0_end(qt);
+    q=h0_begin(live?H0_FINE_LIVE_B:H0_FINE_PC_B);
+    if(usePrecomputedBAction){
+      if(!bcoeff)throw std::runtime_error("H8 pressure B bcoeff pointer null");
+      h8_b3_kernel<<<g4grid(nc),G4B>>>(
+        cells,bcoeff,nc,v0.data(),v1.data(),v2.data(),y);
+    }else{
+      g4_b3_kernel<<<g4grid(nc),G4B>>>(
+        cells,nc,v0.data(),v1.data(),v2.data(),y);
+    }
+    NODALS_CUDA(cudaGetLastError());h0_end(q);h0_end(qt);
   }
   void apply_live(const StateReal*x,StateReal*y){
     if(physicalUseCurrentCSR){
@@ -153,7 +221,25 @@ struct G4PressureFine {
     if(!csr_pc)throw std::runtime_error("H2B fine CSR pointer null");
     int qt=h0_begin(H0_FINE_PC_TOTAL);csr_pc->apply(x,y);h0_end(qt);
   }
-  void bt_state(const StateReal*p){int qt=h0_begin(H0_MOM_BT_TOTAL);int q=h0_begin(H0_MOM_BT_ZERO);NODALS_CUDA(cudaMemset(v0.data(),0,v0.bytes()));NODALS_CUDA(cudaMemset(v1.data(),0,v1.bytes()));NODALS_CUDA(cudaMemset(v2.data(),0,v2.bytes()));h0_end(q);q=h0_begin(H0_MOM_BT_KERNEL);g4_bt3_kernel<<<g4grid(nc),G4B>>>(cells,p,nc,v0.data(),v1.data(),v2.data());NODALS_CUDA(cudaGetLastError());h0_end(q);h0_end(qt);}
+  void bt_state(const StateReal*p){
+    int qt=h0_begin(H0_MOM_BT_TOTAL);
+    int q=h0_begin(H0_MOM_BT_ZERO);
+    NODALS_CUDA(cudaMemset(v0.data(),0,v0.bytes()));
+    NODALS_CUDA(cudaMemset(v1.data(),0,v1.bytes()));
+    NODALS_CUDA(cudaMemset(v2.data(),0,v2.bytes()));
+    h0_end(q);
+    q=h0_begin(H0_MOM_BT_KERNEL);
+    if(usePrecomputedBT){
+      if(!bcoeff)throw std::runtime_error("H8 momentum BT bcoeff pointer null");
+      h8_bt3_kernel<<<g4grid(nc),G4B>>>(
+        cells,bcoeff,p,nc,v0.data(),v1.data(),v2.data());
+    }else{
+      g4_bt3_kernel<<<g4grid(nc),G4B>>>(
+        cells,p,nc,v0.data(),v1.data(),v2.data());
+    }
+    NODALS_CUDA(cudaGetLastError());
+    h0_end(q);h0_end(qt);
+  }
   std::size_t bytes()const{return rau_pc.bytes()+diag_pc.bytes()+v0.bytes()+v1.bytes()+v2.bytes();}
 };
 
@@ -234,11 +320,18 @@ static G4PCGResult pressure_pcg(G4PressureFine&F,G4AMG&A,const StateReal*rhs,dou
 }
 
 struct G4Gpu {
-  int nv=0,nc=0,ncolors=0;DeviceBuffer<G4CellPlanDevice> cells;DeviceBuffer<StateReal>fixed;
+  int nv=0,nc=0,ncolors=0;
+  bool h7WarpConvection=false;
+  bool h7WarpFinalize=false;
+  int h7ConvectionBlocks=0;
+  int h7FinalizeBlocks=0;
+  bool h8PrecomputedContinuity=false;
+  DeviceBuffer<G4CellPlanDevice> cells;
+  DeviceBuffer<OperatorReal> bcoeff;DeviceBuffer<StateReal>fixed;
   DeviceBuffer<std::int64_t> row;DeviceBuffer<std::int32_t>col,diagPos,colorOffset,colorRows;DeviceBuffer<OperatorReal>diffusion,av,delta,diag,rau;
   DeviceBuffer<StateReal>u0,u1,u2,p,s0,s1,s2,c0,c1,c2,b0,b1,b2,fixedDiv,cont;
   DeviceBuffer<double>momSums;H2FineCSRDevice fineCsr;G4PressureFine pf;G4AMG amg;G4PCGWorkspace pcg;DeviceBuffer<double>dotScratch;
-  std::size_t bytes()const{return cells.bytes()+fixed.bytes()+row.bytes()+col.bytes()+diagPos.bytes()+colorOffset.bytes()+colorRows.bytes()+diffusion.bytes()+av.bytes()+delta.bytes()+diag.bytes()+rau.bytes()+u0.bytes()+u1.bytes()+u2.bytes()+p.bytes()+s0.bytes()+s1.bytes()+s2.bytes()+c0.bytes()+c1.bytes()+c2.bytes()+b0.bytes()+b1.bytes()+b2.bytes()+fixedDiv.bytes()+cont.bytes()+momSums.bytes()+fineCsr.bytes()+pf.bytes()+amg.bytes()+pcg.x.bytes()+pcg.r.bytes()+pcg.z.bytes()+pcg.p.bytes()+pcg.q.bytes()+dotScratch.bytes();}
+  std::size_t bytes()const{return cells.bytes()+bcoeff.bytes()+fixed.bytes()+row.bytes()+col.bytes()+diagPos.bytes()+colorOffset.bytes()+colorRows.bytes()+diffusion.bytes()+av.bytes()+delta.bytes()+diag.bytes()+rau.bytes()+u0.bytes()+u1.bytes()+u2.bytes()+p.bytes()+s0.bytes()+s1.bytes()+s2.bytes()+c0.bytes()+c1.bytes()+c2.bytes()+b0.bytes()+b1.bytes()+b2.bytes()+fixedDiv.bytes()+cont.bytes()+momSums.bytes()+fineCsr.bytes()+pf.bytes()+amg.bytes()+pcg.x.bytes()+pcg.r.bytes()+pcg.z.bytes()+pcg.p.bytes()+pcg.q.bytes()+dotScratch.bytes();}
 };
 
 static std::vector<std::int32_t> diag_positions(const MomentumCSRHost&A){std::vector<std::int32_t>d((std::size_t)A.n,-1);for(int i=0;i<A.n;++i){auto first=A.col.begin()+A.row[(std::size_t)i],last=A.col.begin()+A.row[(std::size_t)i+1];auto it=std::lower_bound(first,last,i);if(it==last||*it!=i)throw std::runtime_error("G4 diag position absent");auto k=(std::int64_t)(it-A.col.begin());if(k>INT32_MAX)throw std::runtime_error("G4 diag position exceeds int32");d[(std::size_t)i]=(std::int32_t)k;}return d;}
@@ -254,6 +347,10 @@ static double relvec(const std::vector<double>&a,const std::vector<double>&b,dou
 static G4Gpu upload_all(const G4SetupHost&S,const SAHierarchyHost&H,const std::vector<double>&initRau,const H2FineCSRHost&FH){
   G4Gpu G;G.nv=S.topo.n;G.nc=(int)S.cells.size();G.ncolors=S.coloring.ncolors;
   auto dc=g5e_cast_cells(S.cells);G.cells.allocate(dc.size());G.cells.upload(dc.data(),dc.size());
+  G.bcoeff.allocate((std::size_t)G.nc*H8_BCOEFF_PER_CELL);
+  h8_build_bcoeff_kernel<<<grid_for(G.bcoeff.size()),kBlock>>>(
+    G.cells.data(),G.nc,G.bcoeff.data());
+  NODALS_CUDA(cudaGetLastError());
   std::vector<StateReal>fv(S.fixedValue.size()*3);for(std::size_t i=0;i<S.fixedValue.size();++i)for(int d=0;d<3;++d)fv[3*i+d]=(StateReal)S.fixedValue[i][d];
   G.fixed.allocate(fv.size());G.fixed.upload(fv.data(),fv.size());
   G.row.allocate(S.topo.row.size());G.col.allocate(S.topo.col.size());G.diffusion.allocate(S.topo.val.size());G.av.allocate(S.topo.val.size());G.row.upload(S.topo.row.data(),S.topo.row.size());G.col.upload(S.topo.col.data(),S.topo.col.size());auto diff0=g5e_cast_vec<OperatorReal>(S.topo.val);G.diffusion.upload(diff0.data(),diff0.size());auto dp=diag_positions(S.topo);G.diagPos.allocate(dp.size());G.diagPos.upload(dp.data(),dp.size());
@@ -265,7 +362,8 @@ static G4Gpu upload_all(const G4SetupHost&S,const SAHierarchyHost&H,const std::v
   G.s0.upload(s0.data(),G.nv);G.s1.upload(s1.data(),G.nv);G.s2.upload(s2.data(),G.nv);G.fixedDiv.upload(fd.data(),G.nc);
   NODALS_CUDA(cudaMemset(G.u0.data(),0,G.u0.bytes()));NODALS_CUDA(cudaMemset(G.u1.data(),0,G.u1.bytes()));NODALS_CUDA(cudaMemset(G.u2.data(),0,G.u2.bytes()));NODALS_CUDA(cudaMemset(G.p.data(),0,G.p.bytes()));
   G.fineCsr=upload_h2_fine_csr(FH);
-  G.pf.nc=G.nc;G.pf.nv=G.nv;G.pf.cells=G.cells.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.rau_pc.allocate(ir.size());G.pf.rau_pc.upload(ir.data(),ir.size());auto fdiag=g5e_cast_vec<AMGReal>(H.fineDiag);G.pf.diag_pc.allocate(G.nc);G.pf.diag_pc.upload(fdiag.data(),fdiag.size());G.pf.v0.allocate(G.nv);G.pf.v1.allocate(G.nv);G.pf.v2.allocate(G.nv);
+  G.fineCsr.bcoeff=G.bcoeff.data();
+  G.pf.nc=G.nc;G.pf.nv=G.nv;G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.rau_pc.allocate(ir.size());G.pf.rau_pc.upload(ir.data(),ir.size());auto fdiag=g5e_cast_vec<AMGReal>(H.fineDiag);G.pf.diag_pc.allocate(G.nc);G.pf.diag_pc.upload(fdiag.data(),fdiag.size());G.pf.v0.allocate(G.nv);G.pf.v1.allocate(G.nv);G.pf.v2.allocate(G.nv);
   G.amg.fine=&G.pf;G.amg.fineLambda=H.fineLambda;G.amg.levelLambda=H.levelLambda;G.amg.chebDegree=2;G.amg.powerIts=H.powerIts;G.amg.lambdaSafety=H.lambdaSafety;G.amg.lambdaLowFraction=H.lambdaLowFraction;
   G.amg.fine_r.allocate(G.nc);G.amg.fine_tmp.allocate(G.nc);G.amg.fine_corr.allocate(G.nc);G.amg.fine_rhs.allocate(G.nc);
   G.amg.P.reserve(H.P.size());for(const auto&P:H.P)G.amg.P.push_back(upload_g5_transfer(P));
@@ -288,9 +386,9 @@ static double g5_power_csr_gpu(G4Gpu&G,G4GpuCSR&A,int its,double safety){
 }
 static void g5_gpu_spectrum_refresh(G4Gpu&G,const SAHierarchyHost&H){
   CudaEventTimer T;T.start();double old=G.amg.fineLambda;G.amg.fineLambda=g5_power_fine_gpu(G,G.amg.powerIts,G.amg.lambdaSafety);
-  std::printf("NODALS_GPU_H4_SPECTRUM level=0 powerIts=%d hostLambda=%.12e gpuLambda=%.12e ratio=%.6f status=PASS\n",G.amg.powerIts,old,G.amg.fineLambda,G.amg.fineLambda/std::max(old,1e-300));
-  for(std::size_t l=0;l+1<G.amg.L.size();++l){double h=(l<H.levelLambda.size()?H.levelLambda[l]:0.0);double q=g5_power_csr_gpu(G,G.amg.L[l],G.amg.powerIts,G.amg.lambdaSafety);G.amg.levelLambda[l]=q;std::printf("NODALS_GPU_H4_SPECTRUM level=%zu powerIts=%d hostLambda=%.12e gpuLambda=%.12e ratio=%.6f status=PASS\n",l+1,G.amg.powerIts,h,q,q/std::max(h,1e-300));}
-  NODALS_CUDA(cudaDeviceSynchronize());float ms=T.stop();++G.amg.spectrumRefreshes;std::printf("NODALS_GPU_H4_POWER_SETUP powerIts=%d levels=%zu ms=%.3f scalarD2H_only=1 status=PASS\n",G.amg.powerIts,G.amg.L.size(),ms);
+  std::printf("NODALS_GPU_H8_SPECTRUM level=0 powerIts=%d hostLambda=%.12e gpuLambda=%.12e ratio=%.6f status=PASS\n",G.amg.powerIts,old,G.amg.fineLambda,G.amg.fineLambda/std::max(old,1e-300));
+  for(std::size_t l=0;l+1<G.amg.L.size();++l){double h=(l<H.levelLambda.size()?H.levelLambda[l]:0.0);double q=g5_power_csr_gpu(G,G.amg.L[l],G.amg.powerIts,G.amg.lambdaSafety);G.amg.levelLambda[l]=q;std::printf("NODALS_GPU_H8_SPECTRUM level=%zu powerIts=%d hostLambda=%.12e gpuLambda=%.12e ratio=%.6f status=PASS\n",l+1,G.amg.powerIts,h,q,q/std::max(h,1e-300));}
+  NODALS_CUDA(cudaDeviceSynchronize());float ms=T.stop();++G.amg.spectrumRefreshes;std::printf("NODALS_GPU_H8_POWER_SETUP powerIts=%d levels=%zu ms=%.3f scalarD2H_only=1 status=PASS\n",G.amg.powerIts,G.amg.L.size(),ms);
 }
 static double g5_rau_snapshot_rel(G4Gpu&G){
   g5_diff_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.rau.data(),G.pf.rau_pc.data(),G.pf.v0.data());NODALS_CUDA(cudaGetLastError());double dn=device_norm2(G.pf.v0.data(),G.nv,G.dotScratch);double rn=device_norm2(G.pf.rau_pc.data(),G.nv,G.dotScratch);return dn/std::max(rn,1e-300);
@@ -304,14 +402,14 @@ static void h2_action_parity_and_bench(G4Gpu&G,const char*tag,int reps=24){
   g5_diff_kernel<<<g4grid(G.nc),G4B>>>(G.nc,ycsr.data(),ymf.data(),diff.data());NODALS_CUDA(cudaGetLastError());
   double dn=device_norm2(diff.data(),G.nc,G.dotScratch),rn=device_norm2(ymf.data(),G.nc,G.dotScratch);
   double rel=dn/std::max(rn,1e-300);
-  std::printf("NODALS_GPU_H4_CSR_PARITY tag=%s relL2=%.12e tol=5e-5 status=%s\n",tag,rel,rel<=5e-5?"PASS":"FAIL");
+  std::printf("NODALS_GPU_H8_CSR_PARITY tag=%s relL2=%.12e tol=5e-5 status=%s\n",tag,rel,rel<=5e-5?"PASS":"FAIL");
   if(!(rel<=5e-5))throw std::runtime_error("H2B fine CSR action parity failed");
 
   for(int k=0;k<3;++k){G.pf.apply_pc_mf(x.data(),ymf.data());G.fineCsr.apply(x.data(),ycsr.data());}
   NODALS_CUDA(cudaDeviceSynchronize());
   CudaEventTimer T1;T1.start();for(int k=0;k<reps;++k)G.pf.apply_pc_mf(x.data(),ymf.data());double mf=(double)T1.stop()/reps;
   CudaEventTimer T2;T2.start();for(int k=0;k<reps;++k)G.fineCsr.apply(x.data(),ycsr.data());double cs=(double)T2.stop()/reps;
-  std::printf("NODALS_GPU_H4_ACTION_BENCH tag=%s reps=%d matrixFreeMs=%.6f csrWarpMs=%.6f speedup=%.6f savedMsPerAction=%.6f status=PASS\n",
+  std::printf("NODALS_GPU_H8_ACTION_BENCH tag=%s reps=%d matrixFreeMs=%.6f csrWarpMs=%.6f speedup=%.6f savedMsPerAction=%.6f status=PASS\n",
     tag,reps,mf,cs,mf/cs,mf-cs);
 }
 
@@ -332,25 +430,605 @@ static void h2b_refresh_bench(G4Gpu&G,const char*tag,int reps=12){
   // One final current warp refresh for deterministic post-benchmark state.
   G.fineCsr.refresh(G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
   NODALS_CUDA(cudaDeviceSynchronize());
-  std::printf("NODALS_GPU_H4_REFRESH_BENCH tag=%s reps=%d serialRowMs=%.6f warpRowMs=%.6f speedup=%.6f savedMsPerRefresh=%.6f status=PASS\\n",
+  std::printf("NODALS_GPU_H8_REFRESH_BENCH tag=%s reps=%d serialRowMs=%.6f warpRowMs=%.6f speedup=%.6f savedMsPerRefresh=%.6f status=PASS\\n",
     tag,reps,serialMs,warpMs,serialMs/warpMs,serialMs-warpMs);
 }
 
-static void assemble_live(G4Gpu&G,double alphaU){
-  NODALS_CUDA(cudaMemcpyAsync(G.av.data(),G.diffusion.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
+
+static int h6_host_row_max(const CSRHost&A){
+  int m=0;
+  for(int i=0;i<A.n;++i)
+    m=std::max(m,(int)(A.row[(std::size_t)i+1]-A.row[(std::size_t)i]));
+  return m;
+}
+
+static void h6_select_coarse_spmv(
+    G4Gpu&G,const SAHierarchyHost&H,const char*tag,int reps=200)
+{
+  if(G.amg.L.size()!=H.csr.size())
+    throw std::runtime_error("H8 host/device AMG level mismatch");
+
+  std::printf("NODALS_GPU_H8_COARSE_SPMV_POLICY tag=%s policy=PER_LEVEL_FASTEST_OF_SCALAR_THREAD_ROW_VS_WARP_ROW benchmarkReps=%d setupOnly=1 numericalOperator=UNCHANGED status=PASS\n",
+              tag,reps);
+
+  // Last explicit CSR level is terminal and is inverted by the dense terminal
+  // kernel during the V-cycle, so it has no production CSR SpMV to select.
+  for(std::size_t l=0;l<G.amg.L.size();++l){
+    auto&A=G.amg.L[l];
+    const auto&AH=H.csr[l];
+    const std::size_t nnz=AH.val.size();
+    const double avg=A.n?(double)nnz/(double)A.n:0.0;
+    const int rowMax=h6_host_row_max(AH);
+
+    if(l+1==G.amg.L.size()){
+      A.useWarp=false;
+      std::printf("NODALS_GPU_H8_COARSE_SPMV_SELECT tag=%s amgLevel=%zu rows=%d nnz=%zu avgRow=%.6f maxRow=%d role=TERMINAL_DENSE scalarMs=0 warpMs=0 speedupWarpOverScalar=0 selected=TERMINAL_DENSE parityRelL2=0 status=PASS\n",
+                  tag,l+1,A.n,nnz,avg,rowMax);
+      continue;
+    }
+
+    g5_power_init_kernel<<<g4grid(A.n),G4B>>>(A.n,A.b.data());
+    NODALS_CUDA(cudaGetLastError());
+
+    // Action parity on exactly the same vector.
+    A.apply_scalar_raw(A.b.data(),A.tmp.data());
+    A.apply_warp_raw(A.b.data(),A.r.data());
+    h6_amg_diff_kernel<<<g4grid(A.n),G4B>>>(
+      A.n,A.tmp.data(),A.r.data(),A.corr.data());
+    NODALS_CUDA(cudaGetLastError());
+    const double dn=device_norm2(A.corr.data(),A.n,G.dotScratch);
+    const double rn=device_norm2(A.tmp.data(),A.n,G.dotScratch);
+    const double rel=dn/std::max(rn,1e-300);
+    if(!(rel<=5e-6))
+      throw std::runtime_error("H8 coarse scalar/warp SpMV parity failed");
+
+    // Warm both launch shapes.
+    for(int k=0;k<5;++k){
+      A.apply_scalar_raw(A.b.data(),A.tmp.data());
+      A.apply_warp_raw(A.b.data(),A.r.data());
+    }
+    NODALS_CUDA(cudaDeviceSynchronize());
+
+    CudaEventTimer Ts;Ts.start();
+    for(int k=0;k<reps;++k)A.apply_scalar_raw(A.b.data(),A.tmp.data());
+    const double scalarMs=(double)Ts.stop()/reps;
+
+    CudaEventTimer Tw;Tw.start();
+    for(int k=0;k<reps;++k)A.apply_warp_raw(A.b.data(),A.r.data());
+    const double warpMs=(double)Tw.stop()/reps;
+
+    // Use the directly measured fastest production kernel on this level.
+    A.useWarp=(warpMs<scalarMs);
+    const double speedup=scalarMs/std::max(warpMs,1e-300);
+
+    std::printf("NODALS_GPU_H8_COARSE_SPMV_SELECT tag=%s amgLevel=%zu rows=%d nnz=%zu avgRow=%.6f maxRow=%d role=EXPLICIT_CSR scalarMs=%.9f warpMs=%.9f speedupWarpOverScalar=%.6f selected=%s parityRelL2=%.12e status=PASS\n",
+                tag,l+1,A.n,nnz,avg,rowMax,scalarMs,warpMs,speedup,
+                A.useWarp?"WARP_ROW":"SCALAR_THREAD_ROW",rel);
+  }
+  NODALS_CUDA(cudaDeviceSynchronize());
+}
+
+static void h7_reset_momentum_physical(G4Gpu&G){
+  NODALS_CUDA(cudaMemcpyAsync(
+    G.av.data(),G.diffusion.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
   NODALS_CUDA(cudaMemsetAsync(G.c0.data(),0,G.c0.bytes()));
   NODALS_CUDA(cudaMemsetAsync(G.c1.data(),0,G.c1.bytes()));
   NODALS_CUDA(cudaMemsetAsync(G.c2.data(),0,G.c2.bytes()));
+}
+
+static void h7_apply_convection_scalar(G4Gpu&G){
   h4_assemble_convection_only_kernel<<<g4grid(G.nc),G4B>>>(
     G.cells.data(),G.nc,G.row.data(),G.fixed.data(),
     G.u0.data(),G.u1.data(),G.u2.data(),
     G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
   NODALS_CUDA(cudaGetLastError());
+}
+
+static void h7_apply_convection_warp(G4Gpu&G,int blocks){
+  h7_convection_warp_cell_kernel<<<blocks,H7_BLOCK>>>(
+    G.cells.data(),G.nc,G.row.data(),G.fixed.data(),
+    G.u0.data(),G.u1.data(),G.u2.data(),
+    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
+  NODALS_CUDA(cudaGetLastError());
+}
+
+static void h7_apply_finalize_scalar(G4Gpu&G,double alphaU){
   g4_finalize_relax_kernel<<<g4grid(G.nv),G4B>>>(
     G.nv,G.row.data(),G.col.data(),G.diagPos.data(),OperatorReal(alphaU),
     G.av.data(),G.delta.data(),G.diag.data(),G.rau.data());
   NODALS_CUDA(cudaGetLastError());
 }
+
+static void h7_apply_finalize_warp(G4Gpu&G,double alphaU,int blocks){
+  h7_finalize_relax_warp_row_kernel<<<blocks,H7_BLOCK>>>(
+    G.nv,G.row.data(),G.diagPos.data(),OperatorReal(alphaU),
+    G.av.data(),G.delta.data(),G.diag.data(),G.rau.data());
+  NODALS_CUDA(cudaGetLastError());
+}
+
+static void assemble_live(G4Gpu&G,double alphaU){
+  h7_reset_momentum_physical(G);
+  if(G.h7WarpConvection)
+    h7_apply_convection_warp(G,G.h7ConvectionBlocks);
+  else
+    h7_apply_convection_scalar(G);
+
+  if(G.h7WarpFinalize)
+    h7_apply_finalize_warp(G,alphaU,G.h7FinalizeBlocks);
+  else
+    h7_apply_finalize_scalar(G,alphaU);
+}
+
+template<class T>
+static double h7_rel_diff(
+    const T*a,const T*b,std::size_t n,
+    DeviceBuffer<T>&diff,DeviceBuffer<double>&scratch)
+{
+  if(diff.size()<n)diff.allocate(n);
+  h7_diff_kernel<<<grid_for(n),kBlock>>>(n,a,b,diff.data());
+  NODALS_CUDA(cudaGetLastError());
+  const double dn=device_norm2(diff.data(),n,scratch);
+  const double rn=device_norm2(b,n,scratch);
+  return dn/std::max(rn,1e-300);
+}
+
+static double h7_time_convection_scalar(G4Gpu&G,int reps){
+  CudaEventTimer T;
+  double total=0;
+  for(int k=0;k<reps;++k){
+    h7_reset_momentum_physical(G);
+    T.start();
+    h7_apply_convection_scalar(G);
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h7_time_convection_warp(G4Gpu&G,int blocks,int reps){
+  CudaEventTimer T;
+  double total=0;
+  for(int k=0;k<reps;++k){
+    h7_reset_momentum_physical(G);
+    T.start();
+    h7_apply_convection_warp(G,blocks);
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h7_time_finalize_scalar(
+    G4Gpu&G,const OperatorReal*physical,double alphaU,int reps)
+{
+  CudaEventTimer T;
+  double total=0;
+  for(int k=0;k<reps;++k){
+    NODALS_CUDA(cudaMemcpyAsync(
+      G.av.data(),physical,G.av.bytes(),cudaMemcpyDeviceToDevice));
+    T.start();
+    h7_apply_finalize_scalar(G,alphaU);
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h7_time_finalize_warp(
+    G4Gpu&G,const OperatorReal*physical,double alphaU,int blocks,int reps)
+{
+  CudaEventTimer T;
+  double total=0;
+  for(int k=0;k<reps;++k){
+    NODALS_CUDA(cudaMemcpyAsync(
+      G.av.data(),physical,G.av.bytes(),cudaMemcpyDeviceToDevice));
+    T.start();
+    h7_apply_finalize_warp(G,alphaU,blocks);
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static void h7_select_momentum_assembly(
+    G4Gpu&G,double alphaU,int smCount,const char*tag)
+{
+  constexpr int reps=8;
+  const int factors[4]={4,8,16,32};
+
+  // Temporary reference storage exists only during setup selection.
+  DeviceBuffer<OperatorReal> avRef(G.av.size()),diff(G.av.size());
+  DeviceBuffer<StateReal> c0Ref(G.c0.size()),c1Ref(G.c1.size()),c2Ref(G.c2.size());
+  DeviceBuffer<OperatorReal> diagRef(G.diag.size()),rauRef(G.rau.size());
+
+  // Scalar reference action.
+  h7_reset_momentum_physical(G);
+  h7_apply_convection_scalar(G);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  NODALS_CUDA(cudaMemcpy(
+    avRef.data(),G.av.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
+  NODALS_CUDA(cudaMemcpy(
+    c0Ref.data(),G.c0.data(),G.c0.bytes(),cudaMemcpyDeviceToDevice));
+  NODALS_CUDA(cudaMemcpy(
+    c1Ref.data(),G.c1.data(),G.c1.bytes(),cudaMemcpyDeviceToDevice));
+  NODALS_CUDA(cudaMemcpy(
+    c2Ref.data(),G.c2.data(),G.c2.bytes(),cudaMemcpyDeviceToDevice));
+
+  const double scalarConv=h7_time_convection_scalar(G,reps);
+  double bestConv=scalarConv;
+  int bestConvBlocks=0;
+
+  std::printf(
+    "NODALS_GPU_H8_CONVECTION_BENCH tag=%s variant=SCALAR_THREAD_CELL "
+    "blocks=%d reps=%d ms=%.9f status=PASS\n",
+    tag,g4grid(G.nc),reps,scalarConv);
+
+  for(int f:factors){
+    const int blocks=h7_blocks_for_sm_factor(smCount,f);
+    const double t=h7_time_convection_warp(G,blocks,reps);
+    std::printf(
+      "NODALS_GPU_H8_CONVECTION_BENCH tag=%s variant=WARP_CELL "
+      "smFactor=%d blocks=%d reps=%d ms=%.9f speedupVsScalar=%.6f status=PASS\n",
+      tag,f,blocks,reps,t,scalarConv/std::max(t,1e-300));
+    if(t<bestConv){bestConv=t;bestConvBlocks=blocks;}
+  }
+
+  // Numerical parity of the winning warp candidate, if any.
+  double convParity=0,cParity=0;
+  if(bestConvBlocks>0){
+    h7_reset_momentum_physical(G);
+    h7_apply_convection_warp(G,bestConvBlocks);
+    NODALS_CUDA(cudaDeviceSynchronize());
+    convParity=h7_rel_diff(
+      G.av.data(),avRef.data(),G.av.size(),diff,G.dotScratch);
+    cParity=std::max({
+      h7_rel_diff(G.c0.data(),c0Ref.data(),G.c0.size(),diff,G.dotScratch),
+      h7_rel_diff(G.c1.data(),c1Ref.data(),G.c1.size(),diff,G.dotScratch),
+      h7_rel_diff(G.c2.data(),c2Ref.data(),G.c2.size(),diff,G.dotScratch)});
+    if(convParity>2e-5 || cParity>2e-5)
+      throw std::runtime_error("H8 warp convection parity failed");
+  }
+
+  G.h7WarpConvection=(bestConvBlocks>0);
+  G.h7ConvectionBlocks=bestConvBlocks;
+  std::printf(
+    "NODALS_GPU_H8_CONVECTION_SELECT tag=%s scalarMs=%.9f bestMs=%.9f "
+    "speedup=%.6f selected=%s selectedBlocks=%d matrixParityRelL2=%.12e "
+    "rhsParityRelL2=%.12e status=PASS\n",
+    tag,scalarConv,bestConv,scalarConv/std::max(bestConv,1e-300),
+    G.h7WarpConvection?"WARP_CELL":"SCALAR_THREAD_CELL",
+    G.h7ConvectionBlocks,convParity,cParity);
+
+  // Form the selected physical (unrelaxed) matrix once and retain it in avRef
+  // for the finalizer benchmark.
+  h7_reset_momentum_physical(G);
+  if(G.h7WarpConvection)
+    h7_apply_convection_warp(G,G.h7ConvectionBlocks);
+  else
+    h7_apply_convection_scalar(G);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  NODALS_CUDA(cudaMemcpy(
+    avRef.data(),G.av.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
+
+  // Scalar finalizer reference.
+  NODALS_CUDA(cudaMemcpyAsync(
+    G.av.data(),avRef.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
+  h7_apply_finalize_scalar(G,alphaU);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  NODALS_CUDA(cudaMemcpy(
+    diagRef.data(),G.diag.data(),G.diag.bytes(),cudaMemcpyDeviceToDevice));
+  NODALS_CUDA(cudaMemcpy(
+    rauRef.data(),G.rau.data(),G.rau.bytes(),cudaMemcpyDeviceToDevice));
+
+  const double scalarFinalize=
+    h7_time_finalize_scalar(G,avRef.data(),alphaU,reps);
+  double bestFinalize=scalarFinalize;
+  int bestFinalizeBlocks=0;
+
+  std::printf(
+    "NODALS_GPU_H8_FINALIZE_BENCH tag=%s variant=SCALAR_THREAD_ROW "
+    "blocks=%d reps=%d ms=%.9f status=PASS\n",
+    tag,g4grid(G.nv),reps,scalarFinalize);
+
+  for(int f:factors){
+    const int blocks=h7_blocks_for_sm_factor(smCount,f);
+    const double t=h7_time_finalize_warp(
+      G,avRef.data(),alphaU,blocks,reps);
+    std::printf(
+      "NODALS_GPU_H8_FINALIZE_BENCH tag=%s variant=WARP_ROW "
+      "smFactor=%d blocks=%d reps=%d ms=%.9f speedupVsScalar=%.6f status=PASS\n",
+      tag,f,blocks,reps,t,scalarFinalize/std::max(t,1e-300));
+    if(t<bestFinalize){bestFinalize=t;bestFinalizeBlocks=blocks;}
+  }
+
+  double diagParity=0,rauParity=0;
+  if(bestFinalizeBlocks>0){
+    NODALS_CUDA(cudaMemcpyAsync(
+      G.av.data(),avRef.data(),G.av.bytes(),cudaMemcpyDeviceToDevice));
+    h7_apply_finalize_warp(G,alphaU,bestFinalizeBlocks);
+    NODALS_CUDA(cudaDeviceSynchronize());
+    diagParity=h7_rel_diff(
+      G.diag.data(),diagRef.data(),G.diag.size(),diff,G.dotScratch);
+    rauParity=h7_rel_diff(
+      G.rau.data(),rauRef.data(),G.rau.size(),diff,G.dotScratch);
+    if(diagParity>2e-5 || rauParity>2e-5)
+      throw std::runtime_error("H8 warp finalizer parity failed");
+  }
+
+  G.h7WarpFinalize=(bestFinalizeBlocks>0);
+  G.h7FinalizeBlocks=bestFinalizeBlocks;
+  std::printf(
+    "NODALS_GPU_H8_FINALIZE_SELECT tag=%s scalarMs=%.9f bestMs=%.9f "
+    "speedup=%.6f selected=%s selectedBlocks=%d diagParityRelL2=%.12e "
+    "rauParityRelL2=%.12e status=PASS\n",
+    tag,scalarFinalize,bestFinalize,
+    scalarFinalize/std::max(bestFinalize,1e-300),
+    G.h7WarpFinalize?"WARP_ROW":"SCALAR_THREAD_ROW",
+    G.h7FinalizeBlocks,diagParity,rauParity);
+
+  NODALS_CUDA(cudaDeviceSynchronize());
+  std::printf(
+    "NODALS_GPU_H8_ASSEMBLY_POLICY tag=%s convection=%s convectionBlocks=%d "
+    "finalize=%s finalizeBlocks=%d setupBenchmarkOnly=1 numericalOperator=UNCHANGED "
+    "status=PASS\n",
+    tag,G.h7WarpConvection?"WARP_CELL":"SCALAR_THREAD_CELL",
+    G.h7ConvectionBlocks,
+    G.h7WarpFinalize?"WARP_ROW":"SCALAR_THREAD_ROW",
+    G.h7FinalizeBlocks);
+}
+
+
+template<class T>
+static double h8_rel_diff(
+    const T*a,const T*b,std::size_t n,
+    DeviceBuffer<T>&diff,DeviceBuffer<double>&scratch)
+{
+  if(diff.size()<n)diff.allocate(n);
+  h8_diff_kernel<<<grid_for(n),kBlock>>>(n,a,b,diff.data());
+  NODALS_CUDA(cudaGetLastError());
+  const double dn=device_norm2(diff.data(),n,scratch);
+  const double rn=device_norm2(b,n,scratch);
+  return dn/std::max(rn,1e-300);
+}
+
+static double h8_time_refresh_dynamic(G4Gpu&G,int reps){
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    T.start();
+    G.fineCsr.refresh_dynamic_raw(
+      G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h8_time_refresh_precomputed(G4Gpu&G,int reps){
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    T.start();
+    G.fineCsr.refresh_precomputed_raw(
+      G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h8_time_bt_dynamic(
+    G4Gpu&G,const StateReal*p,
+    StateReal*v0,StateReal*v1,StateReal*v2,int reps)
+{
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    NODALS_CUDA(cudaMemsetAsync(v0,0,(std::size_t)G.nv*sizeof(StateReal)));
+    NODALS_CUDA(cudaMemsetAsync(v1,0,(std::size_t)G.nv*sizeof(StateReal)));
+    NODALS_CUDA(cudaMemsetAsync(v2,0,(std::size_t)G.nv*sizeof(StateReal)));
+    T.start();
+    g4_bt3_kernel<<<g4grid(G.nc),G4B>>>(
+      G.cells.data(),p,G.nc,v0,v1,v2);
+    NODALS_CUDA(cudaGetLastError());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h8_time_bt_precomputed(
+    G4Gpu&G,const StateReal*p,
+    StateReal*v0,StateReal*v1,StateReal*v2,int reps)
+{
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    NODALS_CUDA(cudaMemsetAsync(v0,0,(std::size_t)G.nv*sizeof(StateReal)));
+    NODALS_CUDA(cudaMemsetAsync(v1,0,(std::size_t)G.nv*sizeof(StateReal)));
+    NODALS_CUDA(cudaMemsetAsync(v2,0,(std::size_t)G.nv*sizeof(StateReal)));
+    T.start();
+    h8_bt3_kernel<<<g4grid(G.nc),G4B>>>(
+      G.cells.data(),G.bcoeff.data(),p,G.nc,v0,v1,v2);
+    NODALS_CUDA(cudaGetLastError());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h8_time_cont_dynamic(
+    G4Gpu&G,const StateReal*u0,const StateReal*u1,const StateReal*u2,
+    StateReal*out,int reps)
+{
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    T.start();
+    g4_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+      G.cells.data(),G.nc,G.fixedDiv.data(),u0,u1,u2,out);
+    NODALS_CUDA(cudaGetLastError());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static double h8_time_cont_precomputed(
+    G4Gpu&G,const StateReal*u0,const StateReal*u1,const StateReal*u2,
+    StateReal*out,int reps)
+{
+  CudaEventTimer T;double total=0;
+  for(int k=0;k<reps;++k){
+    T.start();
+    h8_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+      G.cells.data(),G.bcoeff.data(),G.nc,G.fixedDiv.data(),u0,u1,u2,out);
+    NODALS_CUDA(cudaGetLastError());
+    total+=T.stop();
+  }
+  return total/reps;
+}
+
+static void h8_select_precomputed_b(G4Gpu&G,const char*tag)
+{
+  constexpr int reps=8;
+  std::printf(
+    "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu totalMiB=%.3f "
+    "build=SETUP_ONCE storage=FP32 status=PASS\n",
+    tag,H8_BCOEFF_PER_CELL,
+    (std::size_t)H8_BCOEFF_PER_CELL*sizeof(OperatorReal),
+    (double)G.bcoeff.bytes()/(1024.0*1024.0));
+
+  // ---- Exact fine CSR numeric refresh ----
+  DeviceBuffer<AMGReal> valRef(G.fineCsr.val.size());
+  DeviceBuffer<AMGReal> diagRef(G.nc);
+  DeviceBuffer<AMGReal> diffVal(G.fineCsr.val.size());
+
+  G.fineCsr.refresh_dynamic_raw(
+    G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+  NODALS_CUDA(cudaDeviceSynchronize());
+  NODALS_CUDA(cudaMemcpy(
+    valRef.data(),G.fineCsr.val.data(),G.fineCsr.val.bytes(),
+    cudaMemcpyDeviceToDevice));
+  NODALS_CUDA(cudaMemcpy(
+    diagRef.data(),G.pf.diag_pc.data(),G.pf.diag_pc.bytes(),
+    cudaMemcpyDeviceToDevice));
+
+  G.fineCsr.refresh_precomputed_raw(
+    G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+  NODALS_CUDA(cudaDeviceSynchronize());
+
+  const double refreshValParity=h8_rel_diff(
+    G.fineCsr.val.data(),valRef.data(),G.fineCsr.val.size(),
+    diffVal,G.dotScratch);
+  DeviceBuffer<AMGReal> diffDiag(G.nc);
+  const double refreshDiagParity=h8_rel_diff(
+    G.pf.diag_pc.data(),diagRef.data(),G.nc,diffDiag,G.dotScratch);
+
+  if(refreshValParity>3e-5 || refreshDiagParity>3e-5)
+    throw std::runtime_error("H8 precomputed-B fine CSR refresh parity failed");
+
+  const double refreshDynamic=h8_time_refresh_dynamic(G,reps);
+  const double refreshPrecomp=h8_time_refresh_precomputed(G,reps);
+  G.fineCsr.usePrecomputedB=(refreshPrecomp<refreshDynamic);
+
+  std::printf(
+    "NODALS_GPU_H8_REFRESH_SELECT tag=%s dynamicMs=%.9f precomputedMs=%.9f "
+    "speedup=%.6f selected=%s valParityRelL2=%.12e diagParityRelL2=%.12e "
+    "status=PASS\n",
+    tag,refreshDynamic,refreshPrecomp,
+    refreshDynamic/std::max(refreshPrecomp,1e-300),
+    G.fineCsr.usePrecomputedB?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",
+    refreshValParity,refreshDiagParity);
+
+  // Release the very large setup-only CSR parity buffers before proceeding.
+  diffVal.reset();valRef.reset();diagRef.reset();diffDiag.reset();
+
+  // ---- B^T p ----
+  DeviceBuffer<StateReal> ptest(G.nc);
+  DeviceBuffer<StateReal> d0(G.nv),d1(G.nv),d2(G.nv);
+  DeviceBuffer<StateReal> r0(G.nv),r1(G.nv),r2(G.nv),diffV(G.nv);
+  h8_test_vector_kernel<<<g4grid(G.nc),G4B>>>(G.nc,ptest.data(),1);
+  NODALS_CUDA(cudaGetLastError());
+
+  NODALS_CUDA(cudaMemset(d0.data(),0,d0.bytes()));
+  NODALS_CUDA(cudaMemset(d1.data(),0,d1.bytes()));
+  NODALS_CUDA(cudaMemset(d2.data(),0,d2.bytes()));
+  g4_bt3_kernel<<<g4grid(G.nc),G4B>>>(
+    G.cells.data(),ptest.data(),G.nc,d0.data(),d1.data(),d2.data());
+  NODALS_CUDA(cudaGetLastError());
+
+  NODALS_CUDA(cudaMemset(r0.data(),0,r0.bytes()));
+  NODALS_CUDA(cudaMemset(r1.data(),0,r1.bytes()));
+  NODALS_CUDA(cudaMemset(r2.data(),0,r2.bytes()));
+  h8_bt3_kernel<<<g4grid(G.nc),G4B>>>(
+    G.cells.data(),G.bcoeff.data(),ptest.data(),G.nc,
+    r0.data(),r1.data(),r2.data());
+  NODALS_CUDA(cudaGetLastError());
+  NODALS_CUDA(cudaDeviceSynchronize());
+
+  const double btParity=std::max({
+    h8_rel_diff(r0.data(),d0.data(),G.nv,diffV,G.dotScratch),
+    h8_rel_diff(r1.data(),d1.data(),G.nv,diffV,G.dotScratch),
+    h8_rel_diff(r2.data(),d2.data(),G.nv,diffV,G.dotScratch)});
+  if(btParity>3e-5)
+    throw std::runtime_error("H8 precomputed-B BT parity failed");
+
+  const double btDynamic=h8_time_bt_dynamic(
+    G,ptest.data(),d0.data(),d1.data(),d2.data(),reps);
+  const double btPrecomp=h8_time_bt_precomputed(
+    G,ptest.data(),r0.data(),r1.data(),r2.data(),reps);
+  G.pf.usePrecomputedBT=(btPrecomp<btDynamic);
+
+  std::printf(
+    "NODALS_GPU_H8_BT_SELECT tag=%s dynamicKernelMs=%.9f "
+    "precomputedKernelMs=%.9f speedup=%.6f selected=%s "
+    "parityRelL2=%.12e status=PASS\n",
+    tag,btDynamic,btPrecomp,btDynamic/std::max(btPrecomp,1e-300),
+    G.pf.usePrecomputedBT?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",btParity);
+
+  // Matrix-free B action is not the production physical operator, but use the
+  // same selected geometry representation in setup parity/power diagnostics.
+  G.pf.usePrecomputedBAction=G.pf.usePrecomputedBT;
+
+  // ---- continuity B u ----
+  DeviceBuffer<StateReal> u0(G.nv),u1(G.nv),u2(G.nv);
+  DeviceBuffer<StateReal> cDyn(G.nc),cPre(G.nc),diffC(G.nc);
+  h8_test_vector_kernel<<<g4grid(G.nv),G4B>>>(G.nv,u0.data(),2);
+  h8_test_vector_kernel<<<g4grid(G.nv),G4B>>>(G.nv,u1.data(),3);
+  h8_test_vector_kernel<<<g4grid(G.nv),G4B>>>(G.nv,u2.data(),4);
+  NODALS_CUDA(cudaGetLastError());
+
+  g4_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+    G.cells.data(),G.nc,G.fixedDiv.data(),
+    u0.data(),u1.data(),u2.data(),cDyn.data());
+  h8_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+    G.cells.data(),G.bcoeff.data(),G.nc,G.fixedDiv.data(),
+    u0.data(),u1.data(),u2.data(),cPre.data());
+  NODALS_CUDA(cudaGetLastError());
+  NODALS_CUDA(cudaDeviceSynchronize());
+
+  const double contParity=h8_rel_diff(
+    cPre.data(),cDyn.data(),G.nc,diffC,G.dotScratch);
+  if(contParity>3e-5)
+    throw std::runtime_error("H8 precomputed-B continuity parity failed");
+
+  const double contDynamic=h8_time_cont_dynamic(
+    G,u0.data(),u1.data(),u2.data(),cDyn.data(),reps);
+  const double contPrecomp=h8_time_cont_precomputed(
+    G,u0.data(),u1.data(),u2.data(),cPre.data(),reps);
+  G.h8PrecomputedContinuity=(contPrecomp<contDynamic);
+
+  std::printf(
+    "NODALS_GPU_H8_CONTINUITY_SELECT tag=%s dynamicMs=%.9f "
+    "precomputedMs=%.9f speedup=%.6f selected=%s parityRelL2=%.12e "
+    "status=PASS\n",
+    tag,contDynamic,contPrecomp,contDynamic/std::max(contPrecomp,1e-300),
+    G.h8PrecomputedContinuity?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",
+    contParity);
+
+  // Restore the selected exact fine CSR values before all subsequent setup.
+  G.fineCsr.refresh(
+    G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+  NODALS_CUDA(cudaDeviceSynchronize());
+
+  std::printf(
+    "NODALS_GPU_H8_B_POLICY tag=%s refresh=%s bt=%s continuity=%s "
+    "persistentBytes=%zu setupOnlyBenchmark=1 numericalOperator=UNCHANGED "
+    "status=PASS\n",
+    tag,
+    G.fineCsr.usePrecomputedB?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",
+    G.pf.usePrecomputedBT?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",
+    G.h8PrecomputedContinuity?"PRECOMPUTED_B":"DYNAMIC_GEOMETRY",
+    G.bcoeff.bytes());
+}
+
 static void forward_mcgs_fixed(G4Gpu&G,const ColoringHost&C,double omega){
   int q=h0_begin(H0_MOM_FORWARD);
   for(int c=0;c<C.ncolors;++c){
@@ -402,10 +1080,10 @@ static double g5_used_mib(const DeviceMemoryInfo&m){return (double)(m.total_byte
 static double g5_mib(std::size_t b){return (double)b/(1024.0*1024.0);}
 
 static void h0_print_profile(const char*tag,int outer,double pressureStageMs,double momentumStageMs,const H0Profiler&P){
-  std::printf("NODALS_GPU_H4_PROFILE_SUMMARY tag=%s outer=%d pressureStageTotalMs=%.6f momentumStageTotalMs=%.6f records=%lld eventTiming=NO_EXTRA_PER_SPAN_SYNC status=PASS\n",tag,outer,pressureStageMs,momentumStageMs,P.recordCount);
+  std::printf("NODALS_GPU_H8_PROFILE_SUMMARY tag=%s outer=%d pressureStageTotalMs=%.6f momentumStageTotalMs=%.6f records=%lld eventTiming=NO_EXTRA_PER_SPAN_SYNC status=PASS\n",tag,outer,pressureStageMs,momentumStageMs,P.recordCount);
   for(int c=0;c<H0_CAT_COUNT;++c){for(int sl=0;sl<=H0Profiler::MAX_LEVEL;++sl){if(P.calls[c][sl]==0)continue;int lev=sl==0?-1:sl-1;double t=P.total[c][sl],w=P.warm[c][sl];long long n=P.calls[c][sl],nw=P.warmCalls[c][sl];
     const bool mom=c>=H0_MOM_BT_TOTAL;double denom=mom?momentumStageMs:pressureStageMs;double pct=denom>0?100.0*t/denom:0.0;
-    std::printf("NODALS_GPU_H4_PROFILE tag=%s domain=%s category=%s level=%d calls=%lld totalMs=%.6f perCallMs=%.6f perSimpleMs=%.6f pctStage=%.3f warmCalls=%lld warmTotalMs=%.6f warmPerSimpleMs=%.6f\n",tag,mom?"momentum":"pressure",h0_cat_name(c),lev,n,t,t/std::max<long long>(n,1),t/std::max(outer,1),pct,nw,w,w/std::max(outer-1,1));
+    std::printf("NODALS_GPU_H8_PROFILE tag=%s domain=%s category=%s level=%d calls=%lld totalMs=%.6f perCallMs=%.6f perSimpleMs=%.6f pctStage=%.3f warmCalls=%lld warmTotalMs=%.6f warmPerSimpleMs=%.6f\n",tag,mom?"momentum":"pressure",h0_cat_name(c),lev,n,t,t/std::max<long long>(n,1),t/std::max(outer,1),pct,nw,w,w/std::max(outer-1,1));
   }}
 }
 
@@ -441,19 +1119,19 @@ int main(int argc,char**argv){try{
     else if(a=="--fine-csr-refresh-every"&&i+1<argc)fineCsrRefreshEvery=std::atoi(argv[++i]);
     else if(a=="--momentum-work"&&i+1<argc)momentumWork=argv[++i];
     else if(a=="--run-mode"&&i+1<argc)runMode=argv[++i];
-    else throw std::runtime_error("H4 usage error");
+    else throw std::runtime_error("H8 usage error");
   }
   if(mesh.empty())throw std::runtime_error("--mesh required");
-  if(!(simpleTol>0.0) || maxOuter<1)throw std::runtime_error("H4 invalid SIMPLE controls");
-  if(!(alphaU>0.0&&alphaU<=1.0) || !(alphaP>0.0&&alphaP<=1.0))throw std::runtime_error("H4 alpha-u/alpha-p must be in (0,1]");
-  if(momRtol<0.0 || momAtol<0.0 || momDrop<0.0 || momMax<1 || !(momOmega>0.0))throw std::runtime_error("H4 invalid momentum controls");
-  if(pRtol<0.0 || pAtol<0.0 || pMax<1)throw std::runtime_error("H4 invalid pressure controls");
-  if(!(snapshotTol>0.0))throw std::runtime_error("H4 snapshot tolerance must be positive");
-  if(fineCsrRefreshEvery!=1)throw std::runtime_error("H4 requires fine CSR refreshEvery=1");
-  if(!(momentumWork=="fgs1"||momentumWork=="altgs1"))throw std::runtime_error("H4 momentum-work must be fgs1 or altgs1");
-  if(runMode!="fixed10")throw std::runtime_error("H4 is fixed10-only");
-  if(!(runMode=="fixed10"||runMode=="converge"))throw std::runtime_error("H4 run-mode must be fixed10 or converge");
-  if(runMode=="fixed10"&&maxOuter!=10)throw std::runtime_error("H4 fixed10 requires maxOuter=10");
+  if(!(simpleTol>0.0) || maxOuter<1)throw std::runtime_error("H8 invalid SIMPLE controls");
+  if(!(alphaU>0.0&&alphaU<=1.0) || !(alphaP>0.0&&alphaP<=1.0))throw std::runtime_error("H8 alpha-u/alpha-p must be in (0,1]");
+  if(momRtol<0.0 || momAtol<0.0 || momDrop<0.0 || momMax<1 || !(momOmega>0.0))throw std::runtime_error("H8 invalid momentum controls");
+  if(pRtol<0.0 || pAtol<0.0 || pMax<1)throw std::runtime_error("H8 invalid pressure controls");
+  if(!(snapshotTol>0.0))throw std::runtime_error("H8 snapshot tolerance must be positive");
+  if(fineCsrRefreshEvery!=1)throw std::runtime_error("H8 requires fine CSR refreshEvery=1");
+  if(momentumWork!="fgs1")throw std::runtime_error("H8 requires momentum-work=fgs1");
+  if(runMode!="fixed10")throw std::runtime_error("H8 is fixed10-only");
+  if(!(runMode=="fixed10"||runMode=="converge"))throw std::runtime_error("H8 run-mode must be fixed10 or converge");
+  if(runMode=="fixed10"&&maxOuter!=10)throw std::runtime_error("H8 fixed10 requires maxOuter=10");
   const bool physicalUseCurrentCSR=true;
 
   NODALS_CUDA(cudaSetDevice(0));cudaDeviceProp prop{};NODALS_CUDA(cudaGetDeviceProperties(&prop,0));upload_tensors();NODALS_CUDA(cudaDeviceSynchronize());
@@ -465,26 +1143,27 @@ int main(int argc,char**argv){try{
   auto H=build_sa_hierarchy(M,S.pressure,16,6,18,1000,8,16,1.5,0.05,4.0/3.0);
   auto FH=build_h2_fine_csr_host(S);
 
-  std::printf("NODALS_GPU_H4_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_FP32_CSR_warp fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=FP32 operator=FP32 amg=FP32\n",
+  std::printf("NODALS_GPU_H8_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_FP32_CSR_warp coarseAMGSpMV=per_level_scalar_vs_warp_hybrid fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ momentumAssemblyExec=SETUP_SELECT_SCALAR_VS_WARP BGeometry=SETUP_PRECOMPUTED_24FP32_PER_CELL_AUTOSELECT alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=FP32 operator=FP32 amg=FP32\n",
     tag.c_str(),kPrecisionName,prop.name,prop.major,prop.minor,M.tets.size(),runMode.c_str(),momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",alphaU,alphaP,simpleTol,maxOuter,momOmega,pRtol,pAtol,pMax);
-  std::printf("NODALS_GPU_H4_TUNING alphaU=%.8g alphaP=%.8g momentumWork=%s momentumOmega=%.8g momentumAdaptiveTol=DISABLED momentumResidualPolicy=%s pRtol=%.3e pAtol=%.3e pMax=%d simpleTol=%.3e maxOuter=%d snapshotTol=%.3e fineCsrRefreshEvery=1 status=PASS\n",
+  std::printf("NODALS_GPU_H8_TUNING alphaU=%.8g alphaP=%.8g momentumWork=%s momentumOmega=%.8g momentumAdaptiveTol=DISABLED momentumResidualPolicy=%s pRtol=%.3e pAtol=%.3e pMax=%d simpleTol=%.3e maxOuter=%d snapshotTol=%.3e fineCsrRefreshEvery=1 status=PASS\n",
     alphaU,alphaP,momentumWork.c_str(),momOmega,runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",pRtol,pAtol,pMax,simpleTol,maxOuter,snapshotTol);
-  std::printf("NODALS_GPU_H4_FINE_CSR_TOPOLOGY tag=%s cells=%zu nnz=%zu rowMean=%.6f rowMax=%u directedContrib=%llu csrMiB=%.3f compactRefreshMetadataMiB=%.3f totalFineCsrMiB=%.3f bytesPerCell=%.3f status=PASS\n",
+  std::printf("NODALS_GPU_H8_FINE_CSR_TOPOLOGY tag=%s cells=%zu nnz=%zu rowMean=%.6f rowMax=%u directedContrib=%llu csrMiB=%.3f compactRefreshMetadataMiB=%.3f totalFineCsrMiB=%.3f bytesPerCell=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),FH.col.size(),FH.rowMean,FH.rowMax,(unsigned long long)FH.directedContrib,
     g5_mib(FH.csr_bytes()),g5_mib(FH.metadata_bytes()),g5_mib(FH.bytes()),(double)FH.bytes()/std::max<std::size_t>(M.tets.size(),1));
-  std::printf("NODALS_GPU_H4_SETUP tag=%s cells=%zu freeVel=%d momentumNnz=%zu colors=%d hierarchyLevels=%zu terminal=%d transfer0Nnz=%zu cellPlanHostBytes=%zu cellPlanDeviceBytes=%zu baselineUsedMiB=%.3f totalMiB=%.3f status=PASS\n",
+  std::printf("NODALS_GPU_H8_SETUP tag=%s cells=%zu freeVel=%d momentumNnz=%zu colors=%d hierarchyLevels=%zu terminal=%d transfer0Nnz=%zu cellPlanHostBytes=%zu cellPlanDeviceBytes=%zu baselineUsedMiB=%.3f totalMiB=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),S.topo.n,S.topo.val.size(),S.coloring.ncolors,H.csr.size(),H.terminal_n,H.P.empty()?0:H.P[0].val.size(),sizeof(G4CellPlanHost),sizeof(G4CellPlanDevice),g5_used_mib(memBaseline),(double)memBaseline.total_bytes/(1024.0*1024.0));
-  std::printf("NODALS_GPU_H4_MOMENTUM_ASSEMBLY_DESIGN tag=%s diffusionCSR=BUILT_ONCE_HOST_UPLOADED_ONCE_DEVICE_PERSISTENT convectionCSRTopology=STATIC convectionNumeric=REFRESH_EACH_OUTER commonOperatorXYZ=YES pressureGradientBTopology=STATIC pressureGradientAction=APPLY_CURRENT_P fixedDiffusionDirichletRHS=PERSISTENT variableViscosityDesign=REFRESH_DIFFUSION_NUMERICS_ONLY_NO_TOPOLOGY_REBUILD status=PASS\n",tag.c_str());
+  std::printf("NODALS_GPU_H8_MOMENTUM_ASSEMBLY_DESIGN tag=%s diffusionCSR=BUILT_ONCE_HOST_UPLOADED_ONCE_DEVICE_PERSISTENT convectionCSRTopology=STATIC convectionNumeric=REFRESH_EACH_OUTER commonOperatorXYZ=YES pressureGradientBTopology=STATIC pressureGradientAction=APPLY_CURRENT_P fixedDiffusionDirichletRHS=PERSISTENT variableViscosityDesign=REFRESH_DIFFUSION_NUMERICS_ONLY_NO_TOPOLOGY_REBUILD status=PASS\n",tag.c_str());
 
-  G4Gpu G=upload_all(S,H,initRau,FH);G.pf.cells=G.cells.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;
-  G.fineCsr.refresh(G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
-  h2b_refresh_bench(G,tag.c_str(),12);
+  G4Gpu G=upload_all(S,H,initRau,FH);G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;
+  h7_select_momentum_assembly(G,alphaU,prop.multiProcessorCount,tag.c_str());
+  h8_select_precomputed_b(G,tag.c_str());
+  h6_select_coarse_spmv(G,H,tag.c_str(),200);
   g5_gpu_spectrum_refresh(G,H);
   h2_action_parity_and_bench(G,tag.c_str(),24);
   H0Profiler H0P;g_h0=&H0P;
   NODALS_CUDA(cudaDeviceSynchronize());const auto memUpload=device_memory_info();
   const double baselineUsed=g5_used_mib(memBaseline),uploadUsed=g5_used_mib(memUpload),explicitMiB=g5_mib(G.bytes());
-  std::printf("NODALS_GPU_H4_MEMORY tag=%s point=after_upload cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f explicitBytesPerCell=%.3f status=PASS\n",
+  std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_upload cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f explicitBytesPerCell=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),baselineUsed,uploadUsed,uploadUsed-baselineUsed,explicitMiB,(double)G.bytes()/std::max<std::size_t>(M.tets.size(),1));
 
   bool converged=false,pressureAll=true,finiteAll=true;double cont0=-1.0,contRel=1.0;
@@ -493,13 +1172,13 @@ int main(int argc,char**argv){try{
   auto wall0=std::chrono::steady_clock::now();
   int finalIt=0,fineCsrRefreshCount=0;
   for(int it=1;it<=maxOuter;++it){
-    H0P.currentOuter=it;if(H0P.used)throw std::runtime_error("H4 profiler nonempty at outer start");
+    H0P.currentOuter=it;if(H0P.used)throw std::runtime_error("H8 profiler nonempty at outer start");
     G5StageEvents E;E.rec(0);
     assemble_live(G,alphaU);E.rec(1);
     if(it==1){
       double rr=g5_rau_snapshot_rel(G);
-      std::printf("NODALS_GPU_H4_SNAPSHOT_PARITY it=1 rAURel=%.3e tol=%.3e status=%s\n",rr,snapshotTol,rr<snapshotTol?"PASS":"FAIL");
-      if(!(rr<snapshotTol))throw std::runtime_error("H4 setup rAU snapshot mismatch");
+      std::printf("NODALS_GPU_H8_SNAPSHOT_PARITY it=1 rAURel=%.3e tol=%.3e status=%s\n",rr,snapshotTol,rr<snapshotTol?"PASS":"FAIL");
+      if(!(rr<snapshotTol))throw std::runtime_error("H8 setup rAU snapshot mismatch");
     }
     G.pf.bt_state(G.p.data());
     {int q=h0_begin(H0_MOM_RHS);g4_momentum_rhs_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.s0.data(),G.s1.data(),G.s2.data(),G.c0.data(),G.c1.data(),G.c2.data(),G.pf.v0.data(),G.pf.v1.data(),G.pf.v2.data(),G.delta.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.b0.data(),G.b1.data(),G.b2.data());NODALS_CUDA(cudaGetLastError());h0_end(q);}
@@ -510,7 +1189,16 @@ int main(int argc,char**argv){try{
     }
     const char* momentumDirection=fixed_momentum_work(G,S.coloring,momOmega,momentumWork,it);E.rec(2);
 
-    g4_continuity_kernel<<<g4grid(G.nc),G4B>>>(G.cells.data(),G.nc,G.fixedDiv.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.cont.data());NODALS_CUDA(cudaGetLastError());
+    if(G.h8PrecomputedContinuity){
+      h8_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+        G.cells.data(),G.bcoeff.data(),G.nc,G.fixedDiv.data(),
+        G.u0.data(),G.u1.data(),G.u2.data(),G.cont.data());
+    }else{
+      g4_continuity_kernel<<<g4grid(G.nc),G4B>>>(
+        G.cells.data(),G.nc,G.fixedDiv.data(),
+        G.u0.data(),G.u1.data(),G.u2.data(),G.cont.data());
+    }
+    NODALS_CUDA(cudaGetLastError());
     double cn=device_norm2(G.cont.data(),G.nc,G.dotScratch);if(it==1)cont0=cn;contRel=cn/std::max(cont0,1e-300);
     g4_negate_kernel<<<g4grid(G.nc),G4B>>>(G.nc,G.cont.data());NODALS_CUDA(cudaGetLastError());E.rec(3);
 
@@ -519,7 +1207,7 @@ int main(int argc,char**argv){try{
       ++fineCsrRefreshCount;
     }
     auto pr=pressure_pcg(G.pf,G.amg,G.cont.data(),pRtol,pAtol,pMax,G.pcg,G.dotScratch);
-    pressureAll=pressureAll&&pr.ok;if(!pr.ok)throw std::runtime_error("H4 pressure PCG failed requested FP32 inexact target");sumP+=pr.its;E.rec(4);
+    pressureAll=pressureAll&&pr.ok;if(!pr.ok)throw std::runtime_error("H8 pressure PCG failed requested FP32 inexact target");sumP+=pr.its;E.rec(4);
     g4_axpy_kernel<<<g4grid(G.nc),G4B>>>(G.nc,alphaP,G.pcg.x.data(),G.p.data());NODALS_CUDA(cudaGetLastError());E.rec(5);
     NODALS_CUDA(cudaEventSynchronize(E.e[5]));H0P.collect();
 
@@ -534,7 +1222,7 @@ int main(int argc,char**argv){try{
     converged=(runMode=="converge")&&finiteAll&&pressureAll&&contRel<=simpleTol&&auditedThisOuter&&allMomentumMet;finalIt=it;
 
     if(it<=10 || (it%25)==0 || auditedThisOuter || converged)
-      std::printf("NODALS_GPU_H4_SIMPLE tag=%s it=%d relCont=%.12e momentumWork=%s momentumDirection=%s residualAudit=%s auditInitRel=[%.3e,%.3e,%.3e] pCG=%d pTrueRel=%.3e allMomentumMet=%d converged=%d status=%s\n",
+      std::printf("NODALS_GPU_H8_SIMPLE tag=%s it=%d relCont=%.12e momentumWork=%s momentumDirection=%s residualAudit=%s auditInitRel=[%.3e,%.3e,%.3e] pCG=%d pTrueRel=%.3e allMomentumMet=%d converged=%d status=%s\n",
         tag.c_str(),it,contRel,momentumWork.c_str(),momentumDirection,auditedThisOuter?"DONE":"SKIPPED",auditRel[0],auditRel[1],auditRel[2],pr.its,pr.rel,(int)allMomentumMet,(int)converged,(pressureAll&&finiteAll)?"PASS":"FAIL");
     if(runMode=="converge"&&converged)break;
   }
@@ -546,19 +1234,19 @@ int main(int argc,char**argv){try{
   double usedEnd=g5_used_mib(memEnd);
 
   if(runMode=="fixed10"){
-    std::printf("NODALS_GPU_H4_FIXED10 tag=%s cells=%zu fixedOuter=%d momentumWork=%s momentumPassesPerOuter=1 momentumResidualAudits=0 diffusionPolicy=PERSISTENT_NUMERIC_CSR convectionPolicy=NUMERIC_ONLY_EACH_OUTER fineCsrRefreshEvery=1 fineCsrRefreshCount=%d finalRelCont=%.12e avgPressureIts=%.6f pressureDropFit=%.12e exactPressureDrop=%.12e pressureDropRelErr=%.12e loopMs=%.3f avgSimpleMs=%.6f assemblyAvgMs=%.6f momentumAvgMs=%.6f continuityAvgMs=%.6f pressureAvgMs=%.6f pressureUpdateAvgMs=%.6f status=%s\n",
+    std::printf("NODALS_GPU_H8_FIXED10 tag=%s cells=%zu fixedOuter=%d momentumWork=%s momentumPassesPerOuter=1 momentumResidualAudits=0 diffusionPolicy=PERSISTENT_NUMERIC_CSR convectionPolicy=NUMERIC_ONLY_EACH_OUTER fineCsrRefreshEvery=1 fineCsrRefreshCount=%d finalRelCont=%.12e avgPressureIts=%.6f pressureDropFit=%.12e exactPressureDrop=%.12e pressureDropRelErr=%.12e loopMs=%.3f avgSimpleMs=%.6f assemblyAvgMs=%.6f momentumAvgMs=%.6f continuityAvgMs=%.6f pressureAvgMs=%.6f pressureUpdateAvgMs=%.6f status=%s\n",
       tag.c_str(),M.tets.size(),finalIt,momentumWork.c_str(),fineCsrRefreshCount,contRel,finalIt?(double)sumP/finalIt:0.0,dp,exact,dpErr,wallMs,finalIt?wallMs/finalIt:0.0,finalIt?tAssembly/finalIt:0.0,finalIt?tMomentum/finalIt:0.0,finalIt?tContinuity/finalIt:0.0,finalIt?tPressure/finalIt:0.0,finalIt?tPupdate/finalIt:0.0,(pressureAll&&finiteAll&&finalIt==10)?"PASS":"FAIL");
   }else{
-    std::printf("NODALS_GPU_H4_FULLCONV tag=%s cells=%zu momentumWork=%s simpleTol=%.3e outerIts=%d converged=%d finalRelCont=%.12e convergenceAuditCalls=%d finalAuditInitRel=[%.3e,%.3e,%.3e] avgPressureIts=%.6f pressureDropFit=%.12e exactPressureDrop=%.12e pressureDropRelErr=%.12e loopMs=%.3f avgSimpleMs=%.6f assemblyAvgMs=%.6f momentumAvgMs=%.6f continuityAvgMs=%.6f pressureAvgMs=%.6f pressureUpdateAvgMs=%.6f status=%s\n",
+    std::printf("NODALS_GPU_H8_FULLCONV tag=%s cells=%zu momentumWork=%s simpleTol=%.3e outerIts=%d converged=%d finalRelCont=%.12e convergenceAuditCalls=%d finalAuditInitRel=[%.3e,%.3e,%.3e] avgPressureIts=%.6f pressureDropFit=%.12e exactPressureDrop=%.12e pressureDropRelErr=%.12e loopMs=%.3f avgSimpleMs=%.6f assemblyAvgMs=%.6f momentumAvgMs=%.6f continuityAvgMs=%.6f pressureAvgMs=%.6f pressureUpdateAvgMs=%.6f status=%s\n",
       tag.c_str(),M.tets.size(),momentumWork.c_str(),simpleTol,finalIt,(int)converged,contRel,convergenceAuditCalls,lastAuditRel[0],lastAuditRel[1],lastAuditRel[2],finalIt?(double)sumP/finalIt:0.0,dp,exact,dpErr,wallMs,finalIt?wallMs/finalIt:0.0,finalIt?tAssembly/finalIt:0.0,finalIt?tMomentum/finalIt:0.0,finalIt?tContinuity/finalIt:0.0,finalIt?tPressure/finalIt:0.0,finalIt?tPupdate/finalIt:0.0,converged?"PASS":"FAIL");
   }
-  std::printf("NODALS_GPU_H4_MOMENTUM_AUDIT tag=%s runMode=%s policy=%s calls=%d postSweepAudits=0 status=PASS\n",tag.c_str(),runMode.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",convergenceAuditCalls);
+  std::printf("NODALS_GPU_H8_MOMENTUM_AUDIT tag=%s runMode=%s policy=%s calls=%d postSweepAudits=0 status=PASS\n",tag.c_str(),runMode.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",convergenceAuditCalls);
   h0_print_profile(tag.c_str(),finalIt,tPressure,tMomentum,H0P);
-  std::printf("NODALS_GPU_H4_MEMORY tag=%s point=after_convergence cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f runtimeDriftMiB=%.3f totalMiB=%.3f status=PASS\n",
+  std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_convergence cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f runtimeDriftMiB=%.3f totalMiB=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),baselineUsed,usedEnd,usedEnd-baselineUsed,explicitMiB,usedEnd-uploadUsed,(double)memEnd.total_bytes/(1024.0*1024.0));
-  std::printf("NODALS_GPU_H4_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=FP32 physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT H4_scope=FIXED_MOMENTUM_WORK status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
+  std::printf("NODALS_GPU_H8_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=FP32 physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID H8_scope=PRECOMPUTED_B_GEOMETRY status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
   const bool finalPass=(runMode=="fixed10")?(finalIt==10&&pressureAll&&finiteAll):converged;
-  std::printf("NODALS_GPU_RESULT gate=H4 tag=%s cells=%zu precision=fp32 runMode=%s momentumWork=%s outer=%d simpleTol=%.3e fineCsrRefreshEvery=1 physicalOperator=current_exact_CSR pressureAll=%s finite=%s noPetsc=1 noMPI=1 status=%s\n",
+  std::printf("NODALS_GPU_RESULT gate=H8 tag=%s cells=%zu precision=fp32 runMode=%s momentumWork=%s outer=%d simpleTol=%.3e fineCsrRefreshEvery=1 physicalOperator=current_exact_CSR pressureAll=%s finite=%s noPetsc=1 noMPI=1 status=%s\n",
     tag.c_str(),M.tets.size(),runMode.c_str(),momentumWork.c_str(),finalIt,simpleTol,pressureAll?"PASS":"FAIL",finiteAll?"PASS":"FAIL",finalPass?"PASS":"FAIL");
   return finalPass?0:35;
-}catch(const std::exception&e){std::fprintf(stderr,"NODALS_GPU_H4_EXCEPTION what=%s\n",e.what());return 90;}}
+}catch(const std::exception&e){std::fprintf(stderr,"NODALS_GPU_H8_EXCEPTION what=%s\n",e.what());return 90;}}
