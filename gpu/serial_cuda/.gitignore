@@ -6,3 +6,6 @@ h8_results/
 *.log
 *.time
 __pycache__/
+nodals_gpu_h8_fp64
+results_111k_convergence/
+results_fixed10/

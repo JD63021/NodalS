@@ -166,9 +166,9 @@ __global__ void h8_test_vector_kernel(int n,StateReal* x,int phase)
 {
   const int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);
   if(i<n){
-    const float q=(float)(i+1);
-    x[i]=sinf((0.000713f+0.000071f*phase)*q)
-        + 0.31f*cosf((0.001117f+0.000053f*phase)*q);
+    const StateReal q=StateReal(i+1);
+    x[i]=sin((StateReal(0.000713)+StateReal(0.000071)*StateReal(phase))*q)
+        + StateReal(0.31)*cos((StateReal(0.001117)+StateReal(0.000053)*StateReal(phase))*q);
   }
 }
 
