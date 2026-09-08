@@ -29,6 +29,7 @@ struct G4CellPlanDevice {
   std::int32_t ref[8];
   std::uint8_t rowSlot[64];
   OperatorReal det;
+  OperatorReal h2;
   OperatorReal invJ[9];
 };
 

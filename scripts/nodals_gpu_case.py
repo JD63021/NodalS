@@ -26,6 +26,7 @@ KNOWN_KEYS: Dict[str, set[str]] = {
     "boundary": {"wall_patch", "inlet_patch", "outlet_patch"},
     "simple": {"rtol", "max_iterations", "alpha_u", "alpha_p"},
     "momentum": {"work", "rtol", "atol", "relative_drop", "omega", "max_iterations"},
+    "supg": {"enabled", "tau_scale", "magic", "form", "quad_points"},
     "pressure": {
         "solver", "rtol", "atol", "max_iterations", "snapshot_tolerance",
         "fine_csr_refresh_every", "richardson_omega", "chebyshev_degree",
@@ -144,6 +145,19 @@ def build_gpu_options(cp: configparser.ConfigParser) -> List[str]:
     _arg(a, "mom-drop", _get(cp, "momentum", "relative_drop", "0.1"))
     _arg(a, "mom-omega", _get(cp, "momentum", "omega", "1.0"))
     _arg(a, "mom-max", _get(cp, "momentum", "max_iterations", "20000"))
+
+    supg_enabled = _bool(str(_get(cp, "supg", "enabled", "false")), "[supg] enabled")
+    supg_form = str(_get(cp, "supg", "form", "implicit")).lower()
+    supg_quad = int(str(_get(cp, "supg", "quad_points", "64")))
+    if supg_enabled and supg_form != "implicit":
+        raise ValueError("current H8 GPU SUPG supports only [supg] form=implicit")
+    if supg_enabled and supg_quad != 64:
+        raise ValueError("current H8 GPU SUPG supports only [supg] quad_points=64")
+    _arg(a, "supg", 1 if supg_enabled else 0)
+    _arg(a, "supg-tau-scale", _get(cp, "supg", "tau_scale", "0.05"))
+    _arg(a, "supg-magic", _get(cp, "supg", "magic", "9.0"))
+    _arg(a, "supg-form", supg_form)
+    _arg(a, "supg-quad-points", supg_quad)
 
     psolver = str(_get(cp, "pressure", "solver", "richardson")).lower()
     if psolver not in {"pcg", "richardson", "cheb"}:

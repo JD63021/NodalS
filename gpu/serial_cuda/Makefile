@@ -2,7 +2,10 @@ NVCC ?= nvcc
 ARCH ?= sm_86
 NVCCFLAGS ?= -O3 -std=c++17 -lineinfo -Xcompiler=-Wall,-Wextra
 
-H8_DEPS = h8_main.cu h8_precomputed_b.cuh h7_momentum_assembly.cuh \
+H8_DEPS = h8_main.cu h8_main_base.cu \
+          h8_supg_support.inc h8_hp_diagnostics.inc h8_supg_main_cli.inc \
+          h8_supg_main_setup.inc h8_supg_main_loop.inc h8_supg_dispatch.inc \
+          h8_precomputed_b.cuh h7_momentum_assembly.cuh \
           h6_coarse_spmv.cuh h4_kernels.cuh h2b_fine_csr.cuh \
           g5e_fp32_kernels.cuh g4_host.hpp g4_refresh_host.hpp \
           g5_sa_host.hpp g6_cf_host.hpp g6_pmis_host.hpp \
