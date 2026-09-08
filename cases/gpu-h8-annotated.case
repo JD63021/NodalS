@@ -1,0 +1,128 @@
+# =============================================================================
+# NodalS H8 serial CUDA — fully annotated reusable .case
+# =============================================================================
+# This file exposes every CURRENT user-facing H8 CLI option through named case
+# sections.  It does not add new numerics; it only maps readable keys onto the
+# already implemented CUDA solver switches.
+#
+# Two pressure hierarchy families are available:
+#
+#   ORIGINAL SA PATH
+#     pressure_amg.hierarchy = sa
+#     pressure_amg.smoother  = cheb2       (historical/default SA pairing)
+#     pressure.solver        = pcg
+#
+#   CF/PMIS PATH
+#     pressure_amg.hierarchy       = cf
+#     pressure_amg_cf.coarsening   = pmis
+#     pressure_amg_cf.strength     = classical-negative
+#     pressure_amg_cf.interpolation= direct | exti
+#     pressure_amg.smoother        = cheb2 | jacobi | l1jacobi
+#     pressure.solver              = pcg | richardson | cheb
+#
+# The values below select the current recommended CF/PMIS + Jacobi + Richardson
+# configuration.  To return to the original SA path, change the three primary
+# lines in [pressure], [pressure_amg] noted below.
+#
+# Current H8 limitations intentionally reflected here:
+#   - single GPU; source currently selects CUDA device 0
+#   - P1+BF3/P0 pipe path with existing wall/inlet/outlet convention
+#   - momentum work is FGS1
+#   - no CUDA SUPG yet
+#   - no DG inlet or algebraic mixing-length model yet
+#   - fine pressure CSR numeric refresh cadence is currently fixed at 1
+# =============================================================================
+
+[run]
+name = gpu_h8_cf_pmis                                   # Tag printed in every H8 diagnostic marker.
+precision = fp32                                        # fp32 | fp64; selects nodals_gpu_h8_fp32/fp64 binary.
+run_mode = converge                                     # converge | fixed10. fixed10 requires simple.max_iterations=10.
+timeout_seconds = 0                                     # 0 disables launcher timeout.
+output_root = auto                                      # auto -> ~/Downloads/NodalS_GPU_<name>_<timestamp>.
+
+[solver]
+mesh = meshes/pipe/111k/constant/polyMesh               # OpenFOAM tetrahedral constant/polyMesh directory.
+re = 20                                                 # Reynolds number used by current H8 pipe setup.
+bulk_velocity = 1.0                                     # Pipe bulk velocity.
+
+[boundary]
+wall_patch = patch_0_0                                  # No-slip wall patch.
+inlet_patch = patch_2_0                                 # Existing H8 pipe inlet patch.
+outlet_patch = patch_1_0                                # Existing H8 open outlet patch.
+
+[simple]
+rtol = 1e-3                                             # Full convergence threshold.
+max_iterations = 2500                                   # Outer cap; set exactly 10 with run.run_mode=fixed10.
+alpha_u = 0.5                                           # Velocity under-relaxation.
+alpha_p = 0.5                                           # Pressure-correction under-relaxation.
+
+[momentum]
+# H8 currently requires work=fgs1.  The tolerance/drop/max fields are accepted
+# by the H8 CLI for interface continuity, but adaptive inner stopping is disabled
+# in the current performance path; converge mode audits the pre-sweep residual.
+work = fgs1                                             # Current H8 momentum-work implementation.
+rtol = 1e-6                                             # Parsed/validated H8 momentum tolerance field.
+atol = 1e-12                                            # Parsed/validated H8 momentum absolute tolerance field.
+relative_drop = 0.1                                     # Parsed/validated H8 relative-drop field.
+omega = 1.0                                             # FGS relaxation omega.
+max_iterations = 20000                                  # Parsed/validated H8 momentum iteration cap.
+
+[pressure]
+# Pressure outer solver:
+#   pcg         = preconditioned conjugate gradient
+#   richardson  = stationary Richardson using one AMG application per step
+#   cheb        = outer Chebyshev polynomial on M^-1 A
+solver = richardson                                     # For original SA path, historical pairing is pcg.
+rtol = 0.5                                              # Relative pressure target.
+atol = 1e-12                                            # Absolute pressure target.
+max_iterations = 20                                     # Maximum pressure outer iterations.
+snapshot_tolerance = 5e-6                              # Accepted rAU/coarse-hierarchy snapshot drift tolerance.
+fine_csr_refresh_every = 1                              # Current H8 requires exactly 1.
+
+# Used when solver=richardson.
+richardson_omega = 1.0                                  # Richardson relaxation, current H8 accepts (0,2).
+
+# Used when solver=cheb.  These are OUTER-Chebyshev controls and are independent
+# of the inner AMG smoother's Chebyshev controls below.
+chebyshev_degree = 3                                    # Outer polynomial degree.
+power_iterations = 6                                   # Power iterations on preconditioned operator M^-1 A.
+chebyshev_low_fraction = 0.05                           # Outer lambda_min/lambda_max fraction.
+power_safety = 1.15                                     # Outer spectral safety multiplier.
+
+[pressure_amg]
+# PRIMARY HIERARCHY SELECTOR:
+#   sa = original smoothed-aggregation hierarchy
+#   cf = C/F hierarchy; current coarsening implementation is PMIS
+hierarchy = cf                                          # Change to sa for the original hierarchy.
+
+# Inner V-cycle smoother:
+#   cheb2    = spectral Chebyshev/Jacobi polynomial smoother
+#   jacobi   = diagonal Jacobi
+#   l1jacobi = denominator sum_j |A_ij|
+# Historical original SA path used cheb2.  Current fast CF/PMIS path often uses jacobi.
+smoother = jacobi                                       # Change to cheb2 for the historical SA+Cheb path.
+jacobi_omega = 0.7                                      # Used by jacobi/l1jacobi implementations where applicable.
+
+terminal_rows = 1000                                    # Terminal dense inverse threshold; must be >=16.
+
+# Spectrum policy for INNER AMG smoothing:
+#   auto   = estimate only when smoother=cheb2
+#   always = estimate even for Jacobi/L1-Jacobi (diagnostic/experimental)
+#   off    = skip power iteration; invalid with smoother=cheb2
+spectrum_policy = auto
+power_iterations = 16                                   # Inner AMG lambda_max power iterations.
+chebyshev_degree = 2                                    # Inner AMG Chebyshev degree.
+lambda_safety = 1.5                                     # Inner lambda_max safety; H8 accepts (1,3].
+lambda_low_fraction = 0.05                              # Inner lambda_min/lambda_max fraction.
+
+[pressure_amg_cf]
+# These controls are active when pressure_amg.hierarchy=cf.
+# PMIS and classical-negative strength are currently the implemented choices;
+# they are still named here so future HMIS/Falgout/strength variants can extend
+# the case format without changing its structure.
+coarsening = pmis                                       # Current implemented C/F coarsener.
+strength = classical-negative                           # Current implemented strength definition.
+theta = 0.25                                            # Strong-connection threshold, in (0,1].
+interpolation = exti                                    # direct | exti.
+pmax = 8                                                # CF interpolation row cap; H8 accepts 1..16.
+aggressive_first = false                                # Optional first-level aggressive coarsening composition.
