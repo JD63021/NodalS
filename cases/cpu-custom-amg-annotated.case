@@ -1,0 +1,154 @@
+# =============================================================================
+# NodalS CPU/MPI — fully annotated native custom-AMG example
+# =============================================================================
+# This case is intended as the reusable reference for the native low-memory CPU
+# pressure AMG.  It documents BOTH hierarchy families currently implemented:
+#
+#   1) UNSMOOTHED aggregation
+#      - pressure.mode = pcg_unsmoothed
+#      - pressure_amg.smoother = sgs | jacobi | chebyshev
+#      - native FP64 PCG outer solve
+#
+#   2) SMOOTHED aggregation
+#      - pressure.mode = pcg_smoothed
+#      - pressure_amg.smoother = chebyshev   (required by current implementation)
+#      - native FP64 PCG outer solve
+#
+#   3) SMOOTHED aggregation + Richardson outer
+#      - pressure.mode = richardson_smoothed
+#      - pressure_amg.smoother = chebyshev   (required)
+#
+# Convenience fixed-smoother presets are also available for unsmoothed AMG:
+#   pcg_unsmoothed_sgs
+#   pcg_unsmoothed_jacobi
+#   pcg_unsmoothed_chebyshev
+#
+# CPU PMIS is NOT implemented.  The native CPU hierarchy uses connected
+# rank-local aggregation controlled by target/min/soft-max aggregate sizes.
+# =============================================================================
+
+[run]                                                   # MPI/launcher controls.
+name = cpu_custom_amg_40k                               # Name used for log/output naming.
+ranks = 16                                              # MPI ranks.
+timeout_seconds = 0                                     # 0 disables launcher timeout.
+map_by = core                                           # Open MPI mapping policy.
+bind_to = core                                          # Open MPI binding policy.
+report_bindings = true                                  # Print rank/core binding information.
+output_root = auto                                      # auto -> ~/Downloads/NodalS_<name>_<timestamp>.
+
+[solver]                                                # Physical problem and mesh.
+mesh = meshes/pipe/40k/constant/polyMesh                # OpenFOAM tetrahedral constant/polyMesh directory.
+problem = pipe                                          # pipe | flow | mms.
+re = 20                                                 # Pipe verification Reynolds number.
+convection = central                                    # central | none.
+# nu = 0.001                                            # For problem=flow, set kinematic viscosity explicitly.
+
+[boundary]                                              # Existing CPU boundary-condition family.
+wall_patch = patch_0_0                                  # No-slip wall patch.
+wall_type = wall                                        # wall | no_slip | noslip.
+inlet_patch = patch_2_0                                 # Pipe inlet patch.
+inlet_type = parabolic                                  # parabolic for validated pipe path; normal for generic flow.
+bulk_velocity = 1.0                                     # Pipe bulk velocity for the parabolic verification inlet.
+outlet_patch = patch_1_0                                # Open outlet patch.
+outlet_type = pressure0                                 # Existing pressure-zero/open outlet semantics.
+
+[supg]                                                  # CPU SUPG is independent of the pressure AMG choice.
+enabled = false                                         # true enables SUPG stabilization.
+tau_scale = 0.05                                        # SUPG tau multiplier.
+form = implicit                                         # implicit | explicit.
+kernel = fast                                           # fast | legacy.
+quad_points = 64                                        # 64 | 45 | 125.
+
+[simple]                                                # SIMPLE/SIMPLEC outer iteration.
+variant = simple                                        # simple | simplec.
+alpha_u = 0.5                                           # Velocity under-relaxation.
+alpha_p = 0.5                                           # Pressure-correction under-relaxation.
+u_relax_mode = row_l1                                  # row_l1 | diag.  NOTE: key is u_relax_mode.
+rau_mode = diag                                         # diag | row_l1.
+rau_scale = 1                                           # Positive rAU multiplier.
+simplec_blend = 1                                       # Used by SIMPLEC.
+simplec_floor_fraction = 1e-6                           # SIMPLEC denominator floor.
+simplec_fallback = diag                                 # diag | floor | error.
+rtol = 1e-3                                             # Outer gate on Ux/Uy/Uz initial residuals + continuity.
+max_iterations = 2000                                   # Maximum outer iterations.
+
+[momentum]                                              # CPU native SGS/SOR momentum predictor.
+rtol = 1e-8                                             # Relative momentum tolerance.
+atol = 0                                                # Absolute tolerance input retained by CPU interface.
+relative_drop = 0.1                                     # Stop after this fraction of the initial inner residual; 0 disables.
+max_iterations = 20000                                  # Hard inner-iteration cap.
+check_every = 1                                         # Residual-check cadence.
+local_sweeps = 1                                        # Local symmetric-GS sweeps per inner iteration.
+sor_omega = 1                                           # SOR/SGS omega.
+
+[pressure]
+# -----------------------------------------------------------------------------
+# Select ONE pressure mode.
+#
+# Native custom AMG (the focus of this example):
+#   pcg_unsmoothed             = PCG + UNSMOOTHED aggregate injection.
+#   pcg_unsmoothed_sgs         = same hierarchy, force SGS smoother.
+#   pcg_unsmoothed_jacobi      = same hierarchy, force Jacobi smoother.
+#   pcg_unsmoothed_chebyshev   = same hierarchy, force Chebyshev smoother.
+#   pcg_smoothed               = PCG + SMOOTHED aggregation transfer.
+#   richardson_smoothed        = Richardson + SMOOTHED aggregation transfer.
+#
+# Existing PETSc/legacy alternatives remain available:
+#   fast_full_gamg
+#   full_pcg_gamg
+#   compact_cheb
+#   compact_pcg
+#
+# IMPORTANT:
+#   - unsmoothed AMG permits sgs, jacobi, or chebyshev.
+#   - smoothed AMG currently requires chebyshev because transfer smoothing uses
+#     the spectral estimate.
+#   - CPU PMIS is not part of this solver.
+# -----------------------------------------------------------------------------
+mode = pcg_unsmoothed                                   # Change this line to pcg_smoothed to use smoothed aggregation.
+pmat = custom                                           # custom/none/full all map to NO PETSc pressure Pmat for native AMG.
+refresh = 100                                           # Native pressure-preconditioner refresh cadence.
+rtol = 0.5                                              # Pressure outer relative tolerance.
+atol = 1e-12                                            # Pressure outer absolute tolerance.
+divtol = 1e8                                            # Divergence guard.
+max_iterations = 20                                     # Maximum PCG/Richardson iterations.
+
+[pressure_amg]
+# -----------------------------------------------------------------------------
+# Native CPU aggregate hierarchy controls.
+# These knobs apply to BOTH unsmoothed and smoothed native AMG unless noted.
+# The defaults below are the current validated production/scaling values.
+# -----------------------------------------------------------------------------
+target_aggregate = 16                                   # Desired connected rank-local aggregate size.
+min_aggregate = 6                                       # Minimum aggregate size.
+soft_max_aggregate = 18                                 # Soft maximum aggregate size.
+
+# V-cycle smoother:
+#   UNSMOOTHED hierarchy: sgs | jacobi | chebyshev
+#   SMOOTHED hierarchy:   chebyshev only in the current implementation
+smoother = sgs                                           # For mode=pcg_smoothed or richardson_smoothed, change to chebyshev.
+
+# Chebyshev/spectral controls.  Used when smoother=chebyshev and also by the
+# smoothed-transfer construction.
+chebyshev_degree = 2                                    # Polynomial degree.
+power_iterations = 16                                   # Power iterations for lambda_max estimate.
+lambda_safety = 1.50                                    # Must be >1.
+lambda_low_fraction = 0.05                              # lambda_min/lambda_max fraction, in (0,1).
+
+coarse_target_rows = 1000                               # Stop recursive aggregation and use terminal LU below this size.
+
+# Smoothed-aggregation transfer controls.  They are harmless when the selected
+# hierarchy is unsmoothed, and are kept here so switching hierarchy is a one-line
+# pressure.mode change plus smoother=chebyshev.
+interpolation_max_row_nnz = 8                           # Sparsity cap for smoothed interpolation rows.
+sa_damping = 1.3333333333333333                         # Jacobi damping used to smooth tentative prolongation.
+
+# Used by pressure.mode=richardson_smoothed.
+richardson_omega = 1.0                                  # Richardson relaxation omega.
+
+[output]
+write_vtu = false                                       # Write solution VTU after convergence.
+vtu_velocity_mode = cell_average                        # legacy | cell_average/u0 | both.
+resource_profile = true                                 # Runtime resource markers.
+memory_audit = false                                    # Detailed memory diagnostics.
+mesh_audit_only = false                                 # true -> audit mesh/patches and exit.
