@@ -14,6 +14,8 @@ fi
 
 python3 tests/check_source_freeze.py
 python3 tests/test_case_translation.py
+python3 tests/test_cpu_custom_amg_annotated.py
+python3 tests/test_gpu_case_translation.py
 
 echo "NODALS_BUILD PETSC_DIR=$PETSC_DIR PETSC_ARCH=$PETSC_ARCH jobs=$JOBS"
 if [[ -x "$PETSC_DIR/$PETSC_ARCH/bin/petsc-config" ]]; then
@@ -22,3 +24,4 @@ fi
 make -j"$JOBS" nodals_solver
 [[ -x ./nodals_solver ]] || { echo "NODALS_BUILD status=FAIL reason=missing_binary"; exit 3; }
 echo "NODALS_BUILD status=PASS executable=$ROOT/nodals_solver"
+echo "NODALS_BUILD note='GPU H8 is built separately with make -C gpu/serial_cuda fp32 or fp64'"
