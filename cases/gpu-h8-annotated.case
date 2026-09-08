@@ -28,7 +28,7 @@
 #   - single GPU; source currently selects CUDA device 0
 #   - P1+BF3/P0 pipe path with existing wall/inlet/outlet convention
 #   - momentum work is FGS1
-#   - no CUDA SUPG yet
+#   - CUDA SUPG currently implements the CPU fast implicit 64-point path
 #   - no DG inlet or algebraic mixing-length model yet
 #   - fine pressure CSR numeric refresh cadence is currently fixed at 1
 # =============================================================================
@@ -67,6 +67,17 @@ relative_drop = 0.1                                     # Parsed/validated H8 re
 omega = 1.0                                             # FGS relaxation omega.
 max_iterations = 20000                                  # Parsed/validated H8 momentum iteration cap.
 
+[supg]
+# GPU implementation matches the CPU fast implicit P1+BF3 SUPG formulation:
+#   tau = tau_scale / sqrt(4 |u|^2/h^2 + magic * (4 nu/h^2)^2)
+# The current GPU path intentionally supports only implicit form and the
+# positive-weight 64-point collapsed quadrature rule.
+enabled = false                                         # false delegates to the historical central-only H8 path.
+tau_scale = 0.05                                        # CPU production default.
+magic = 9.0                                             # CPU production default.
+form = implicit                                         # Current GPU implementation: implicit only.
+quad_points = 64                                        # Current GPU implementation: 64 only.
+
 [pressure]
 # Pressure outer solver:
 #   pcg         = preconditioned conjugate gradient
@@ -76,7 +87,7 @@ solver = richardson                                     # For original SA path, 
 rtol = 0.5                                              # Relative pressure target.
 atol = 1e-12                                            # Absolute pressure target.
 max_iterations = 20                                     # Maximum pressure outer iterations.
-snapshot_tolerance = 5e-6                              # Accepted rAU/coarse-hierarchy snapshot drift tolerance.
+snapshot_tolerance = 5e-6                              # Central-only historical default. FP32 SUPG validation used 2e-4.
 fine_csr_refresh_every = 1                              # Current H8 requires exactly 1.
 
 # Used when solver=richardson.
