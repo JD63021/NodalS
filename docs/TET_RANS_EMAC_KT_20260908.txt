@@ -1,0 +1,60 @@
+NodalS tet RANS / EMAC KT — 2026-09-08
+======================================
+
+BASELINE FREEZE
+- Keep the recovered `[P1+BF3]^3/P0` SIMPLE RANS solver with CENTRAL ADVECTIVE convection as the production reference.
+- Wall configuration C is the accepted wall baseline:
+  Spalding; legacy_face_trace; molecularConsistency=OFF; y=0.25*(3V/A);
+  kappa=0.4; B=5.5; betaScale=1; consistent_tangent; tangentBlend=0.5.
+- Frozen source SHA256: 222d2fce915e7843b82bfc938abcc14d5106845af238366b4be05838cc7adf24.
+- 20D tight baseline: 626 SIMPLE its; cont=2.704e-6; final momentum rel=3.968e-5;
+  wallFSpalding=0.02559429; pressure drop=2205.16284; massRelative=2.60e-7.
+- Exact axial momentum budget showed wall algebra matches direct Spalding force (~0.2% difference),
+  while ordinary advective convection contributes ~8.5–10% of downstream pressure drive.
+
+WHAT FAILED
+- Raw conservative form, implicit `u div(u)` correction: nonlinear SIMPLE divergence.
+- Raw conservative form, explicit-lagged correction: also nonlinear SIMPLE divergence.
+- Therefore do not reintroduce plain conservative correction into weakly divergence-free P1+BF3/P0.
+
+EMAC FINDINGS
+- EMAC nonlinear term: N(u)=2D(u)u + (div u)u.
+- Diagnostic evaluation on the converged advective 20D solution passed:
+  * tensor/quadrature EMAC identity: max relative error ~8e-15;
+  * linear-momentum identity: ~1e-14 to 5e-14;
+  * kinetic-energy identity: ~2e-14.
+- Thus EMAC is algebraically appropriate for this weakly divergence-free mixed FEM setting.
+
+SEGREGATED PICARD FORM
+- Define B(v,a)=2D(v)a + (div v)a, so B(u,u)=N(u).
+- Use a frozen advector a and solve each new component v_d with implicit scalar self part:
+    a.grad(v_d) + 2 a_d d_d(v_d)
+  while the remaining cross-component terms are deferred.
+- Gate 3A: B(u,u)=EMAC to ~6e-16.
+- Gate 3B: full B(v,u) = scalar-self + deferred-cross decomposition to ~4.4e-16
+  for a deterministic v != u.
+- A live 10D ~460k-tet segregated EMAC-Picard run showed residuals falling rather than the runaway
+  behavior of the raw conservative attempts. This establishes viability, not production performance.
+
+WHY THE FIRST LIVE EMAC CODE WAS SLOW
+- It was correctness-first and intentionally unoptimized.
+- It retained the old advective assembly for pressure rAU and then rebuilt diffusion/RANS/wall work
+  separately for Ux, Uy, Uz (~4 common physical assemblies per SIMPLE iteration).
+- Deferred EMAC cross terms were evaluated by brute-force nested cell tensor contractions.
+- Do NOT use that implementation for performance conclusions.
+
+NEXT IMPLEMENTATION
+1. Keep the frozen advective-C branch untouched as oracle.
+2. Build an efficient segregated EMAC operator from reusable linear pieces:
+   - assemble molecular + eddy diffusion + wall terms ONCE per SIMPLE iteration;
+   - reuse/copy the common CSR for all three components;
+   - add only the component-specific EMAC self-convection term to each component matrix;
+   - implement deferred cross terms as a fused tensor/action kernel, not brute-force reassembly;
+   - component Gauss-Seidel order x->y->z initially; expose order and cross-term relaxation/ramp knobs;
+   - initially keep the proven advective-Oseen rAU/pressure Schur as an approximate SIMPLE pressure preconditioner.
+3. First validate on the real 10D ~460k-tet VMFL003 case. Avoid more tiny algebra gates unless an implementation bug appears.
+4. Once stable, optimize timing before any 20D/920k production comparison.
+5. EMAC pressure is modified pressure. For static-pressure/friction comparisons recover approximately
+   p_phys = p_EMAC + Pi_P0(|u|^2/2) before comparing developing-flow pressure drops.
+
+DO NOT RESUME AMG/FGS WORK FROM THIS KT. This handoff is only for the turbulent-flow/EMAC branch.
