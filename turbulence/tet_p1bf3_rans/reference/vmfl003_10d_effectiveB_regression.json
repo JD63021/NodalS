@@ -1,0 +1,22 @@
+{
+  "case": "VMFL003 10D, 460080 tets, Re=13691.7402481, Ubulk=50",
+  "simple_rtol": 0.001,
+  "unsmoothed_sgs": {
+    "outerIts": 361,
+    "avgPCG": 1.961,
+    "dropPa": 418.503750127,
+    "massRelative": 0.000236135908727,
+    "wallFSpalding": 0.0288076391,
+    "amgRetainedMiB": 18.55
+  },
+  "smoothed_cheb_degree2": {
+    "outerIts": 434,
+    "avgPCG": 1.836,
+    "dropPa": 418.510816661,
+    "massRelative": 0.000244894201254,
+    "wallFSpalding": 0.0287982109,
+    "amgRetainedMiB": 141.189
+  },
+  "physics_relative_tolerance": 0.002,
+  "mass_absolute_tolerance": 0.0001
+}

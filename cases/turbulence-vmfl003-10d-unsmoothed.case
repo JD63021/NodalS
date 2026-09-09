@@ -1,0 +1,82 @@
+[run]
+name = turbulence_vmfl003_10d_unsmoothed
+np = 16
+output_root = $HOME/Downloads/NodalS_TURBULENCE_RUNS
+
+[solver]
+mesh = $HOME/Desktop/meshes/nodals_vmfl003_10D_radial460k/foam_case/constant/polyMesh
+re = 13691.7402481
+nu = 1.460734693878e-5
+convection = central
+
+[boundary]
+wall_patch = wall
+inlet_patch = inlet
+outlet_patch = outlet
+inlet_type = dg_numerical_trace
+bulk_velocity = 50.0
+speed = 50.0
+
+[turbulence]
+model = nikuradse_mixing_length
+scale = 1.0
+strain_mode = raw
+audit = false
+
+[wall_function]
+enabled = true
+law = spalding
+kappa = 0.4
+B = 5.5
+distance_factor = 0.25
+beta_scale = 1.0
+linearization = consistent_tangent
+tangent_blend = 0.5
+sample_mode = legacy_face_trace
+molecular_consistency = false
+
+[simple]
+variant = simplec
+alpha_u = 0.70
+alpha_p = 0.30
+rtol = 1e-3
+max_iterations = 10000
+rau_mode = diag
+rau_scale = 2.0
+simplec_blend = 1.0
+simplec_floor_fraction = 1e-6
+simplec_fallback = diag
+
+[momentum]
+relax_mode = row_l1
+rtol = 1e-8
+atol = 0
+relative_drop = 0.5
+check_every = 1
+local_sweeps = 1
+sor_omega = 1.0
+
+[pressure]
+mode = pcg_unsmoothed_sgs
+rtol = 0.9
+atol = 1e-12
+divtol = 1e8
+max_iterations = 1500
+refresh = 1
+petsc_level_cheb_iterations = 12
+
+[pressure_amg]
+target_aggregate = 16
+min_aggregate = 6
+soft_max_aggregate = 18
+coarse_target = 1000
+cheb_degree = 2
+power_iterations = 16
+lambda_safety = 1.50
+lambda_low_fraction = 0.05
+interpolation_max_nnz = 8
+sa_damping = 1.3333333333333333
+
+[output]
+write_vtu = true
+velocity_mode = both
