@@ -1,0 +1,10366 @@
+#include <petscksp.h>
+#include <petscdmplex.h>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <chrono>
+#include <climits>
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <type_traits>
+
+namespace {
+constexpr double PI = 3.141592653589793238462643383279502884;
+
+struct Vec3 { double x=0, y=0, z=0; };
+struct Face { std::array<int,3> v{}; };
+struct Patch { std::string name; PetscInt startFace=0,nFaces=0; };
+struct Mesh {
+  std::vector<Vec3> points;
+  std::vector<Face> faces;
+  std::vector<int> owner, neighbour;
+  std::vector<std::array<int,4>> tets;
+  std::vector<std::array<int,4>> oppFace; // local face opposite local tet vertex i
+  std::vector<Patch> patches;
+  std::vector<int> facePatch; // -1 internal, otherwise index into patches
+};
+
+static std::vector<Vec3> cellCentroids(const Mesh& M);
+
+static bool parseIntegerToken(const std::string& tok,long long& value) {
+  if(tok.empty()) return false;
+  char *end=nullptr;
+  errno=0;
+  const long long v=std::strtoll(tok.c_str(),&end,10);
+  if(errno!=0 || !end || *end!='\0') return false;
+  value=v;
+  return true;
+}
+
+class FoamTokenStream {
+public:
+  explicit FoamTokenStream(const std::string& p):in_(p),path_(p) {
+    if(!in_) throw std::runtime_error("cannot open " + path_);
+  }
+
+  std::string next() {
+    char c=0;
+    while(in_.get(c)) {
+      if(std::isspace(static_cast<unsigned char>(c))) continue;
+      if(c=='/') {
+        const int q=in_.peek();
+        if(q=='/') { in_.get(); skipLineComment(); continue; }
+        if(q=='*') { in_.get(); skipBlockComment(); continue; }
+      }
+      if(c=='(' || c==')' || c=='{' || c=='}' || c==';') return std::string(1,c);
+      if(c=='\"') return readQuoted();
+
+      std::string tok(1,c);
+      while(true) {
+        const int q=in_.peek();
+        if(q==EOF) break;
+        const char d=static_cast<char>(q);
+        if(std::isspace(static_cast<unsigned char>(d)) || d=='(' || d==')' || d=='{' || d=='}' || d==';') break;
+        if(d=='/') {
+          // A slash beginning a comment terminates the current token. Plain slashes are
+          // retained so quoted/unquoted paths remain harmless if encountered in headers.
+          in_.get();
+          const int r=in_.peek();
+          in_.unget();
+          if(r=='/' || r=='*') break;
+        }
+        in_.get(); tok.push_back(d);
+      }
+      return tok;
+    }
+    return {};
+  }
+
+  const std::string& path() const { return path_; }
+
+private:
+  std::ifstream in_;
+  std::string path_;
+
+  void skipLineComment() {
+    char c=0; while(in_.get(c)) if(c=='\n' || c=='\r') break;
+  }
+  void skipBlockComment() {
+    char prev=0,c=0;
+    while(in_.get(c)) { if(prev=='*' && c=='/') return; prev=c; }
+    throw std::runtime_error("unterminated block comment in " + path_);
+  }
+  std::string readQuoted() {
+    std::string out; char c=0;
+    while(in_.get(c)) {
+      if(c=='\\') {
+        char d=0; if(!in_.get(d)) break; out.push_back(d); continue;
+      }
+      if(c=='\"') return out;
+      out.push_back(c);
+    }
+    throw std::runtime_error("unterminated quoted string in " + path_);
+  }
+};
+
+
+struct ProcessMemoryKiB { long long rss=0, hwm=0; };
+
+static ProcessMemoryKiB readProcessMemoryKiB() {
+  ProcessMemoryKiB m;
+  std::ifstream in("/proc/self/status");
+  std::string key;
+  while(in >> key) {
+    if(key=="VmRSS:" || key=="VmHWM:") {
+      long long v=0; std::string unit;
+      in >> v >> unit;
+      if(key=="VmRSS:") m.rss=v; else m.hwm=v;
+    } else {
+      std::string rest; std::getline(in,rest);
+    }
+  }
+  return m;
+}
+
+static PetscErrorCode printSetupPhase(const char *name, PetscLogDouble localSeconds, PetscInt cells) {
+  PetscFunctionBeginUser;
+  double x=(double)localSeconds,mn=0,mx=0,sum=0;
+  int size=1; PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD,&size));
+  PetscCallMPI(MPI_Allreduce(&x,&mn,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&x,&mx,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&x,&sum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_SETUP_PHASE name=%s seconds=%.6f minRankSeconds=%.6f meanRankSeconds=%.6f cells=%" PetscInt_FMT "\n",
+    name,mx,mn,sum/(double)size,cells));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode printResourceMark(const char *label, PetscInt cells,
+                                        PetscLogDouble phaseSeconds,
+                                        PetscLogDouble profileOrigin) {
+  PetscFunctionBeginUser;
+  const ProcessMemoryKiB local=readProcessMemoryKiB();
+  long long rssSum=0,rssMax=0,hwmSum=0,hwmMax=0;
+  PetscCallMPI(MPI_Allreduce(&local.rss,&rssSum,1,MPI_LONG_LONG_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local.rss,&rssMax,1,MPI_LONG_LONG_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local.hwm,&hwmSum,1,MPI_LONG_LONG_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local.hwm,&hwmMax,1,MPI_LONG_LONG_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscLogDouble now=0; PetscCall(PetscTime(&now));
+  const auto epochMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  const double rssSumMiB=(double)rssSum/1024.0;
+  const double rssMaxMiB=(double)rssMax/1024.0;
+  const double hwmSumMiB=(double)hwmSum/1024.0;
+  const double hwmMaxMiB=(double)hwmMax/1024.0;
+  const double rssBpc=cells>0 ? (double)rssSum*1024.0/(double)cells : 0.0;
+  const double hwmBpc=cells>0 ? (double)hwmSum*1024.0/(double)cells : 0.0;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_RESOURCE_MARK label=%s epochMs=%lld elapsedSeconds=%.6f phaseSeconds=%.6f cells=%" PetscInt_FMT
+    " rssSumMiB=%.3f rssMaxRankMiB=%.3f hwmSumMiB=%.3f hwmMaxRankMiB=%.3f rssBytesPerCell=%.3f hwmBytesPerCell=%.3f\n",
+    label,(long long)epochMs,(double)(now-profileOrigin),(double)phaseSeconds,cells,
+    rssSumMiB,rssMaxMiB,hwmSumMiB,hwmMaxMiB,rssBpc,hwmBpc));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static void expectFoamToken(FoamTokenStream& ts,const char *want) {
+  const std::string got=ts.next();
+  if(got!=want) throw std::runtime_error("expected token '"+std::string(want)+"' but got '"+got+"' in "+ts.path());
+}
+
+static long long requireIntegerToken(FoamTokenStream& ts,const std::string& tok,const char *what) {
+  long long v=0;
+  if(!parseIntegerToken(tok,v)) throw std::runtime_error("invalid "+std::string(what)+" token '"+tok+"' in "+ts.path());
+  return v;
+}
+
+static double requireDoubleToken(FoamTokenStream& ts,const std::string& tok,const char *what) {
+  if(tok.empty()) throw std::runtime_error("missing "+std::string(what)+" in "+ts.path());
+  char *end=nullptr; errno=0;
+  const double v=std::strtod(tok.c_str(),&end);
+  if(errno!=0 || !end || *end!='\0') throw std::runtime_error("invalid "+std::string(what)+" token '"+tok+"' in "+ts.path());
+  return v;
+}
+
+static int seekFoamListStart(FoamTokenStream& ts) {
+  // polyMesh files have a FoamFile dictionary followed by: <count> ( ... ).
+  // Scan tokens rather than materializing/regex-rewriting the complete file.
+  for(std::string tok=ts.next(); !tok.empty(); tok=ts.next()) {
+    long long n=0;
+    if(!parseIntegerToken(tok,n) || n<0 || n>INT_MAX) continue;
+    const std::string next=ts.next();
+    if(next=="(") return static_cast<int>(n);
+  }
+  throw std::runtime_error("cannot find OpenFOAM list count in " + ts.path());
+}
+
+static std::vector<Vec3> readPoints(const std::string& path) {
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Vec3> p; p.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    expectFoamToken(ts,"(");
+    const double x=requireDoubleToken(ts,ts.next(),"point x");
+    const double y=requireDoubleToken(ts,ts.next(),"point y");
+    const double z=requireDoubleToken(ts,ts.next(),"point z");
+    expectFoamToken(ts,")");
+    p.push_back({x,y,z});
+  }
+  expectFoamToken(ts,")");
+  return p;
+}
+
+static std::vector<Face> readFaces(const std::string& path) {
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Face> F; F.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    const long long k=requireIntegerToken(ts,ts.next(),"face arity");
+    if(k!=3) throw std::runtime_error("non-triangular face found in "+path+"; this tetrahedral solver requires face arity 3");
+    expectFoamToken(ts,"(");
+    Face f;
+    for(int j=0;j<3;++j) {
+      const long long v=requireIntegerToken(ts,ts.next(),"face vertex");
+      if(v<0 || v>INT_MAX) throw std::runtime_error("face vertex label out of range in "+path);
+      f.v[static_cast<std::size_t>(j)]=static_cast<int>(v);
+    }
+    expectFoamToken(ts,")");
+    F.push_back(f);
+  }
+  expectFoamToken(ts,")");
+  return F;
+}
+
+static std::vector<int> readLabels(const std::string& path) {
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<int> a; a.reserve(static_cast<std::size_t>(n));
+  for(int i=0;i<n;++i) {
+    const long long v=requireIntegerToken(ts,ts.next(),"label");
+    if(v<INT_MIN || v>INT_MAX) throw std::runtime_error("label out of int range in "+path);
+    a.push_back(static_cast<int>(v));
+  }
+  expectFoamToken(ts,")");
+  return a;
+}
+
+static std::vector<Patch> readBoundary(const std::string& path) {
+  FoamTokenStream ts(path);
+  const int n=seekFoamListStart(ts);
+  std::vector<Patch> out; out.reserve(static_cast<std::size_t>(n));
+  for(int pi=0;pi<n;++pi) {
+    const std::string name=ts.next();
+    if(name.empty() || name==")") throw std::runtime_error("missing boundary patch name in "+path);
+    expectFoamToken(ts,"{");
+    long long nFaces=-1,startFace=-1;
+    int depth=1;
+    while(depth>0) {
+      const std::string tok=ts.next();
+      if(tok.empty()) throw std::runtime_error("unterminated boundary patch "+name+" in "+path);
+      if(tok=="{") { ++depth; continue; }
+      if(tok=="}") { --depth; continue; }
+      if(depth!=1) continue;
+      if(tok=="nFaces") {
+        nFaces=requireIntegerToken(ts,ts.next(),"nFaces");
+        const std::string semi=ts.next(); if(semi!=";") throw std::runtime_error("missing ';' after nFaces for "+name+" in "+path);
+      } else if(tok=="startFace") {
+        startFace=requireIntegerToken(ts,ts.next(),"startFace");
+        const std::string semi=ts.next(); if(semi!=";") throw std::runtime_error("missing ';' after startFace for "+name+" in "+path);
+      }
+    }
+    if(nFaces<0 || startFace<0) throw std::runtime_error("cannot parse boundary patch "+name+" in "+path);
+    out.push_back({name,(PetscInt)startFace,(PetscInt)nFaces});
+  }
+  expectFoamToken(ts,")");
+  return out;
+}
+
+static double det3(const double J[3][3]) {
+  return J[0][0]*(J[1][1]*J[2][2]-J[1][2]*J[2][1])
+       - J[0][1]*(J[1][0]*J[2][2]-J[1][2]*J[2][0])
+       + J[0][2]*(J[1][0]*J[2][1]-J[1][1]*J[2][0]);
+}
+static void inv3(const double J[3][3], double I[3][3]) {
+  double d=det3(J); if (std::abs(d)<1e-18) throw std::runtime_error("singular tetrahedron");
+  I[0][0]=(J[1][1]*J[2][2]-J[1][2]*J[2][1])/d;
+  I[0][1]=(J[0][2]*J[2][1]-J[0][1]*J[2][2])/d;
+  I[0][2]=(J[0][1]*J[1][2]-J[0][2]*J[1][1])/d;
+  I[1][0]=(J[1][2]*J[2][0]-J[1][0]*J[2][2])/d;
+  I[1][1]=(J[0][0]*J[2][2]-J[0][2]*J[2][0])/d;
+  I[1][2]=(J[0][2]*J[1][0]-J[0][0]*J[1][2])/d;
+  I[2][0]=(J[1][0]*J[2][1]-J[1][1]*J[2][0])/d;
+  I[2][1]=(J[0][1]*J[2][0]-J[0][0]*J[2][1])/d;
+  I[2][2]=(J[0][0]*J[1][1]-J[0][1]*J[1][0])/d;
+}
+
+static Mesh loadFoamTetMesh(const std::string& pm) {
+  Mesh M; M.points=readPoints(pm+"/points"); M.faces=readFaces(pm+"/faces");
+  M.owner=readLabels(pm+"/owner"); M.neighbour=readLabels(pm+"/neighbour");
+  M.patches=readBoundary(pm+"/boundary");
+  M.facePatch.assign(M.faces.size(),-1);
+  for(int p=0;p<(int)M.patches.size();++p) {
+    const auto& P=M.patches[p];
+    for(PetscInt f=P.startFace; f<P.startFace+P.nFaces; ++f) {
+      if(f<0 || f>=(PetscInt)M.faces.size()) throw std::runtime_error("boundary patch face range out of bounds");
+      if(M.facePatch[f]>=0) throw std::runtime_error("boundary face appears in multiple patches");
+      M.facePatch[f]=p;
+    }
+  }
+  if (M.owner.size()!=M.faces.size()) throw std::runtime_error("owner size != faces size");
+  int maxc=-1; for(int x:M.owner) maxc=std::max(maxc,x); for(int x:M.neighbour) maxc=std::max(maxc,x);
+  int nc=maxc+1; std::vector<std::vector<int>> cf(nc);
+  for (int f=0; f<(int)M.faces.size(); ++f) cf[M.owner[f]].push_back(f);
+  for (int f=0; f<(int)M.neighbour.size(); ++f) cf[M.neighbour[f]].push_back(f);
+  M.tets.resize(nc); M.oppFace.resize(nc);
+  for (int c=0;c<nc;++c) {
+    if (cf[c].size()!=4) throw std::runtime_error("cell "+std::to_string(c)+" has "+std::to_string(cf[c].size())+" faces, not 4");
+    std::set<int> vs; for(int f:cf[c]) for(int v:M.faces[f].v) vs.insert(v);
+    if (vs.size()!=4) throw std::runtime_error("cell "+std::to_string(c)+" does not have 4 unique vertices");
+    std::array<int,4> t; std::copy(vs.begin(),vs.end(),t.begin());
+    auto X0=M.points[t[0]],X1=M.points[t[1]],X2=M.points[t[2]],X3=M.points[t[3]];
+    double J[3][3]={{X1.x-X0.x,X2.x-X0.x,X3.x-X0.x},{X1.y-X0.y,X2.y-X0.y,X3.y-X0.y},{X1.z-X0.z,X2.z-X0.z,X3.z-X0.z}};
+    if (det3(J)<0) std::swap(t[1],t[2]);
+    M.tets[c]=t;
+    for (int i=0;i<4;++i) {
+      int found=-1;
+      for(int f:cf[c]) {
+        bool has=false; for(int v:M.faces[f].v) if(v==t[i]) {has=true;break;}
+        if(!has) { if(found>=0) throw std::runtime_error("multiple opposite faces"); found=f; }
+      }
+      if(found<0) throw std::runtime_error("missing opposite face");
+      M.oppFace[c][i]=found;
+    }
+  }
+  return M;
+}
+
+struct Quad { std::array<double,4> lam; double w; };
+static std::vector<Quad> tetDuffy7() {
+  const double x[7]={-0.94910791234275852453,-0.74153118559939443986,-0.40584515137739716691,0.0,0.40584515137739716691,0.74153118559939443986,0.94910791234275852453};
+  const double w[7]={0.12948496616886969327,0.27970539148927666790,0.38183005050511894495,0.41795918367346938776,0.38183005050511894495,0.27970539148927666790,0.12948496616886969327};
+  std::vector<Quad> q; q.reserve(343);
+  for(int ia=0;ia<7;++ia) for(int ib=0;ib<7;++ib) for(int ic=0;ic<7;++ic) {
+    double A=.5*(x[ia]+1),B=.5*(x[ib]+1),C=.5*(x[ic]+1);
+    double wa=.5*w[ia],wb=.5*w[ib],wc=.5*w[ic];
+    double r=A,s=(1-A)*B,t=(1-A)*(1-B)*C;
+    double jac=(1-A)*(1-A)*(1-B);
+    q.push_back({{1-r-s-t,r,s,t},wa*wb*wc*jac});
+  }
+  return q;
+}
+
+
+static std::vector<Quad> tetDuffy5() {
+  // Exact 5x5x5 collapsed-coordinate Gauss-Jacobi rule retained from the
+  // earlier P1+BF3/P0 SUPG implementation.  r weights include (1-r)^2,
+  // s weights include (1-s), and t is ordinary Gauss-Legendre on [0,1].
+  const double rn[5]={0.034578939918215090,0.17348032077169567,0.38988638706551931,0.63433347263088680,0.85105421294701644};
+  const double rw[5]={0.081764784285771011,0.12619896189991137,0.089200161221590066,0.032055600722961895,0.0041138252030990035};
+  const double sn[5]={0.039809857051468722,0.19801341787360821,0.43797481024738616,0.69546427335363614,0.90146491420117358};
+  const double sw[5]={0.096781590226651476,0.16717463809436969,0.14638698708466985,0.073908870072616678,0.015747914521692299};
+  const double tn[5]={0.046910077030668018,0.23076534494715845,0.50000000000000000,0.76923465505284150,0.95308992296933193};
+  const double tw[5]={0.11846344252809449,0.23931433524968326,0.28444444444444450,0.23931433524968326,0.11846344252809449};
+  std::vector<Quad> q; q.reserve(125);
+  for(int ir=0;ir<5;++ir) for(int is=0;is<5;++is) for(int it=0;it<5;++it) {
+    const double r=rn[ir], ss=sn[is], t=tn[it];
+    const double omr=1.0-r, oms=1.0-ss;
+    q.push_back({{omr*oms*(1.0-t),r,omr*ss,omr*oms*t},rw[ir]*sw[is]*tw[it]});
+  }
+  return q;
+}
+
+
+static std::vector<Quad> tetSupg64() {
+  // Positive-weight 4x4x4 collapsed Gauss-Jacobi rule.  This is the compact
+  // SUPG rule previously used in the P1+BF3 lineage for the non-polynomial
+  // tau(u) integrand.  It is intentionally distinct from the degree-8 Keast
+  // rule below: all weights are positive, which is attractive for a
+  // stabilization term whose coefficient tau is positive but non-polynomial.
+  const double rn[4]={0.0485005494469972764,0.238600737551862341,0.517047295104367421,0.795851417896772828};
+  const double rw[4]={0.110888415611277741,0.143458789799214448,0.0686338871729230970,0.0103522407499180812};
+  const double sn[4]={0.0571041961145177246,0.276843013638123803,0.583590432368916834,0.860240135656219485};
+  const double sw[4]={0.135506913431488518,0.203464568010271102,0.129847547608232333,0.0311809709500080849};
+  const double tn[4]={0.0694318442029737137,0.330009478207571871,0.669990521792428129,0.930568155797026231};
+  const double tw[4]={0.173927422568726897,0.326072577431273103,0.326072577431273103,0.173927422568726897};
+  std::vector<Quad> q; q.reserve(64);
+  for(int ir=0;ir<4;++ir) for(int is=0;is<4;++is) for(int it=0;it<4;++it) {
+    const double r=rn[ir], ss=sn[is], t=tn[it];
+    const double omr=1.0-r, oms=1.0-ss;
+    q.push_back({{omr*oms*(1.0-t),r,omr*ss,omr*oms*t},rw[ir]*sw[is]*tw[it]});
+  }
+  return q;
+}
+
+static std::vector<Quad> tetKeast45() {
+  // Keast degree-8 fully symmetric tetrahedral cubature.  This exactly
+  // integrates total-degree <= 8 polynomials on the affine reference tet, but
+  // the centroid orbit has a negative weight.  It is therefore retained as an
+  // experimental SUPG choice; the positive-weight 64-point rule is the fast
+  // default for the non-polynomial tau(u) integrand.
+  const std::array<std::array<double,4>,7> generator{{
+    {{0.250000000000000000,0.250000000000000000,0.250000000000000000,0.250000000000000000}},
+    {{0.617587190300082967,0.127470936566639015,0.127470936566639015,0.127470936566639015}},
+    {{0.903763508822103123,0.0320788303926322960,0.0320788303926322960,0.0320788303926322960}},
+    {{0.0497770956432810185,0.0497770956432810185,0.450222904356718978,0.450222904356718978}},
+    {{0.183730447398549945,0.183730447398549945,0.316269552601450060,0.316269552601450060}},
+    {{0.231901089397150906,0.231901089397150906,0.0229177878448171174,0.513280033360881072}},
+    {{0.0379700484718286102,0.0379700484718286102,0.730313427807538396,0.193746475248804382}},
+  }};
+  const std::array<double,7> orbitWeight{{
+    -0.0393270066412926145,
+     0.00408131605934270525,
+     0.000658086773304341943,
+     0.00438425882512284693,
+     0.0138300638425098166,
+     0.00424043742468372453,
+     0.00223873973961420164,
+  }};
+  std::vector<Quad> q; q.reserve(45);
+  for(int orbit=0;orbit<7;++orbit) {
+    auto lambda=generator[orbit];
+    std::sort(lambda.begin(),lambda.end());
+    do { q.push_back({lambda,orbitWeight[orbit]}); }
+    while(std::next_permutation(lambda.begin(),lambda.end()));
+  }
+  if(q.size()!=45) throw std::runtime_error("Keast45 quadrature point count mismatch");
+  return q;
+}
+
+static std::vector<Quad> supgQuadrature(PetscInt n) {
+  if(n==125) return tetDuffy5();
+  if(n==64) return tetSupg64();
+  if(n==45) return tetKeast45();
+  throw std::runtime_error("SUPG quadrature must be 125, 64, or 45 points");
+}
+
+static void referenceHessian(const std::array<double,4>& l, double hess[8][3][3]) {
+  const double gl[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};
+  for(int a=0;a<8;++a) for(int d=0;d<3;++d) for(int e=0;e<3;++e) hess[a][d][e]=0.0;
+  // Exact Hessian of b_i = 27 prod_{j != i} lambda_j.  This is the same
+  // ordered-pair formula used by the earlier P1+BF3/P0 SUPG kernels.
+  for(int i=0;i<4;++i) {
+    const int a=4+i;
+    for(int d=0;d<3;++d) for(int e=0;e<3;++e) {
+      double value=0.0;
+      for(int j=0;j<4;++j) {
+        if(j==i) continue;
+        for(int k=0;k<4;++k) {
+          if(k==i || k==j) continue;
+          double term=gl[j][d]*gl[k][e];
+          for(int m=0;m<4;++m) if(m!=i && m!=j && m!=k) term*=l[m];
+          value+=term;
+        }
+      }
+      hess[a][d][e]=27.0*value;
+    }
+  }
+}
+
+static double tetDiameter(const Vec3 X[4]) {
+  double h=0.0;
+  for(int a=0;a<4;++a) for(int b=a+1;b<4;++b) {
+    const double dx=X[a].x-X[b].x,dy=X[a].y-X[b].y,dz=X[a].z-X[b].z;
+    h=std::max(h,std::sqrt(dx*dx+dy*dy+dz*dz));
+  }
+  return h;
+}
+
+static void basis(const std::array<double,4>& l, double val[8], double gr[8][3]) {
+  const double gl[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};
+  for(int i=0;i<4;++i){ val[i]=l[i]; for(int d=0;d<3;++d) gr[i][d]=gl[i][d]; }
+  for(int i=0;i<4;++i) {
+    int js[3],k=0; for(int j=0;j<4;++j) if(j!=i) js[k++]=j;
+    val[4+i]=27*l[js[0]]*l[js[1]]*l[js[2]];
+    for(int d=0;d<3;++d) gr[4+i][d]=0;
+    for(int a=0;a<3;++a) {
+      int j=js[a],o1=js[(a+1)%3],o2=js[(a+2)%3];
+      for(int d=0;d<3;++d) gr[4+i][d]+=27*l[o1]*l[o2]*gl[j][d];
+    }
+  }
+}
+
+static void exactPressureGradient(double x,double y,double z,double gp[3]) {
+  const double sx=sin(PI*x), sy=sin(PI*y), sz=sin(PI*z);
+  const double cx=cos(PI*x), cy=cos(PI*y), cz=cos(PI*z);
+  gp[0]=-PI*sx*cy*cz;
+  gp[1]=-PI*cx*sy*cz;
+  gp[2]=-PI*cx*cy*sz;
+}
+
+static void stokesForcingNu1(double x,double y,double z,double f[3]) {
+  const double sx=sin(PI*x),sy=sin(PI*y),sz=sin(PI*z),cx=cos(PI*x),cy=cos(PI*y),cz=cos(PI*z);
+  f[0]=PI*(24*PI*PI*sx*sx*sy*sz*sz - 4*PI*PI*sx*sx*sy - sx*cz - 4*PI*PI*sy*sz*sz)*cy;
+  f[1]=PI*(-24*PI*PI*sx*sy*sy*sz*sz + 4*PI*PI*sx*sy*sy + 4*PI*PI*sx*sz*sz - sy*cz)*cx;
+  f[2]=-PI*sz*cx*cy;
+}
+
+static void exactConvection(double x,double y,double z,double c[3]) {
+  const double sx=sin(PI*x), sy=sin(PI*y), sz=sin(PI*z);
+  const double cx=cos(PI*x), cy=cos(PI*y);
+  const double fac=4.0*PI*PI*PI*sz*sz*sz*sz;
+  c[0]=fac*sx*sx*sx*sy*sy*cx;
+  c[1]=fac*sx*sx*sy*sy*sy*cy;
+  c[2]=0.0;
+}
+
+static void forcing(double x,double y,double z,double nu,bool centralConvection,double f[3]) {
+  double fs[3],gp[3],cv[3]={0,0,0};
+  stokesForcingNu1(x,y,z,fs);
+  exactPressureGradient(x,y,z,gp);
+  if(centralConvection) exactConvection(x,y,z,cv);
+  // fs = -Delta(u_exact) + grad(p_exact). General viscosity gives
+  // f = -nu Delta(u_exact) + (u_exact.grad)u_exact + grad(p_exact).
+  for(int d=0; d<3; ++d) f[d]=nu*(fs[d]-gp[d]) + gp[d] + cv[d];
+}
+
+static void exactU(double x,double y,double z,double u[3]) {
+  double sx=sin(PI*x),sy=sin(PI*y),sz=sin(PI*z);
+  u[0]=PI*sx*sx*sin(2*PI*y)*sz*sz;
+  u[1]=-PI*sin(2*PI*x)*sy*sy*sz*sz;
+  u[2]=0;
+}
+static double exactP(double x,double y,double z) { return cos(PI*x)*cos(PI*y)*cos(PI*z); }
+
+enum class ProblemMode { MMS, Pipe, Flow };
+enum class InletBCMode { PipeParabolic, PipeOneSeventh, FixedNormalSpeed, DgNumericalTrace };
+
+struct PipeGeometry {
+  std::string wallPatch="patch_0_0", inletPatch="patch_2_0", outletPatch="patch_1_0";
+  int wall=-1,inlet=-1,outlet=-1;
+  double cx=0.0,cy=0.0,zIn=0.0,zOut=0.0,R=0.0,D=0.0,L=0.0;
+  double inletArea=0.0,outletArea=0.0,circleArea=0.0,areaRatio=0.0;
+  double bulkVelocity=1.0,profileScale=1.0,nu=0.0,re=0.0,hpDrop=0.0,hpGradient=0.0;
+};
+
+struct BoundaryGeometry {
+  std::vector<std::string> wallPatches;
+  std::vector<int> walls;
+  std::string inletPatch, outletPatch;
+  int inlet=-1,outlet=-1;
+  double inletArea=0.0,outletArea=0.0,inletProjectedArea=0.0,outletProjectedArea=0.0;
+  Vec3 inletAreaVector{},outletAreaVector{},inletReferenceNormal{},outletReferenceNormal{};
+  double signedNormalSpeed=-1.0;
+  Vec3 inletVelocity{};
+};
+
+struct ProblemConfig {
+  ProblemMode mode=ProblemMode::MMS;
+  InletBCMode inletBC=InletBCMode::PipeParabolic;
+  bool centralConvection=true;
+  bool weakWallFunction=false;
+  double re=1.0,nu=1.0;
+  PipeGeometry pipe;
+  BoundaryGeometry boundary;
+};
+
+static inline bool dgNumericalTraceInlet(const ProblemConfig& P) {
+  return P.inletBC==InletBCMode::DgNumericalTrace;
+}
+
+static Vec3 cross3(const Vec3& a,const Vec3& b) {
+  return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};
+}
+static Vec3 sub3(const Vec3& a,const Vec3& b) { return {a.x-b.x,a.y-b.y,a.z-b.z}; }
+static double norm3(const Vec3& a) { return std::sqrt(a.x*a.x+a.y*a.y+a.z*a.z); }
+static double triangleArea(const Vec3& a,const Vec3& b,const Vec3& c) { return 0.5*norm3(cross3(sub3(b,a),sub3(c,a))); }
+static Vec3 add3(const Vec3& a,const Vec3& b) { return {a.x+b.x,a.y+b.y,a.z+b.z}; }
+static Vec3 scale3(const Vec3& a,double s) { return {s*a.x,s*a.y,s*a.z}; }
+static double dot3(const Vec3& a,const Vec3& b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
+
+static Vec3 cellCentroidOne(const Mesh& M,PetscInt c) {
+  Vec3 q{}; for(int i=0;i<4;++i) q=add3(q,M.points[M.tets[c][i]]); return scale3(q,0.25);
+}
+
+static Vec3 faceOutwardAreaVector(const Mesh& M,PetscInt f) {
+  const auto& F=M.faces[f];
+  const Vec3& x0=M.points[F.v[0]]; const Vec3& x1=M.points[F.v[1]]; const Vec3& x2=M.points[F.v[2]];
+  Vec3 sf=scale3(cross3(sub3(x1,x0),sub3(x2,x0)),0.5);
+  const Vec3 fc=scale3(add3(add3(x0,x1),x2),1.0/3.0);
+  const Vec3 cc=cellCentroidOne(M,M.owner[f]);
+  if(dot3(sf,sub3(fc,cc))<0.0) sf=scale3(sf,-1.0);
+  return sf;
+}
+
+struct PatchFrame { double area=0.0,projectedArea=0.0; Vec3 areaVector{},normal{}; };
+static PatchFrame patchFrame(const Mesh& M,int pi) {
+  PatchFrame F; const auto& P=M.patches[pi];
+  for(PetscInt f=P.startFace;f<P.startFace+P.nFaces;++f) {
+    const Vec3 sf=faceOutwardAreaVector(M,f); F.area += norm3(sf); F.areaVector=add3(F.areaVector,sf);
+  }
+  F.projectedArea=norm3(F.areaVector);
+  if(!(F.area>0.0) || !(F.projectedArea>0.0)) throw std::runtime_error("degenerate boundary patch " + P.name);
+  F.normal=scale3(F.areaVector,1.0/F.projectedArea);
+  return F;
+}
+
+static std::vector<std::string> splitPatchNames(const std::string& text) {
+  std::vector<std::string> out; std::string cur;
+  auto flush=[&](){ if(!cur.empty()){out.push_back(cur);cur.clear();} };
+  for(char ch:text) { if(ch==',' || ch==';' || ch==' ' || ch=='\t') flush(); else cur.push_back(ch); }
+  flush(); return out;
+}
+
+static int patchIndex(const Mesh& M,const std::string& name) {
+  for(int p=0;p<(int)M.patches.size();++p) if(M.patches[p].name==name) return p;
+  return -1;
+}
+
+static BoundaryGeometry makeBoundaryGeometry(const Mesh& M,const std::vector<std::string>& wallNames,
+                                             const std::string& inletName,const std::string& outletName,
+                                             double signedNormalSpeed) {
+  BoundaryGeometry B; B.wallPatches=wallNames; B.inletPatch=inletName; B.outletPatch=outletName; B.signedNormalSpeed=signedNormalSpeed;
+  if(wallNames.empty()) throw std::runtime_error("at least one wall patch is required");
+  for(const auto& w:wallNames) { int pi=patchIndex(M,w); if(pi<0) throw std::runtime_error("wall patch not found: "+w); B.walls.push_back(pi); }
+  B.inlet=patchIndex(M,inletName); B.outlet=patchIndex(M,outletName);
+  if(B.inlet<0) throw std::runtime_error("inlet patch not found: "+inletName);
+  if(B.outlet<0) throw std::runtime_error("outlet patch not found: "+outletName);
+  if(B.inlet==B.outlet) throw std::runtime_error("inlet and outlet patches must differ");
+  for(int w:B.walls) if(w==B.inlet || w==B.outlet) throw std::runtime_error("wall patch overlaps inlet/outlet role");
+  std::vector<int> role(M.patches.size(),0);
+  for(int w:B.walls) role[w]++; role[B.inlet]++; role[B.outlet]++;
+  std::ostringstream missing; bool anyMissing=false;
+  for(int pi=0;pi<(int)M.patches.size();++pi) if(role[pi]==0) { if(anyMissing) missing<<','; missing<<M.patches[pi].name; anyMissing=true; }
+  if(anyMissing) throw std::runtime_error("unclassified boundary patches (add them to -flow_wall_patches or choose inlet/outlet): "+missing.str());
+  const PatchFrame fi=patchFrame(M,B.inlet),fo=patchFrame(M,B.outlet);
+  B.inletArea=fi.area; B.outletArea=fo.area; B.inletProjectedArea=fi.projectedArea; B.outletProjectedArea=fo.projectedArea;
+  B.inletAreaVector=fi.areaVector; B.outletAreaVector=fo.areaVector; B.inletReferenceNormal=fi.normal; B.outletReferenceNormal=fo.normal;
+  B.inletVelocity=scale3(B.inletReferenceNormal,signedNormalSpeed);
+  return B;
+}
+
+static bool isWallPatch(const BoundaryGeometry& B,int pi) {
+  return std::find(B.walls.begin(),B.walls.end(),pi)!=B.walls.end();
+}
+
+static bool dgNumericalTraceFaceGeom(const Mesh& M,const ProblemConfig& P,PetscInt c,int& opp,Vec3& sf) {
+  opp=-1; sf={};
+  if(!dgNumericalTraceInlet(P)) return false;
+  for(int i=0;i<4;++i) {
+    const PetscInt f=M.oppFace[(std::size_t)c][i];
+    if(f<(PetscInt)M.neighbour.size()) continue;
+    if(M.facePatch[(std::size_t)f]!=P.boundary.inlet) continue;
+    if(opp>=0) throw std::runtime_error("tetrahedron has multiple weak-DG inlet faces");
+    opp=i; sf=faceOutwardAreaVector(M,f);
+  }
+  return opp>=0;
+}
+
+static PetscErrorCode printPatchAuditRoot(const Mesh& M) {
+  PetscFunctionBeginUser;
+  for(int pi=0;pi<(int)M.patches.size();++pi) {
+    const auto F=patchFrame(M,pi);
+    PetscCall(PetscPrintf(PETSC_COMM_SELF,
+      "P1BF3_PATCH_AUDIT name=%s startFace=%" PetscInt_FMT " nFaces=%" PetscInt_FMT " area=%.12e areaVector=[%.12e,%.12e,%.12e] averageOutwardNormal=[%.12e,%.12e,%.12e] projectedArea=%.12e planarityRatio=%.12e\n",
+      M.patches[pi].name.c_str(),M.patches[pi].startFace,M.patches[pi].nFaces,F.area,F.areaVector.x,F.areaVector.y,F.areaVector.z,F.normal.x,F.normal.y,F.normal.z,F.projectedArea,F.projectedArea/F.area));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static double pipeIdealUz(const PipeGeometry& P,double x,double y) {
+  const double rr=(x-P.cx)*(x-P.cx)+(y-P.cy)*(y-P.cy);
+  return 2.0*P.bulkVelocity*(1.0-rr/(P.R*P.R));
+}
+static double pipeIdealOneSeventhUz(const PipeGeometry& P,double x,double y) {
+  const double r=std::sqrt((x-P.cx)*(x-P.cx)+(y-P.cy)*(y-P.cy));
+  const double q=std::max(0.0,1.0-r/P.R);
+  return P.bulkVelocity*std::pow(q,1.0/7.0);
+}
+static double pipeBoundaryUz(const ProblemConfig& P,double x,double y) {
+  const double raw=(P.inletBC==InletBCMode::PipeOneSeventh)?pipeIdealOneSeventhUz(P.pipe,x,y):pipeIdealUz(P.pipe,x,y);
+  return P.pipe.profileScale*raw;
+}
+static double pipeExactPressure(const PipeGeometry& P,double z) { return P.hpGradient*(P.zOut-z); }
+
+static double triangleAverageIdealPipeUz(const PipeGeometry& P,const Vec3 X[3]) {
+  double xx[3],yy[3];
+  for(int i=0;i<3;++i){xx[i]=X[i].x-P.cx;yy[i]=X[i].y-P.cy;}
+  const double avgx2=(xx[0]*xx[0]+xx[1]*xx[1]+xx[2]*xx[2]+xx[0]*xx[1]+xx[1]*xx[2]+xx[2]*xx[0])/6.0;
+  const double avgy2=(yy[0]*yy[0]+yy[1]*yy[1]+yy[2]*yy[2]+yy[0]*yy[1]+yy[1]*yy[2]+yy[2]*yy[0])/6.0;
+  return 2.0*P.bulkVelocity*(1.0-(avgx2+avgy2)/(P.R*P.R));
+}
+static double triangleAverageIdealPipeOneSeventhUz(const PipeGeometry& P,const Vec3 X[3]) {
+  // Dunavant degree-5 seven-point rule.  The 1/7 profile is non-polynomial,
+  // so use the same robust face rule as the weak wall model rather than a
+  // centroid sample.  Weights sum to one and therefore return a face average.
+  static const double L[7][3]={
+    {1.0/3.0,1.0/3.0,1.0/3.0},
+    {0.059715871789770,0.470142064105115,0.470142064105115},
+    {0.470142064105115,0.059715871789770,0.470142064105115},
+    {0.470142064105115,0.470142064105115,0.059715871789770},
+    {0.797426985353087,0.101286507323456,0.101286507323456},
+    {0.101286507323456,0.797426985353087,0.101286507323456},
+    {0.101286507323456,0.101286507323456,0.797426985353087}
+  };
+  static const double W[7]={0.225000000000000,0.132394152788506,0.132394152788506,0.132394152788506,0.125939180544827,0.125939180544827,0.125939180544827};
+  double avg=0.0;
+  for(int q=0;q<7;++q) {
+    double x=0.0,y=0.0; for(int a=0;a<3;++a){x+=L[q][a]*X[a].x;y+=L[q][a]*X[a].y;}
+    avg+=W[q]*pipeIdealOneSeventhUz(P,x,y);
+  }
+  return avg;
+}
+static double triangleAverageIdealPipeProfileUz(const PipeGeometry& P,InletBCMode mode,const Vec3 X[3]) {
+  return (mode==InletBCMode::PipeOneSeventh)?triangleAverageIdealPipeOneSeventhUz(P,X):triangleAverageIdealPipeUz(P,X);
+}
+
+static PipeGeometry makePipeGeometry(const Mesh& M,double re,double bulkVelocity,InletBCMode inletBC,
+                                     const std::string& wallName,const std::string& inletName,const std::string& outletName) {
+  PipeGeometry P; P.wallPatch=wallName;P.inletPatch=inletName;P.outletPatch=outletName;
+  P.wall=patchIndex(M,wallName);P.inlet=patchIndex(M,inletName);P.outlet=patchIndex(M,outletName);
+  if(P.wall<0||P.inlet<0||P.outlet<0) throw std::runtime_error("pipe patch names not found in boundary file");
+  double xmin=1e300,xmax=-1e300,ymin=1e300,ymax=-1e300,zmin=1e300,zmax=-1e300;
+  for(const auto& x:M.points){xmin=std::min(xmin,x.x);xmax=std::max(xmax,x.x);ymin=std::min(ymin,x.y);ymax=std::max(ymax,x.y);zmin=std::min(zmin,x.z);zmax=std::max(zmax,x.z);}
+  P.cx=0.5*(xmin+xmax);P.cy=0.5*(ymin+ymax);P.zIn=zmin;P.zOut=zmax;P.L=zmax-zmin;
+  P.R=0.5*std::max(xmax-xmin,ymax-ymin);P.D=2.0*P.R;P.bulkVelocity=bulkVelocity;P.re=re;
+  if(!(P.R>0&&P.L>0&&re>0&&bulkVelocity>0)) throw std::runtime_error("invalid pipe geometry/Re/Umean");
+  P.nu=bulkVelocity*P.D/re;
+  P.circleArea=PI*P.R*P.R;
+  auto patchArea=[&](int pi){double A=0;const auto& pp=M.patches[pi];for(PetscInt f=pp.startFace;f<pp.startFace+pp.nFaces;++f){const auto& F=M.faces[f];A+=triangleArea(M.points[F.v[0]],M.points[F.v[1]],M.points[F.v[2]]);}return A;};
+  P.inletArea=patchArea(P.inlet);P.outletArea=patchArea(P.outlet);P.areaRatio=P.inletArea/P.circleArea;
+  double rawFlux=0.0;const auto& pin=M.patches[P.inlet];
+  for(PetscInt f=pin.startFace;f<pin.startFace+pin.nFaces;++f){const auto& F=M.faces[f];Vec3 X[3]={M.points[F.v[0]],M.points[F.v[1]],M.points[F.v[2]]};rawFlux+=triangleArea(X[0],X[1],X[2])*triangleAverageIdealPipeProfileUz(P,inletBC,X);}
+  if(!(rawFlux>0)) throw std::runtime_error("non-positive raw inlet profile flux");
+  P.profileScale=bulkVelocity*P.inletArea/rawFlux;
+  P.hpGradient=32.0*P.nu*bulkVelocity/(P.D*P.D);
+  P.hpDrop=P.hpGradient*P.L;
+  return P;
+}
+
+static void problemForcing(const ProblemConfig& P,double x,double y,double z,double f[3]) {
+  if(P.mode!=ProblemMode::MMS){f[0]=f[1]=f[2]=0.0;return;}
+  forcing(x,y,z,P.nu,P.centralConvection,f);
+}
+
+
+static PetscErrorCode buildPlexAuditSelf(const Mesh& M) {
+  PetscFunctionBeginUser;
+  std::vector<PetscInt> cells(4*M.tets.size());
+  for(size_t c=0;c<M.tets.size();++c) for(int i=0;i<4;++i) cells[4*c+i]=M.tets[c][i];
+  std::vector<PetscReal> xyz(3*M.points.size());
+  for(size_t i=0;i<M.points.size();++i){xyz[3*i]=M.points[i].x;xyz[3*i+1]=M.points[i].y;xyz[3*i+2]=M.points[i].z;}
+  DM dm=nullptr;
+  PetscCall(DMPlexCreateFromCellListPetsc(PETSC_COMM_SELF,3,(PetscInt)M.tets.size(),(PetscInt)M.points.size(),4,PETSC_TRUE,cells.data(),3,xyz.data(),&dm));
+  PetscInt cs,ce,fs,fe,es,ee,vs,ve;
+  PetscCall(DMPlexGetHeightStratum(dm,0,&cs,&ce)); PetscCall(DMPlexGetHeightStratum(dm,1,&fs,&fe));
+  PetscCall(DMPlexGetDepthStratum(dm,1,&es,&ee)); PetscCall(DMPlexGetDepthStratum(dm,0,&vs,&ve));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,"P1BF3_DMPLEX_AUDIT cells=%" PetscInt_FMT " faces=%" PetscInt_FMT " edges=%" PetscInt_FMT " vertices=%" PetscInt_FMT " status=%s scope=rank0_serial_audit\n",ce-cs,fe-fs,ee-es,ve-vs,((size_t)(ce-cs)==M.tets.size() && (size_t)(fe-fs)==M.faces.size() && (size_t)(ve-vs)==M.points.size())?"PASS":"CHECK"));
+  PetscCall(DMDestroy(&dm));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct Discrete {
+  Mat A=nullptr, B[3]={nullptr,nullptr,nullptr};
+  Vec rhs[3]={nullptr,nullptr,nullptr}, volumes=nullptr, fixedDiv=nullptr;
+  // M6A: physical pressure scalar data are assembled directly in native FP64.
+  // PETSc pressure Vecs remain layout/preconditioner bridges only.
+  std::vector<double> volumesOwnedFP64, fixedDivOwnedFP64;
+  // M6B: all physical momentum source terms are native FP64 owned-row arrays.
+  std::array<std::vector<double>,3> rhsOwnedFP64;
+  std::vector<PetscInt> g2free, pGid;
+  std::vector<int> cellOwner;
+  std::vector<PetscInt> velCount, cellCount;
+  std::vector<char> fixedEntity;
+  // Stage-3 pipe wall bookkeeping.  wallEntity marks P1 vertices and BF3 face
+  // entities lying on the cylindrical wall.  With the weak wall model these
+  // scalar entities remain algebraic unknowns so Uz can slip; Ux/Uy are
+  // clamped strongly in the custom scalar solves and omitted from Bx/By.
+  std::vector<char> wallEntity;
+  // A2 memory hygiene: fixed Dirichlet values are stored only for fixed entities.
+  // g2free uses -1 for an as-yet-unassigned free entity during boundary setup and
+  // -(slot+2) for a fixed entity; after ownership, free entities receive gid>=0.
+  // This removes three dense FP64 arrays over all velocity entities without adding
+  // another global entity->slot map.
+  std::vector<std::array<double,3>> fixedDirValue;
+  PetscInt ns=0, freeVertices=0, freeFaces=0, fixedVertices=0, fixedFaces=0;
+};
+
+static PetscInt distributedGlobalCellCount(const Discrete& D) {
+  return std::accumulate(D.cellCount.begin(),D.cellCount.end(),(PetscInt)0);
+}
+static PetscInt distributedGlobalVelCount(const Discrete& D) { return D.ns; }
+
+static inline PetscInt fixedDirSlotFromEncodedGid(PetscInt g) { return -g-2; }
+
+static double entityDirValue(const Discrete& D,int d,PetscInt entity) {
+  const PetscInt g=D.g2free[(std::size_t)entity];
+  if(g>=0) throw std::runtime_error("entityDirValue called on free entity");
+  const PetscInt slot=fixedDirSlotFromEncodedGid(g);
+  if(slot<0 || slot>=(PetscInt)D.fixedDirValue.size()) throw std::runtime_error("invalid compact Dirichlet slot");
+  return D.fixedDirValue[(std::size_t)slot][(std::size_t)d];
+}
+
+static void setEntityDirValue(Discrete& D,int d,PetscInt entity,double value) {
+  const PetscInt g=D.g2free[(std::size_t)entity];
+  const PetscInt slot=fixedDirSlotFromEncodedGid(g);
+  if(slot<0 || slot>=(PetscInt)D.fixedDirValue.size()) throw std::runtime_error("invalid compact Dirichlet slot in setter");
+  D.fixedDirValue[(std::size_t)slot][(std::size_t)d]=value;
+}
+
+static void finalizeCompactDirichletSlots(Discrete& D) {
+  D.g2free.assign(D.fixedEntity.size(),-1);
+  PetscInt nfixed=0;
+  for(char f:D.fixedEntity) if(f) ++nfixed;
+  D.fixedDirValue.assign((std::size_t)nfixed,std::array<double,3>{0.0,0.0,0.0});
+  PetscInt slot=0;
+  for(std::size_t e=0;e<D.fixedEntity.size();++e) if(D.fixedEntity[e]) D.g2free[e]=-(slot++ + 2);
+}
+
+static void prepareBoundaryData(const Mesh& M,const ProblemConfig& P,Discrete& D) {
+  const PetscInt nv=(PetscInt)M.points.size(), nf=(PetscInt)M.faces.size(), ni=(PetscInt)M.neighbour.size();
+  D.fixedEntity.assign(nv+nf,0);
+  if(P.weakWallFunction) D.wallEntity.assign((std::size_t)(nv+nf),0);
+  else std::vector<char>().swap(D.wallEntity);
+
+  if(P.mode==ProblemMode::MMS) {
+    for(PetscInt f=ni;f<nf;++f) {
+      D.fixedEntity[nv+f]=1;
+      for(int v:M.faces[f].v) D.fixedEntity[v]=1;
+    }
+    finalizeCompactDirichletSlots(D);
+    return;
+  }
+
+  const auto& B=P.boundary;
+  std::vector<char> onWall(nv,0),onInlet(nv,0);
+  for(PetscInt f=ni;f<nf;++f) {
+    const int pi=M.facePatch[f];
+    const bool wall=isWallPatch(B,pi);
+    if(wall) {
+      if(P.weakWallFunction) D.wallEntity[(std::size_t)(nv+f)]=1;
+      for(int v:M.faces[f].v) {
+        onWall[(std::size_t)v]=1;
+        if(P.weakWallFunction) D.wallEntity[(std::size_t)v]=1;
+      }
+    }
+    // One scalar topology is shared by all three components.  For Stage 3 the
+    // wall entities are released globally; Ux/Uy are subsequently clamped to
+    // zero algebraically, while Uz remains active for the weak wall law.
+    if((wall && !P.weakWallFunction) || (pi==B.inlet && !dgNumericalTraceInlet(P))) D.fixedEntity[(std::size_t)(nv+f)]=1;
+    if(pi==B.inlet) for(int v:M.faces[f].v) onInlet[(std::size_t)v]=1;
+  }
+  for(PetscInt v=0;v<nv;++v)
+    if((onWall[(std::size_t)v] && !P.weakWallFunction) || (onInlet[(std::size_t)v] && !dgNumericalTraceInlet(P)))
+      D.fixedEntity[(std::size_t)v]=1;
+
+  // Allocate compact slots only after the complete fixed-entity mask is known.
+  finalizeCompactDirichletSlots(D);
+
+  // dg_numerical_trace prescribes velocity only through the weak boundary forms.
+  if(dgNumericalTraceInlet(P)) return;
+
+  for(PetscInt v=0;v<nv;++v) {
+    // Preserve the existing wall-priority convention at inlet/wall edge vertices.
+    // BF3 below restores the requested inlet face mean exactly despite that corner incompatibility.
+    if(onInlet[v] && !onWall[v]) {
+      if(P.inletBC==InletBCMode::PipeParabolic || P.inletBC==InletBCMode::PipeOneSeventh) setEntityDirValue(D,2,v,pipeBoundaryUz(P,M.points[v].x,M.points[v].y));
+      else { setEntityDirValue(D,0,v,B.inletVelocity.x); setEntityDirValue(D,1,v,B.inletVelocity.y); setEntityDirValue(D,2,v,B.inletVelocity.z); }
+    }
+  }
+
+  // Integral_F b_F / |F| = 9/20 for b_F=27 lambda1 lambda2 lambda3.
+  // Choose each boundary BF3 coefficient so the complete P1+BF3 trace has the
+  // requested vector face mean exactly.  This is especially important at the
+  // inlet/wall edge where conforming P1 vertices retain no-slip wall priority.
+  const auto& pin=M.patches[B.inlet];
+  for(PetscInt f=pin.startFace;f<pin.startFace+pin.nFaces;++f) {
+    const auto& F=M.faces[f];
+    double exactMean[3]={0,0,0};
+    if(P.inletBC==InletBCMode::PipeParabolic || P.inletBC==InletBCMode::PipeOneSeventh) {
+      Vec3 X[3]={M.points[F.v[0]],M.points[F.v[1]],M.points[F.v[2]]};
+      exactMean[2]=P.pipe.profileScale*triangleAverageIdealPipeProfileUz(P.pipe,P.inletBC,X);
+    } else { exactMean[0]=B.inletVelocity.x; exactMean[1]=B.inletVelocity.y; exactMean[2]=B.inletVelocity.z; }
+    for(int d=0;d<3;++d) {
+      const double vertexMean=(entityDirValue(D,d,F.v[0])+entityDirValue(D,d,F.v[1])+entityDirValue(D,d,F.v[2]))/3.0;
+      setEntityDirValue(D,d,nv+f,(20.0/9.0)*(exactMean[d]-vertexMean));
+    }
+  }
+}
+
+
+struct CentralTensor {
+  double t[8][8][8][3] = {};
+};
+
+static const CentralTensor& centralTensor() {
+  static const CentralTensor T = []() {
+    CentralTensor out;
+    // phi_a * phi_m * grad(phi_b) has total polynomial degree <= 8 for
+    // P1+BF3 on an affine tetrahedron.  The 5x5x5 collapsed rule is exact
+    // through that degree, so the older 7^3 construction was unnecessary.
+    // This tensor is still built only once per process.
+    const auto Q=tetDuffy5();
+    for(const auto& q:Q) {
+      double val[8],gr[8][3];
+      basis(q.lam,val,gr);
+      for(int a=0;a<8;++a)
+        for(int m=0;m<8;++m)
+          for(int b=0;b<8;++b)
+            for(int j=0;j<3;++j)
+              out.t[a][m][b][j] += val[a]*val[m]*gr[b][j]*q.w;
+    }
+    return out;
+  }();
+  return T;
+}
+
+struct DiffusionTensor {
+  double t[8][8][3][3] = {};
+};
+
+static const DiffusionTensor& diffusionTensor() {
+  static const DiffusionTensor T = []() {
+    DiffusionTensor out;
+    // Reference contraction for int grad(phi_a).grad(phi_b) dV.  Build once
+    // with the same exact collapsed 5^3 rule used by the accepted static K.
+    const auto Q=tetDuffy5();
+    for(const auto& q:Q) {
+      double val[8],gr[8][3]; basis(q.lam,val,gr);
+      for(int a=0;a<8;++a) for(int b=0;b<8;++b)
+        for(int j=0;j<3;++j) for(int k=0;k<3;++k)
+          out.t[a][b][j][k] += gr[a][j]*gr[b][k]*q.w;
+    }
+    return out;
+  }();
+  return T;
+}
+
+struct GhostPlan {
+  PetscInt rstart=0,rend=0,nOwned=0;
+  std::vector<PetscInt> ghosts;
+  std::unordered_map<PetscInt,PetscInt> ghostLocal;
+};
+
+static PetscErrorCode buildVelocityGhostPlan(const Mesh& M,const Discrete& D,int rank,GhostPlan& G) {
+  PetscFunctionBeginUser;
+  G.rstart=0; for(int r=0;r<rank;++r) G.rstart+=D.velCount[(std::size_t)r];
+  G.rend=G.rstart+D.velCount[(std::size_t)rank];
+  G.nOwned=G.rend-G.rstart;
+  const PetscInt nv=(PetscInt)M.points.size();
+  std::set<PetscInt> need;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) if(D.cellOwner[c]==rank) {
+    PetscInt lg[8];
+    for(int i=0;i<4;++i) lg[i]=M.tets[c][i];
+    for(int i=0;i<4;++i) lg[4+i]=nv+M.oppFace[c][i];
+    for(int a=0;a<8;++a) {
+      const PetscInt gid=D.g2free[lg[a]];
+      if(gid>=0 && (gid<G.rstart || gid>=G.rend)) need.insert(gid);
+    }
+  }
+  G.ghosts.assign(need.begin(),need.end());
+  G.ghostLocal.reserve(G.ghosts.size()*2+1);
+  for(PetscInt k=0;k<(PetscInt)G.ghosts.size();++k) G.ghostLocal.emplace(G.ghosts[k],G.nOwned+k);
+  PetscInt localGhosts=(PetscInt)G.ghosts.size(), minGhosts=0,maxGhosts=0;
+  PetscCallMPI(MPI_Allreduce(&localGhosts,&minGhosts,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localGhosts,&maxGhosts,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MPI_GHOSTS velocityGhostMin=%" PetscInt_FMT " velocityGhostMax=%" PetscInt_FMT " purpose=central_convection_local_element_values\n",minGhosts,maxGhosts));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscInt velocityLocalIndex(const GhostPlan& G,PetscInt gid) {
+  if(gid>=G.rstart && gid<G.rend) return gid-G.rstart;
+  auto it=G.ghostLocal.find(gid);
+  if(it==G.ghostLocal.end()) throw std::runtime_error("velocity ghost plan missing element DOF");
+  return it->second;
+}
+
+// -----------------------------------------------------------------------------
+// M2B direct custom FP64 momentum live architecture
+// -----------------------------------------------------------------------------
+// This is deliberately independent of PETSc's MPIAIJ row storage and of the
+// existing velocity ghost plan.  An owned velocity row receives FE
+// contributions from every incident tetrahedron, including tetrahedra owned by
+// neighbouring cell partitions.  Therefore the custom row-support halo is
+// built from all cells touching an owned row, not merely from rank-owned cells.
+//
+// M2B removes PETSc dynamic momentum matrices entirely. Static diffusion is copied
+// once from the validated FE matrix, then all convection/SUPG element contributions
+// are assembled directly into owned custom CSR rows from an all-incident-tet row
+// support plan.  PETSc remains only for pressure-side objects and vectors.
+struct CustomMomentumCSR {
+  PetscInt rstart=0,rend=0,nOwned=0;
+  std::vector<PetscInt> rowPtr;
+  std::vector<PetscInt> colGid;
+  std::vector<PetscInt> colLocal; // [0,nOwned) owned, [nOwned,...) custom ghosts
+  std::vector<PetscInt> diagPos;
+
+  std::vector<PetscInt> ghostGid; // grouped by owning rank because global IDs are rank-contiguous
+  std::vector<int> reqSendCounts,reqSendDispls,reqRecvCounts,reqRecvDispls;
+  std::vector<PetscInt> reqRecvGid,reqRecvLocalOffset;
+  std::vector<double> exchangeSend,ghostValues;
+  std::vector<MPI_Request> exchangeRequests;
+
+  // M1+M2 memory-hygiene storage: only one active numeric CSR array is retained.
+  // kNu remains as an intentionally-empty compatibility field for legacy shadow
+  // diagnostics; static diffusion is re-integrated directly into aRel on every
+  // physical-operator rebuild.  No persistent second nnz-sized FP64 array exists.
+  std::vector<double> kNu,aRel;
+  // Legacy M1/M2A shadow arrays are kept as empty fields so old diagnostic helpers
+  // remain source-compatible; they consume no retained numeric payload in M2B.
+  std::vector<double> convection,supg,aPhys;
+  std::vector<double> physDiag,relaxDelta,relaxedDiag,metric,rAU;
+  // Stage-3 pipe weak wall: owned scalar velocity rows that lie on the
+  // cylindrical wall.  Ux/Uy use this mask as an exact algebraic clamp;
+  // Uz remains unconstrained and receives the weak wall operator.
+  std::vector<char> wallOwned;
+
+  // Direct dynamic assembly gathers the three velocity components through the
+  // same peer-only custom halo used by MatVec/SGS and accumulates owned-row RHS.
+  std::array<std::vector<double>,3> fieldOwned,fieldGhost,convRhs,supgRhs,mixlenRhs,wallRhs,inletRhs;
+
+  // Reused live-solver work buffers. Keep the custom path allocation-free.
+  std::vector<double> workB,workX,workY,workBeff;
+};
+
+
+// -----------------------------------------------------------------------------
+// Cell-principal-block Jacobi rAU plan
+// -----------------------------------------------------------------------------
+// For -rau_mode cell_block_diag, replace scalar 1/diag(A_rel) by the average
+// diagonal of the inverse of each incident tetrahedron's assembled GLOBAL
+// principal block A_rel[I_K,I_K]. This is not an element-matrix inverse: every
+// block entry is read from the assembled relaxed CSR, so all global
+// contributions to each row/column pair are retained.
+//
+// Each rank stores complete CSR rows only for its velocity ownership interval.
+// The existing velocity halo identifies every off-rank row touched by an owned
+// row. The plan below exchanges those complete ghost-row VALUES once per SIMPLE
+// operator rebuild. Row topology is reconstructed once from the replicated mesh.
+struct CellBlockJacobiPlan {
+  PetscBool built=PETSC_FALSE;
+  // Sparse principal-entry topology retained for OWNED rows. Production M1
+  // releases CustomMomentumCSR::colGid after setup; cell-block rAU therefore
+  // must not depend on that released array during SIMPLE refreshes.  Each
+  // retained entry stores its column GID and permanent position in A.aRel.
+  std::vector<PetscInt> ownedRowPtr;
+  std::vector<PetscInt> ownedRowColGid;
+  std::vector<PetscInt> ownedRowValuePos;
+
+  std::vector<PetscInt> ghostRowPtr;
+  std::vector<PetscInt> ghostRowColGid;
+  std::vector<double> ghostRowValues;
+
+  // Sparse (row,column) value halo used only by cell-block rAU.  A remote
+  // assembled momentum row can contain many columns that this rank never uses;
+  // request exactly the principal-block entries required by local tetrahedra.
+  // sendValuePos is the owned-CSR slot for every value requested BY a peer.
+  // recvDest maps each value requested FROM a peer back into ghostRowValues.
+  std::vector<int> sendCounts,sendDispls,recvCounts,recvDispls;
+  std::vector<PetscInt> sendValuePos,recvDest;
+  std::vector<double> sendValues,recvPackedValues;
+
+  std::vector<PetscInt> supportCells;
+  std::vector<PetscInt> ownedMultiplicity;
+  unsigned long long exchangedValuesPerRefresh=0;
+};
+
+
+static int customMomentumOwnerOfGid(const std::vector<PetscInt>& off,PetscInt gid) {
+  auto it=std::upper_bound(off.begin(),off.end(),gid);
+  if(it==off.begin() || (it==off.end() && gid>=off.back())) return -1;
+  return (int)((it-off.begin())-1);
+}
+
+static PetscErrorCode buildCustomMomentumCSR(const Mesh& M,const Discrete& D,int rank,CustomMomentumCSR& A) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size();
+  std::vector<PetscInt> off(D.velCount.size()+1,0);
+  for(std::size_t r=0;r<D.velCount.size();++r) off[r+1]=off[r]+D.velCount[r];
+  A.rstart=off[(std::size_t)rank]; A.rend=off[(std::size_t)rank+1]; A.nOwned=A.rend-A.rstart;
+  bool hasOwnedFreeWall=false;
+  if(!D.wallEntity.empty()) for(std::size_t e=0;e<D.wallEntity.size();++e) if(D.wallEntity[e]) {
+    const PetscInt g=D.g2free[e]; if(g>=A.rstart && g<A.rend) { hasOwnedFreeWall=true; break; }
+  }
+  if(hasOwnedFreeWall) {
+    A.wallOwned.assign((std::size_t)A.nOwned,0);
+    for(std::size_t e=0;e<D.wallEntity.size();++e) if(D.wallEntity[e]) {
+      const PetscInt g=D.g2free[e];
+      if(g>=A.rstart && g<A.rend) A.wallOwned[(std::size_t)(g-A.rstart)]=1;
+    }
+  } else std::vector<char>().swap(A.wallOwned);
+
+  std::vector<std::vector<PetscInt>> rows((std::size_t)A.nOwned);
+  // Global mesh is still replicated in M1.  Evaluate row support from every tet
+  // touching an owned row.  This exactly models the owned-row + halo assembly
+  // that will remain after mesh localization.
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    PetscInt entity[8],gid[8];
+    for(int i=0;i<4;++i) entity[i]=M.tets[(std::size_t)c][i];
+    for(int i=0;i<4;++i) entity[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int i=0;i<8;++i) gid[i]=D.g2free[(std::size_t)entity[i]];
+    for(int a=0;a<8;++a) if(gid[a]>=A.rstart && gid[a]<A.rend) {
+      auto& rr=rows[(std::size_t)(gid[a]-A.rstart)];
+      for(int b=0;b<8;++b) if(gid[b]>=0) rr.push_back(gid[b]);
+    }
+  }
+
+  A.rowPtr.assign((std::size_t)A.nOwned+1,0);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    auto& rr=rows[(std::size_t)i];
+    std::sort(rr.begin(),rr.end()); rr.erase(std::unique(rr.begin(),rr.end()),rr.end());
+    const PetscInt diag=A.rstart+i;
+    if(!std::binary_search(rr.begin(),rr.end(),diag))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom momentum CSR row is missing its diagonal");
+    A.rowPtr[(std::size_t)i+1]=A.rowPtr[(std::size_t)i]+(PetscInt)rr.size();
+  }
+  A.colGid.resize((std::size_t)A.rowPtr.back());
+  A.diagPos.assign((std::size_t)A.nOwned,-1);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    const auto& rr=rows[(std::size_t)i];
+    PetscInt p=A.rowPtr[(std::size_t)i];
+    for(PetscInt k=0;k<(PetscInt)rr.size();++k) {
+      A.colGid[(std::size_t)(p+k)]=rr[(std::size_t)k];
+      if(rr[(std::size_t)k]==A.rstart+i) A.diagPos[(std::size_t)i]=p+k;
+    }
+  }
+
+  A.ghostGid.clear();
+  for(PetscInt g:A.colGid) if(g<A.rstart || g>=A.rend) A.ghostGid.push_back(g);
+  std::sort(A.ghostGid.begin(),A.ghostGid.end());
+  A.ghostGid.erase(std::unique(A.ghostGid.begin(),A.ghostGid.end()),A.ghostGid.end());
+
+  const int nr=(int)D.velCount.size();
+  A.reqSendCounts.assign((std::size_t)nr,0); A.reqRecvCounts.assign((std::size_t)nr,0);
+  for(PetscInt g:A.ghostGid) {
+    const int owner=customMomentumOwnerOfGid(off,g);
+    if(owner<0 || owner>=nr) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"invalid owner for custom momentum ghost gid");
+    ++A.reqSendCounts[(std::size_t)owner];
+  }
+  A.reqSendDispls.assign((std::size_t)nr,0); A.reqRecvDispls.assign((std::size_t)nr,0);
+  for(int r=1;r<nr;++r) A.reqSendDispls[(std::size_t)r]=A.reqSendDispls[(std::size_t)r-1]+A.reqSendCounts[(std::size_t)r-1];
+  PetscCallMPI(MPI_Alltoall(A.reqSendCounts.data(),1,MPI_INT,A.reqRecvCounts.data(),1,MPI_INT,PETSC_COMM_WORLD));
+  for(int r=1;r<nr;++r) A.reqRecvDispls[(std::size_t)r]=A.reqRecvDispls[(std::size_t)r-1]+A.reqRecvCounts[(std::size_t)r-1];
+  int nRecvReq=0; for(int v:A.reqRecvCounts) nRecvReq+=v;
+  A.reqRecvGid.assign((std::size_t)nRecvReq,-1);
+  PetscCallMPI(MPI_Alltoallv(A.ghostGid.empty()?nullptr:A.ghostGid.data(),A.reqSendCounts.data(),A.reqSendDispls.data(),MPIU_INT,
+                             A.reqRecvGid.empty()?nullptr:A.reqRecvGid.data(),A.reqRecvCounts.data(),A.reqRecvDispls.data(),MPIU_INT,PETSC_COMM_WORLD));
+  A.reqRecvLocalOffset.resize(A.reqRecvGid.size());
+  for(std::size_t k=0;k<A.reqRecvGid.size();++k) {
+    const PetscInt g=A.reqRecvGid[k];
+    if(g<A.rstart || g>=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom momentum peer requested a non-owned gid");
+    A.reqRecvLocalOffset[k]=g-A.rstart;
+  }
+
+  A.colLocal.resize(A.colGid.size());
+  for(std::size_t k=0;k<A.colGid.size();++k) {
+    const PetscInt g=A.colGid[k];
+    if(g>=A.rstart && g<A.rend) A.colLocal[k]=g-A.rstart;
+    else {
+      auto it=std::lower_bound(A.ghostGid.begin(),A.ghostGid.end(),g);
+      if(it==A.ghostGid.end() || *it!=g) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom momentum ghost lookup failed");
+      A.colLocal[k]=A.nOwned+(PetscInt)(it-A.ghostGid.begin());
+    }
+  }
+
+  const std::size_t nnz=A.colGid.size();
+  A.kNu.clear(); A.kNu.shrink_to_fit(); // M2: persistent static K payload eliminated
+  A.aRel.assign(nnz,0.0);
+  A.convection.clear(); A.supg.clear(); A.aPhys.clear();
+  A.physDiag.assign((std::size_t)A.nOwned,0.0); A.relaxDelta.assign((std::size_t)A.nOwned,0.0);
+  A.relaxedDiag.assign((std::size_t)A.nOwned,0.0); A.metric.assign((std::size_t)A.nOwned,0.0);
+  A.rAU.assign((std::size_t)A.nOwned,0.0);
+  for(int d=0;d<3;++d) {
+    A.fieldOwned[d].assign((std::size_t)A.nOwned,0.0);
+    A.fieldGhost[d].assign(A.ghostGid.size(),0.0);
+    A.convRhs[d].assign((std::size_t)A.nOwned,0.0);
+    A.supgRhs[d].assign((std::size_t)A.nOwned,0.0);
+  }
+  A.workB.assign((std::size_t)A.nOwned,0.0); A.workX.assign((std::size_t)A.nOwned,0.0);
+  A.workY.assign((std::size_t)A.nOwned,0.0); A.workBeff.assign((std::size_t)A.nOwned,0.0);
+  A.exchangeSend.assign(A.reqRecvGid.size(),0.0); A.ghostValues.assign(A.ghostGid.size(),0.0);
+  int peerOps=0; for(int r=0;r<nr;++r) { if(A.reqSendCounts[(std::size_t)r]>0) ++peerOps; if(A.reqRecvCounts[(std::size_t)r]>0) ++peerOps; }
+  A.exchangeRequests.resize((std::size_t)peerOps);
+
+  unsigned long long localNnz=(unsigned long long)nnz,globalNnz=0;
+  PetscCallMPI(MPI_Allreduce(&localNnz,&globalNnz,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscInt lg=(PetscInt)A.ghostGid.size(),gmin=0,gmax=0;
+  PetscCallMPI(MPI_Allreduce(&lg,&gmin,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lg,&gmax,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_CUSTOM_MOM_CSR rows=%" PetscInt_FMT " globalNnz=%llu avgNnzPerRow=%.6f customGhostMin=%" PetscInt_FMT " customGhostMax=%" PetscInt_FMT " semantics=owned_rows_all_incident_tets_custom_MPI_exchange\n",
+    D.ns,globalNnz,D.ns?((double)globalNnz/(double)D.ns):0.0,gmin,gmax));
+  unsigned long long localBytes=0,globalBytes=0;
+  localBytes += (unsigned long long)(A.rowPtr.capacity()+A.colGid.capacity()+A.colLocal.capacity()+A.diagPos.capacity()+A.ghostGid.capacity()+A.reqRecvGid.capacity()+A.reqRecvLocalOffset.capacity())*sizeof(PetscInt);
+  localBytes += (unsigned long long)(A.reqSendCounts.capacity()+A.reqSendDispls.capacity()+A.reqRecvCounts.capacity()+A.reqRecvDispls.capacity())*sizeof(int);
+  localBytes += (unsigned long long)(A.exchangeSend.capacity()+A.ghostValues.capacity()+A.aRel.capacity()+A.physDiag.capacity()+A.relaxDelta.capacity()+A.relaxedDiag.capacity()+A.metric.capacity()+A.rAU.capacity()+A.workB.capacity()+A.workX.capacity()+A.workY.capacity()+A.workBeff.capacity())*sizeof(double);
+  localBytes += (unsigned long long)A.wallOwned.capacity()*sizeof(char);
+  for(int d=0;d<3;++d) localBytes += (unsigned long long)(A.fieldOwned[d].capacity()+A.fieldGhost[d].capacity()+A.convRhs[d].capacity()+A.supgRhs[d].capacity()+A.mixlenRhs[d].capacity()+A.wallRhs[d].capacity()+A.inletRhs[d].capacity())*sizeof(double);
+  PetscCallMPI(MPI_Allreduce(&localBytes,&globalBytes,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_CUSTOM_MOM_MEMORY summedRetainedMiB=%.3f bytesPerGlobalVelDof=%.3f note=M1M2_single_activeA_static_diffusion_reintegrated_no_persistent_kNu_no_PETSc_momentum_matrices\n",
+    (double)globalBytes/(1024.0*1024.0),D.ns?((double)globalBytes/(double)D.ns):0.0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// M4A custom FP64 pressure B/B^T shadow architecture
+// -----------------------------------------------------------------------------
+// The final mixed-precision design cannot leave the physical divergence/gradient
+// operators in PETSc, because a single-precision PETSc build would then make B
+// itself single precision.  M4A therefore builds genuine custom MPI B and B^T
+// actions now, while the validated FP64 PETSc pressure path remains live.
+//
+// B x:       owned pressure rows, velocity owned+halo input.
+// B^T p:     owned velocity rows, all incident pressure cells, pressure halo.
+// S x:       B [ rAU .* (B^T x) ], entirely custom FP64 arithmetic.
+//
+// No global sparse insertion is used.  Runtime communication is peer-only; the
+// one-time MPI_Alltoall[v] below is only for discovering which GIDs each peer
+// needs, exactly as in the custom momentum halo.
+struct CustomPeerHalo {
+  PetscInt start=0,end=0,nOwned=0;
+  std::vector<PetscInt> ghostGid;
+  std::vector<int> reqSendCounts,reqSendDispls,reqRecvCounts,reqRecvDispls;
+  std::vector<PetscInt> reqRecvGid,reqRecvLocalOffset;
+  std::vector<double> exchangeSend,ghostValues;
+  std::vector<MPI_Request> exchangeRequests;
+};
+
+static PetscErrorCode buildCustomPeerHalo(const std::vector<PetscInt>& counts,int rank,
+  std::vector<PetscInt> neededGhosts,CustomPeerHalo& H,const char *label) {
+  PetscFunctionBeginUser;
+  std::vector<PetscInt> off(counts.size()+1,0);
+  for(std::size_t r=0;r<counts.size();++r) off[r+1]=off[r]+counts[r];
+  H.start=off[(std::size_t)rank]; H.end=off[(std::size_t)rank+1]; H.nOwned=H.end-H.start;
+  std::sort(neededGhosts.begin(),neededGhosts.end());
+  neededGhosts.erase(std::unique(neededGhosts.begin(),neededGhosts.end()),neededGhosts.end());
+  H.ghostGid.clear(); H.ghostGid.reserve(neededGhosts.size());
+  for(PetscInt g:neededGhosts) if(g<H.start || g>=H.end) H.ghostGid.push_back(g);
+  const int nr=(int)counts.size();
+  H.reqSendCounts.assign((std::size_t)nr,0); H.reqRecvCounts.assign((std::size_t)nr,0);
+  for(PetscInt g:H.ghostGid) {
+    const int owner=customMomentumOwnerOfGid(off,g);
+    if(owner<0 || owner>=nr) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A halo ghost GID has invalid owner");
+    ++H.reqSendCounts[(std::size_t)owner];
+  }
+  H.reqSendDispls.assign((std::size_t)nr,0); H.reqRecvDispls.assign((std::size_t)nr,0);
+  for(int r=1;r<nr;++r) H.reqSendDispls[(std::size_t)r]=H.reqSendDispls[(std::size_t)r-1]+H.reqSendCounts[(std::size_t)r-1];
+  PetscCallMPI(MPI_Alltoall(H.reqSendCounts.data(),1,MPI_INT,H.reqRecvCounts.data(),1,MPI_INT,PETSC_COMM_WORLD));
+  for(int r=1;r<nr;++r) H.reqRecvDispls[(std::size_t)r]=H.reqRecvDispls[(std::size_t)r-1]+H.reqRecvCounts[(std::size_t)r-1];
+  int nRecvReq=0; for(int v:H.reqRecvCounts) nRecvReq+=v;
+  H.reqRecvGid.assign((std::size_t)nRecvReq,-1);
+  PetscCallMPI(MPI_Alltoallv(H.ghostGid.empty()?nullptr:H.ghostGid.data(),H.reqSendCounts.data(),H.reqSendDispls.data(),MPIU_INT,
+                             H.reqRecvGid.empty()?nullptr:H.reqRecvGid.data(),H.reqRecvCounts.data(),H.reqRecvDispls.data(),MPIU_INT,PETSC_COMM_WORLD));
+  H.reqRecvLocalOffset.resize(H.reqRecvGid.size());
+  for(std::size_t k=0;k<H.reqRecvGid.size();++k) {
+    const PetscInt g=H.reqRecvGid[k];
+    if(g<H.start || g>=H.end) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A peer requested a non-owned GID");
+    H.reqRecvLocalOffset[k]=g-H.start;
+  }
+  H.exchangeSend.assign(H.reqRecvGid.size(),0.0); H.ghostValues.assign(H.ghostGid.size(),0.0);
+  int peerOps=0; for(int r=0;r<nr;++r){if(H.reqSendCounts[(std::size_t)r]>0)++peerOps;if(H.reqRecvCounts[(std::size_t)r]>0)++peerOps;}
+  H.exchangeRequests.resize((std::size_t)peerOps);
+  PetscInt lg=(PetscInt)H.ghostGid.size(),gmin=0,gmax=0;
+  PetscCallMPI(MPI_Allreduce(&lg,&gmin,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lg,&gmax,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_HALO kind=%s ghostMin=%" PetscInt_FMT " ghostMax=%" PetscInt_FMT " runtime=peer_only_nonblocking\n",label,gmin,gmax));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscInt customPeerLocalIndex(const CustomPeerHalo& H,PetscInt gid) {
+  if(gid>=H.start && gid<H.end) return gid-H.start;
+  auto it=std::lower_bound(H.ghostGid.begin(),H.ghostGid.end(),gid);
+  if(it==H.ghostGid.end() || *it!=gid) return -1;
+  return H.nOwned+(PetscInt)(it-H.ghostGid.begin());
+}
+
+static PetscErrorCode customPeerExchange(CustomPeerHalo& H,const std::vector<double>& xOwned,int tag) {
+  PetscFunctionBeginUser;
+  if((PetscInt)xOwned.size()!=H.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M4A halo owned vector size mismatch");
+  for(std::size_t k=0;k<H.reqRecvLocalOffset.size();++k) H.exchangeSend[k]=xOwned[(std::size_t)H.reqRecvLocalOffset[k]];
+  const int nr=(int)H.reqSendCounts.size(); int q=0;
+  for(int r=0;r<nr;++r) if(H.reqSendCounts[(std::size_t)r]>0)
+    PetscCallMPI(MPI_Irecv(H.ghostValues.data()+H.reqSendDispls[(std::size_t)r],H.reqSendCounts[(std::size_t)r],MPI_DOUBLE,r,tag,PETSC_COMM_WORLD,&H.exchangeRequests[(std::size_t)q++]));
+  for(int r=0;r<nr;++r) if(H.reqRecvCounts[(std::size_t)r]>0)
+    PetscCallMPI(MPI_Isend(H.exchangeSend.data()+H.reqRecvDispls[(std::size_t)r],H.reqRecvCounts[(std::size_t)r],MPI_DOUBLE,r,tag,PETSC_COMM_WORLD,&H.exchangeRequests[(std::size_t)q++]));
+  if(q!=(int)H.exchangeRequests.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A halo peer request count changed");
+  if(q>0) PetscCallMPI(MPI_Waitall(q,H.exchangeRequests.data(),MPI_STATUSES_IGNORE));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static inline double customPeerValue(const CustomPeerHalo& H,const std::vector<double>& owned,PetscInt li) {
+  return (li<H.nOwned)?owned[(std::size_t)li]:H.ghostValues[(std::size_t)(li-H.nOwned)];
+}
+
+static PetscErrorCode customVecOwnedRange(Vec v,PetscInt start,PetscInt end,std::vector<double>& out) {
+  PetscFunctionBeginUser;
+  PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(v,&s,&e));
+  if(s!=start || e!=end) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M4A PETSc Vec ownership does not match custom plan");
+  const PetscScalar *a=nullptr; PetscCall(VecGetArrayRead(v,&a)); out.resize((std::size_t)(end-start));
+  for(PetscInt i=0;i<end-start;++i) out[(std::size_t)i]=(double)PetscRealPart(a[i]);
+  PetscCall(VecRestoreArrayRead(v,&a)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customVecWriteOwnedRange(Vec v,PetscInt start,PetscInt end,const std::vector<double>& in) {
+  PetscFunctionBeginUser;
+  PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(v,&s,&e));
+  if(s!=start || e!=end || (PetscInt)in.size()!=end-start) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M4B PETSc Vec ownership does not match custom pressure plan");
+  PetscScalar *a=nullptr; PetscCall(VecGetArray(v,&a));
+  for(PetscInt i=0;i<end-start;++i) a[i]=(PetscScalar)in[(std::size_t)i];
+  PetscCall(VecRestoreArray(v,&a)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct CustomPressureForwardCell {
+  PetscInt pLocal=-1;
+  PetscInt velLocal[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  std::uint8_t wallBasis[8]={0,0,0,0,0,0,0,0};
+  std::int8_t inletOpp=-1;
+  double inletSf[3]={0.0,0.0,0.0};
+  double vol=0.0,gradLambda[4][3]={{0}};
+};
+struct CustomPressureTransposeCell {
+  PetscInt pLocal=-1;
+  PetscInt nOwnedVel=0;
+  std::uint8_t basis[8]={0};
+  std::uint8_t wallOwned[8]={0};
+  PetscInt velOwnedLocal[8]={0};
+  std::int8_t inletOpp=-1;
+  double inletSf[3]={0.0,0.0,0.0};
+  double vol=0.0,gradLambda[4][3]={{0}};
+};
+struct CustomPressureBPlan {
+  CustomPeerHalo velocityHalo,pressureHalo;
+  std::vector<CustomPressureForwardCell> forwardCells;
+  std::vector<CustomPressureTransposeCell> transposeCells;
+  std::vector<double> velOwned,pOwned,pressureWork,velocityWork;
+};
+
+static inline double customPressureBCoeff(double vol,const double gradLambda[4][3],int d,int a) {
+  const int i=(a<4)?a:(a-4);
+  const double base=vol*gradLambda[i][d];
+  return (a<4)?base:-(27.0/20.0)*base;
+}
+
+// Low-level raw DG trace correction. Boundary-condition interpretation stops
+// here; pressure solvers and AMG consume only the effective-B accessors below.
+static inline double customPressureBCoeffDG(double vol,const double gradLambda[4][3],
+                                            int inletOpp,const double inletSf[3],int d,int a) {
+  double v=customPressureBCoeff(vol,gradLambda,d,a);
+  if(inletOpp>=0) {
+    if(a<4 && a!=inletOpp) v-=inletSf[d]/3.0;
+    else if(a==4+inletOpp) v-=(9.0/20.0)*inletSf[d];
+  }
+  return v;
+}
+
+// Canonical effective pressure coupling. The compact B plan stores only
+// geometry plus boundary metadata; no 3x8 FP64 coefficient table is retained.
+// All live consumers therefore share:
+//   B_eff = B_volume - DG_inlet_trace, weak-wall scalar entities z-only.
+static inline double customPressureEffectiveB(const CustomPressureForwardCell& cp,int d,int a) {
+  if(d<2 && cp.wallBasis[a]) return 0.0;
+  return customPressureBCoeffDG(cp.vol,cp.gradLambda,(int)cp.inletOpp,cp.inletSf,d,a);
+}
+
+static inline double customPressureEffectiveBt(const CustomPressureTransposeCell& cp,int d,PetscInt j) {
+  if(d<2 && cp.wallOwned[j]) return 0.0;
+  const int a=(int)cp.basis[j];
+  return customPressureBCoeffDG(cp.vol,cp.gradLambda,(int)cp.inletOpp,cp.inletSf,d,a);
+}
+
+// The explicit full-Schur oracle uses the same coefficient factory. AMG does
+// not call this mesh/BC helper; it sees only the canonical compact B plan.
+static inline double customPressureEffectiveBForCell(const Mesh& M,const Discrete& D,
+                                                      const ProblemConfig& P,PetscInt c,
+                                                      double vol,const double gradLambda[4][3],
+                                                      int d,int a) {
+  int opp=-1; Vec3 sf{}; double sd[3]={0.0,0.0,0.0};
+  if(dgNumericalTraceFaceGeom(M,P,c,opp,sf)) { sd[0]=sf.x; sd[1]=sf.y; sd[2]=sf.z; }
+  const PetscInt nv=(PetscInt)M.points.size();
+  const PetscInt entity=(a<4)?M.tets[(std::size_t)c][(std::size_t)a]
+                              :nv+M.oppFace[(std::size_t)c][(std::size_t)(a-4)];
+  const bool weakWallScalar=(!D.wallEntity.empty() && D.wallEntity[(std::size_t)entity]);
+  if(weakWallScalar && d<2) return 0.0;
+  return customPressureBCoeffDG(vol,gradLambda,opp,sd,d,a);
+}
+
+static void fillCustomPressureGeom(const Mesh& M,PetscInt c,double& vol,double gradLambda[4][3]) {
+  const auto t=M.tets[(std::size_t)c];
+  const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+  double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                  {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                  {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},invJ[3][3];
+  const double det=det3(J); if(!(det>0.0)) throw std::runtime_error("M4A non-positive tet orientation");
+  inv3(J,invJ); vol=det/6.0;
+  const double gr[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};
+  for(int i=0;i<4;++i) for(int d=0;d<3;++d) { gradLambda[i][d]=0.0; for(int j=0;j<3;++j) gradLambda[i][d]+=gr[i][j]*invJ[j][d]; }
+}
+
+static PetscErrorCode buildCustomPressureBPlan(const Mesh& M,const Discrete& D,const ProblemConfig& problem,int rank,CustomPressureBPlan& P) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(),nc=(PetscInt)M.tets.size();
+  std::vector<PetscInt> vOff(D.velCount.size()+1,0),pOff(D.cellCount.size()+1,0);
+  for(std::size_t r=0;r<D.velCount.size();++r){vOff[r+1]=vOff[r]+D.velCount[r];pOff[r+1]=pOff[r]+D.cellCount[r];}
+  const PetscInt vStart=vOff[(std::size_t)rank],vEnd=vOff[(std::size_t)rank+1];
+  const PetscInt pStart=pOff[(std::size_t)rank],pEnd=pOff[(std::size_t)rank+1];
+
+  std::vector<PetscInt> neededVel,neededP;
+  P.forwardCells.clear(); P.forwardCells.reserve((std::size_t)D.cellCount[(std::size_t)rank]);
+  for(PetscInt c=0;c<nc;++c) if(D.cellOwner[(std::size_t)c]==rank) {
+    CustomPressureForwardCell cp; cp.pLocal=D.pGid[(std::size_t)c]-pStart;
+    PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int a=0;a<8;++a) { const PetscInt g=D.g2free[(std::size_t)ent[a]]; if(g>=0 && (g<vStart || g>=vEnd)) neededVel.push_back(g); }
+    fillCustomPressureGeom(M,c,cp.vol,cp.gradLambda);
+    { int io=-1; Vec3 sf{}; if(dgNumericalTraceFaceGeom(M,problem,c,io,sf)) { cp.inletOpp=(std::int8_t)io; cp.inletSf[0]=sf.x; cp.inletSf[1]=sf.y; cp.inletSf[2]=sf.z; } }
+    P.forwardCells.push_back(cp);
+  }
+  PetscCall(buildCustomPeerHalo(D.velCount,rank,std::move(neededVel),P.velocityHalo,"velocity_for_B"));
+  // Fill velocity local indices only after the halo is finalized.
+  for(PetscInt c=0;c<nc;++c) if(D.cellOwner[(std::size_t)c]==rank) {
+    auto& cp=P.forwardCells[(std::size_t)(D.pGid[(std::size_t)c]-pStart)];
+    PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int a=0;a<8;++a) {
+      const PetscInt g=D.g2free[(std::size_t)ent[a]];
+      cp.velLocal[a]=(g>=0)?customPeerLocalIndex(P.velocityHalo,g):-1;
+      cp.wallBasis[a]=(!D.wallEntity.empty() && D.wallEntity[(std::size_t)ent[a]])?1:0;
+      if(g>=0 && cp.velLocal[a]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A B forward halo missing velocity gid");
+    }
+  }
+
+  // A2 memory hygiene: reserve the exact transpose support count.  The old
+  // push_back growth could leave nearly 2x capacity depending on mesh/rank.
+  std::size_t transposeSupportCount=0;
+  for(PetscInt c=0;c<nc;++c) {
+    PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    bool any=false;
+    for(int a=0;a<8;++a) { const PetscInt g=D.g2free[(std::size_t)ent[a]]; if(g>=vStart && g<vEnd) { any=true; break; } }
+    if(any) ++transposeSupportCount;
+  }
+  P.transposeCells.clear(); P.transposeCells.reserve(transposeSupportCount);
+  for(PetscInt c=0;c<nc;++c) {
+    PetscInt ent[8],gid[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    CustomPressureTransposeCell cp;
+    for(int a=0;a<8;++a) {
+      gid[a]=D.g2free[(std::size_t)ent[a]];
+      if(gid[a]>=vStart && gid[a]<vEnd) {
+        cp.basis[cp.nOwnedVel]=(std::uint8_t)a;
+        cp.wallOwned[cp.nOwnedVel]=(!D.wallEntity.empty() && D.wallEntity[(std::size_t)ent[a]])?1:0;
+        cp.velOwnedLocal[cp.nOwnedVel]=gid[a]-vStart;
+        ++cp.nOwnedVel;
+      }
+    }
+    if(cp.nOwnedVel==0) continue;
+    const PetscInt pg=D.pGid[(std::size_t)c]; if(pg<pStart || pg>=pEnd) neededP.push_back(pg);
+    fillCustomPressureGeom(M,c,cp.vol,cp.gradLambda);
+    { int io=-1; Vec3 sf{}; if(dgNumericalTraceFaceGeom(M,problem,c,io,sf)) { cp.inletOpp=(std::int8_t)io; cp.inletSf[0]=sf.x; cp.inletSf[1]=sf.y; cp.inletSf[2]=sf.z; } }
+    P.transposeCells.push_back(cp);
+  }
+  PetscCall(buildCustomPeerHalo(D.cellCount,rank,std::move(neededP),P.pressureHalo,"pressure_for_Bt"));
+  std::size_t jt=0;
+  for(PetscInt c=0;c<nc;++c) {
+    bool any=false; PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[(std::size_t)c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int a=0;a<8;++a){const PetscInt g=D.g2free[(std::size_t)ent[a]];if(g>=vStart && g<vEnd){any=true;break;}}
+    if(!any) continue;
+    auto& cp=P.transposeCells[jt++]; cp.pLocal=customPeerLocalIndex(P.pressureHalo,D.pGid[(std::size_t)c]);
+    if(cp.pLocal<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A Bt halo missing pressure gid");
+  }
+  if(jt!=P.transposeCells.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A Bt support fill mismatch");
+  P.velOwned.assign((std::size_t)(vEnd-vStart),0.0); P.pOwned.assign((std::size_t)(pEnd-pStart),0.0);
+  P.pressureWork.assign((std::size_t)(pEnd-pStart),0.0); P.velocityWork.assign((std::size_t)(vEnd-vStart),0.0);
+  unsigned long long lf=(unsigned long long)P.forwardCells.size(),lt=(unsigned long long)P.transposeCells.size(),gf=0,gt=0;
+  PetscCallMPI(MPI_Allreduce(&lf,&gf,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lt,&gt,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  unsigned long long lb=(unsigned long long)P.forwardCells.capacity()*sizeof(CustomPressureForwardCell)+(unsigned long long)P.transposeCells.capacity()*sizeof(CustomPressureTransposeCell);
+  auto haloBytes=[](const CustomPeerHalo& H)->unsigned long long{return (unsigned long long)(H.ghostGid.capacity()+H.reqRecvGid.capacity()+H.reqRecvLocalOffset.capacity())*sizeof(PetscInt)+(unsigned long long)(H.reqSendCounts.capacity()+H.reqSendDispls.capacity()+H.reqRecvCounts.capacity()+H.reqRecvDispls.capacity())*sizeof(int)+(unsigned long long)(H.exchangeSend.capacity()+H.ghostValues.capacity())*sizeof(double);};
+  lb+=haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)+(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity())*sizeof(double);
+  unsigned long long gb=0; PetscCallMPI(MPI_Allreduce(&lb,&gb,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_PLAN pressureRows=%llu transposeSupportCells=%llu transposeSupportReplication=%.6f retainedMiB=%.3f semantics=custom_FP64_owned_rows_peer_halo\n",gf,gt,distributedGlobalCellCount(D)?(double)gt/(double)distributedGlobalCellCount(D):0.0,(double)gb/(1024.0*1024.0)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static unsigned long long customPressurePlanLocalBytes(const CustomPressureBPlan& P) {
+  auto haloBytes=[](const CustomPeerHalo& H)->unsigned long long {
+    return (unsigned long long)(H.ghostGid.capacity()+H.reqRecvGid.capacity()+H.reqRecvLocalOffset.capacity())*sizeof(PetscInt)
+      +(unsigned long long)(H.reqSendCounts.capacity()+H.reqSendDispls.capacity()+H.reqRecvCounts.capacity()+H.reqRecvDispls.capacity())*sizeof(int)
+      +(unsigned long long)(H.exchangeSend.capacity()+H.ghostValues.capacity())*sizeof(double)
+      +(unsigned long long)H.exchangeRequests.capacity()*sizeof(MPI_Request);
+  };
+  return (unsigned long long)P.forwardCells.capacity()*sizeof(CustomPressureForwardCell)
+    +(unsigned long long)P.transposeCells.capacity()*sizeof(CustomPressureTransposeCell)
+    +haloBytes(P.velocityHalo)+haloBytes(P.pressureHalo)
+    +(unsigned long long)(P.velOwned.capacity()+P.pOwned.capacity()+P.pressureWork.capacity()+P.velocityWork.capacity())*sizeof(double);
+}
+
+static PetscErrorCode customPressureBApply(CustomPressureBPlan& P,int d,const std::vector<double>& xOwned,std::vector<double>& yOwned) {
+  PetscFunctionBeginUser; PetscCall(customPeerExchange(P.velocityHalo,xOwned,48201+d));
+  yOwned.assign((std::size_t)P.pressureHalo.nOwned,0.0);
+  for(const auto& cp:P.forwardCells) {
+    double s=0.0;
+    for(int a=0;a<8;++a) if(cp.velLocal[a]>=0) {
+      // Straight-pipe Stage 3: wall scalar entities are active only for the
+      // axial z component.  Excluding them from Bx/By is the pressure-side
+      // counterpart of the exact Ux/Uy wall clamp.
+      s+=customPressureEffectiveB(cp,d,a)*customPeerValue(P.velocityHalo,xOwned,cp.velLocal[a]);
+    }
+    yOwned[(std::size_t)cp.pLocal]=s;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customPressureBtApply(CustomPressureBPlan& P,int d,const std::vector<double>& pOwned,std::vector<double>& yOwned) {
+  PetscFunctionBeginUser; PetscCall(customPeerExchange(P.pressureHalo,pOwned,48211+d));
+  yOwned.assign((std::size_t)P.velocityHalo.nOwned,0.0);
+  for(const auto& cp:P.transposeCells) {
+    const double pv=customPeerValue(P.pressureHalo,pOwned,cp.pLocal);
+    for(PetscInt j=0;j<cp.nOwnedVel;++j) {
+      yOwned[(std::size_t)cp.velOwnedLocal[j]]+=customPressureEffectiveBt(cp,d,j)*pv;
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct CustomPressureParityNorm { double rel=0.0,maxAbs=0.0; };
+static PetscErrorCode customPressureCompareOwned(const std::vector<double>& got,Vec ref,CustomPressureParityNorm& out) {
+  PetscFunctionBeginUser; PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(ref,&s,&e)); std::vector<double> rv; PetscCall(customVecOwnedRange(ref,s,e,rv));
+  if(got.size()!=rv.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M4A parity vector size mismatch");
+  double ld2=0.0,lr2=0.0,lmax=0.0; for(std::size_t i=0;i<got.size();++i){const double q=got[i]-rv[i];ld2+=q*q;lr2+=rv[i]*rv[i];lmax=std::max(lmax,std::abs(q));}
+  double gd2=0.0,gr2=0.0,gmax=0.0; PetscCallMPI(MPI_Allreduce(&ld2,&gd2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lr2,&gr2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lmax,&gmax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  out.rel=std::sqrt(gd2)/std::max(std::sqrt(gr2),1e-300); out.maxAbs=gmax; PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customPressureBStaticParity(const Discrete& D,CustomPressureBPlan& P,double tol) {
+  PetscFunctionBeginUser;
+  Vec xv=nullptr,pv=nullptr,yP=nullptr,yV=nullptr; PetscCall(VecDuplicate(D.rhs[0],&xv)); PetscCall(VecDuplicate(D.volumes,&pv)); PetscCall(VecDuplicate(D.volumes,&yP)); PetscCall(VecDuplicate(D.rhs[0],&yV));
+  PetscInt vs=0,ve=0,ps=0,pe=0; PetscCall(VecGetOwnershipRange(xv,&vs,&ve)); PetscCall(VecGetOwnershipRange(pv,&ps,&pe));
+  { PetscScalar *a=nullptr; PetscCall(VecGetArray(xv,&a)); for(PetscInt i=0;i<ve-vs;++i){const double g=(double)(vs+i+1);a[i]=(PetscScalar)(std::sin(0.001731*g)+0.25*std::cos(0.000913*g));} PetscCall(VecRestoreArray(xv,&a)); }
+  { PetscScalar *a=nullptr; PetscCall(VecGetArray(pv,&a)); for(PetscInt i=0;i<pe-ps;++i){const double g=(double)(ps+i+1);a[i]=(PetscScalar)(std::cos(0.001127*g)-0.17*std::sin(0.000719*g));} PetscCall(VecRestoreArray(pv,&a)); }
+  PetscCall(customVecOwnedRange(xv,vs,ve,P.velOwned)); PetscCall(customVecOwnedRange(pv,ps,pe,P.pOwned));
+  bool ok=true;
+  for(int d=0;d<3;++d) {
+    PetscCall(customPressureBApply(P,d,P.velOwned,P.pressureWork)); PetscCall(MatMult(D.B[d],xv,yP)); CustomPressureParityNorm bn; PetscCall(customPressureCompareOwned(P.pressureWork,yP,bn));
+    PetscCall(customPressureBtApply(P,d,P.pOwned,P.velocityWork)); PetscCall(MatMultTranspose(D.B[d],pv,yV)); CustomPressureParityNorm btn; PetscCall(customPressureCompareOwned(P.velocityWork,yV,btn));
+    const bool dok=(bn.rel<=tol && btn.rel<=tol); ok=ok&&dok;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4A_B_PARITY comp=%d BRel=%.3e BMaxAbs=%.3e BtRel=%.3e BtMaxAbs=%.3e tol=%.3e status=%s\n",d,bn.rel,bn.maxAbs,btn.rel,btn.maxAbs,tol,dok?"PASS":"CHECK"));
+  }
+  PetscCall(VecDestroy(&xv)); PetscCall(VecDestroy(&pv)); PetscCall(VecDestroy(&yP)); PetscCall(VecDestroy(&yV));
+  if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A custom B/Bt static parity failed");
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct M10PressurePCGProfile {
+  PetscBool enabled=PETSC_FALSE;
+  unsigned long long solves=0,iterations=0,schurCalls=0,btCalls=0,bCalls=0,pcApplyCalls=0,reductionCalls=0;
+  double totalPcg=0.0;
+  double schurTotal=0.0,bt=0.0,rau=0.0,b=0.0,schurAccum=0.0;
+  double pcApplyTotal=0.0,pcBridgeIn=0.0,pcKernel=0.0,pcBridgeOut=0.0,pcProject=0.0;
+  double reductions=0.0,vectorOps=0.0;
+};
+static void m10ProfileAdd(M10PressurePCGProfile& a,const M10PressurePCGProfile& b) {
+  a.solves+=b.solves; a.iterations+=b.iterations; a.schurCalls+=b.schurCalls; a.btCalls+=b.btCalls; a.bCalls+=b.bCalls; a.pcApplyCalls+=b.pcApplyCalls; a.reductionCalls+=b.reductionCalls;
+  a.totalPcg+=b.totalPcg; a.schurTotal+=b.schurTotal; a.bt+=b.bt; a.rau+=b.rau; a.b+=b.b; a.schurAccum+=b.schurAccum;
+  a.pcApplyTotal+=b.pcApplyTotal; a.pcBridgeIn+=b.pcBridgeIn; a.pcKernel+=b.pcKernel; a.pcBridgeOut+=b.pcBridgeOut; a.pcProject+=b.pcProject;
+  a.reductions+=b.reductions; a.vectorOps+=b.vectorOps;
+}
+
+static PetscErrorCode customPressureSchurApply(CustomPressureBPlan& P,const CustomMomentumCSR& M,const std::vector<double>& xOwned,std::vector<double>& yOwned,M10PressurePCGProfile *prof=nullptr) {
+  PetscFunctionBeginUser;
+  PetscLogDouble tall0=0,tall1=0,t0=0,t1=0;
+  if(prof && prof->enabled) { PetscCall(PetscTime(&tall0)); prof->schurCalls++; }
+  if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+  yOwned.assign((std::size_t)P.pressureHalo.nOwned,0.0);
+  std::vector<double> partP;
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->schurAccum += (double)(t1-t0); }
+  for(int d=0;d<3;++d) {
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureBtApply(P,d,xOwned,P.velocityWork));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->bt += (double)(t1-t0); prof->btCalls++; PetscCall(PetscTime(&t0)); }
+    for(std::size_t i=0;i<P.velocityWork.size();++i) P.velocityWork[i]*=M.rAU[i];
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->rau += (double)(t1-t0); PetscCall(PetscTime(&t0)); }
+    PetscCall(customPressureBApply(P,d,P.velocityWork,partP));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->b += (double)(t1-t0); prof->bCalls++; PetscCall(PetscTime(&t0)); }
+    for(std::size_t i=0;i<yOwned.size();++i) yOwned[i]+=partP[i];
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->schurAccum += (double)(t1-t0); }
+  }
+  if(prof && prof->enabled) { PetscCall(PetscTime(&tall1)); prof->schurTotal += (double)(tall1-tall0); }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// M5B: custom outer pressure PCG in FP64. PETSc owns only the already-built
+// pressure preconditioner; every Krylov vector, dot product, recurrence and
+// exact Schur application remains in custom C++ FP64/MPI.
+struct CustomPressurePCGWorkspace {
+  std::vector<double> x,r,z,p;
+};
+struct CustomPressurePCGResult {
+  PetscInt its=0;
+  double finalPreconditionedRel=0.0;
+  PetscBool converged=PETSC_FALSE;
+};
+
+static PetscErrorCode customPressureDot(const std::vector<double>& a,const std::vector<double>& b,double *gdot) {
+  PetscFunctionBeginUser;
+  if(a.size()!=b.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M5B pressure dot size mismatch");
+  double l=0.0; for(std::size_t i=0;i<a.size();++i) l+=a[i]*b[i];
+  PetscCallMPI(MPI_Allreduce(&l,gdot,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customPressureNorm2(const std::vector<double>& a,double *gnorm) {
+  PetscFunctionBeginUser;
+  double l=0.0,g=0.0; for(double v:a) l+=v*v;
+  PetscCallMPI(MPI_Allreduce(&l,&g,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  *gnorm=std::sqrt(std::max(0.0,g));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customPressureProjectConstant(std::vector<double>& a) {
+  PetscFunctionBeginUser;
+  double ls=0.0,gs=0.0; unsigned long long ln=(unsigned long long)a.size(),gn=0;
+  for(double v:a) ls+=v;
+  PetscCallMPI(MPI_Allreduce(&ls,&gs,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&ln,&gn,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  if(gn) { const double m=gs/(double)gn; for(double& v:a) v-=m; }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+// M6A: native FP64 pressure-state helpers.  These never touch PetscScalar and
+// therefore remain FP64 even when the eventual PETSc backend is configured
+// --with-precision=single.
+static PetscErrorCode customPressureVolumeMeanShift(std::vector<double>& p,const std::vector<double>& vol,double globalVol) {
+  PetscFunctionBeginUser;
+  if(p.size()!=vol.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A pressure/volume size mismatch");
+  double local=0.0,global=0.0; for(std::size_t i=0;i<p.size();++i) local+=vol[i]*p[i];
+  PetscCallMPI(MPI_Allreduce(&local,&global,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  const double shift=global/std::max(globalVol,1e-300); for(double& v:p) v-=shift;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customGatherOwnedPressureToZero(const std::vector<double>& local,const std::vector<PetscInt>& counts,std::vector<double>& global) {
+  PetscFunctionBeginUser;
+  int rank=0,size=1; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank)); PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD,&size));
+  if((int)counts.size()!=size) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A pressure gather count size mismatch");
+  std::vector<int> cnt((std::size_t)size),disp((std::size_t)size,0); PetscInt total=0;
+  for(int r=0;r<size;++r) { if(counts[(std::size_t)r]>(PetscInt)INT_MAX) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A pressure gather count exceeds int MPI limit"); cnt[(std::size_t)r]=(int)counts[(std::size_t)r]; if(r) disp[(std::size_t)r]=disp[(std::size_t)r-1]+cnt[(std::size_t)r-1]; total+=counts[(std::size_t)r]; }
+  if((PetscInt)local.size()!=counts[(std::size_t)rank]) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A local pressure gather size mismatch");
+  if(rank==0) global.assign((std::size_t)total,0.0); else global.clear();
+  PetscCallMPI(MPI_Gatherv(local.empty()?nullptr:local.data(),cnt[(std::size_t)rank],MPI_DOUBLE,rank==0?global.data():nullptr,cnt.data(),disp.data(),MPI_DOUBLE,0,PETSC_COMM_WORLD));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customPressurePCApply(PC pc,CustomPressureBPlan& B,Vec pcIn,Vec pcOut,
+  const std::vector<double>& in,std::vector<double>& out,PetscBool projectConstant,M10PressurePCGProfile *prof=nullptr) {
+  PetscFunctionBeginUser;
+  PetscLogDouble tall0=0,tall1=0,t0=0,t1=0;
+  if(prof && prof->enabled) { PetscCall(PetscTime(&tall0)); prof->pcApplyCalls++; PetscCall(PetscTime(&t0)); }
+  PetscCall(customVecWriteOwnedRange(pcIn,B.pressureHalo.start,B.pressureHalo.end,in));
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->pcBridgeIn += (double)(t1-t0); PetscCall(PetscTime(&t0)); }
+  PetscCall(PCApply(pc,pcIn,pcOut));
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->pcKernel += (double)(t1-t0); PetscCall(PetscTime(&t0)); }
+  PetscCall(customVecOwnedRange(pcOut,B.pressureHalo.start,B.pressureHalo.end,out));
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->pcBridgeOut += (double)(t1-t0); }
+  if(projectConstant) {
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureProjectConstant(out));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->pcProject += (double)(t1-t0); prof->reductionCalls += 2; }
+  }
+  if(prof && prof->enabled) { PetscCall(PetscTime(&tall1)); prof->pcApplyTotal += (double)(tall1-tall0); }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customPressurePCG(CustomPressureBPlan& B,const CustomMomentumCSR& M,PC pc,
+  Vec pcIn,Vec pcOut,const std::vector<double>& rhs,double rtol,double atol,double dtol,PetscInt maxIts,
+  PetscBool projectConstant,CustomPressurePCGWorkspace& W,CustomPressurePCGResult& R,M10PressurePCGProfile *prof=nullptr) {
+  PetscFunctionBeginUser;
+  const std::size_t n=rhs.size();
+  PetscLogDouble t0=0,t1=0;
+  if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+  W.x.assign(n,0.0); W.r=rhs; W.z.assign(n,0.0); W.p.assign(n,0.0);
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->vectorOps += (double)(t1-t0); }
+  if(projectConstant) {
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureProjectConstant(W.r));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls += 2; }
+  }
+  PetscCall(customPressurePCApply(pc,B,pcIn,pcOut,W.r,W.z,projectConstant,prof));
+  double n0=0.0;
+  if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+  PetscCall(customPressureNorm2(W.z,&n0));
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls++; }
+  const double target=std::max(atol,rtol*n0);
+  if(n0<=target) { R.its=0; R.finalPreconditionedRel=0.0; R.converged=PETSC_TRUE; PetscFunctionReturn(PETSC_SUCCESS); }
+  if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+  W.p=W.z;
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->vectorOps += (double)(t1-t0); }
+  double rho=0.0;
+  if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+  PetscCall(customPressureDot(W.r,W.z,&rho));
+  if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls++; }
+  if(!(rho>0.0) || !std::isfinite(rho)) { R.its=0; R.finalPreconditionedRel=1.0; R.converged=PETSC_FALSE; PetscFunctionReturn(PETSC_SUCCESS); }
+  R.converged=PETSC_FALSE; R.finalPreconditionedRel=1.0; R.its=0;
+  for(PetscInt k=0;k<maxIts;++k) {
+    PetscCall(customPressureSchurApply(B,M,W.p,B.pressureWork,prof));
+    double pq=0.0;
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureDot(W.p,B.pressureWork,&pq));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls++; }
+    if(!(pq>0.0) || !std::isfinite(pq)) { R.its=k; PetscFunctionReturn(PETSC_SUCCESS); }
+    const double alpha=rho/pq;
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    for(std::size_t i=0;i<n;++i) { W.x[i]+=alpha*W.p[i]; W.r[i]-=alpha*B.pressureWork[i]; }
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->vectorOps += (double)(t1-t0); }
+    if(projectConstant) {
+      if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+      PetscCall(customPressureProjectConstant(W.r));
+      if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls += 2; }
+    }
+    PetscCall(customPressurePCApply(pc,B,pcIn,pcOut,W.r,W.z,projectConstant,prof));
+    double zn=0.0;
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureNorm2(W.z,&zn));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls++; }
+    R.its=k+1; R.finalPreconditionedRel=zn/std::max(n0,1e-300);
+    if(zn<=target) { R.converged=PETSC_TRUE; if(prof && prof->enabled) prof->iterations += (unsigned long long)R.its; PetscFunctionReturn(PETSC_SUCCESS); }
+    if(dtol>0.0 && zn>dtol*n0) { if(prof && prof->enabled) prof->iterations += (unsigned long long)R.its; PetscFunctionReturn(PETSC_SUCCESS); }
+    double rhoNew=0.0;
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    PetscCall(customPressureDot(W.r,W.z,&rhoNew));
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->reductions += (double)(t1-t0); prof->reductionCalls++; }
+    if(!(rhoNew>0.0) || !std::isfinite(rhoNew)) { if(prof && prof->enabled) prof->iterations += (unsigned long long)R.its; PetscFunctionReturn(PETSC_SUCCESS); }
+    const double beta=rhoNew/rho;
+    if(prof && prof->enabled) PetscCall(PetscTime(&t0));
+    for(std::size_t i=0;i<n;++i) W.p[i]=W.z[i]+beta*W.p[i];
+    if(prof && prof->enabled) { PetscCall(PetscTime(&t1)); prof->vectorOps += (double)(t1-t0); }
+    rho=rhoNew;
+  }
+  if(prof && prof->enabled) prof->iterations += (unsigned long long)R.its;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode m10PrintPressurePCGProfile(const char *scope,const M10PressurePCGProfile& p,PetscInt mixedDof) {
+  PetscFunctionBeginUser;
+  double local[13]={p.totalPcg,p.schurTotal,p.bt,p.rau,p.b,p.schurAccum,p.pcApplyTotal,p.pcBridgeIn,p.pcKernel,p.pcBridgeOut,p.pcProject,p.reductions,p.vectorOps};
+  double g[13]={0}; PetscCallMPI(MPI_Allreduce(local,g,13,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  unsigned long long lc[7]={p.solves,p.iterations,p.schurCalls,p.btCalls,p.bCalls,p.pcApplyCalls,p.reductionCalls},gc[7]={0};
+  PetscCallMPI(MPI_Allreduce(lc,gc,7,MPI_UNSIGNED_LONG_LONG,MPI_MAX,PETSC_COMM_WORLD));
+  const double top=g[1]+g[6]+g[11]+g[12];
+  const double unaccounted=std::max(0.0,g[0]-top);
+  const double itden=gc[1]?double(gc[1]):1.0, pcden=gc[5]?double(gc[5]):1.0, schden=gc[2]?double(gc[2]):1.0;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_M10_PCG_PROFILE scope=%s mixedDof=%" PetscInt_FMT " solves=%llu iterations=%llu avgIts=%.6f totalMs=%.6f totalMsPerIt=%.6f schurCalls=%llu schurMs=%.6f schurMsPerIt=%.6f btMsPerIt=%.6f rauMsPerIt=%.6f bMsPerIt=%.6f schurAccumMsPerIt=%.6f pcApplyCalls=%llu pcApplyTotalMs=%.6f pcApplyMsPerIt=%.6f pcKernelMsPerCall=%.6f bridgeInMsPerCall=%.6f bridgeOutMsPerCall=%.6f pcProjectMsPerCall=%.6f reductionCalls=%llu reductionsMsPerIt=%.6f vectorOpsMsPerIt=%.6f unaccountedMsPerIt=%.6f schurInternalClosure=%.6f pcInternalClosure=%.6f\\n",
+    scope,mixedDof,gc[0],gc[1],gc[0]?double(gc[1])/double(gc[0]):0.0,1e3*g[0],1e3*g[0]/itden,gc[2],1e3*g[1],1e3*g[1]/itden,
+    1e3*g[2]/itden,1e3*g[3]/itden,1e3*g[4]/itden,1e3*g[5]/itden,gc[5],1e3*g[6],1e3*g[6]/itden,1e3*g[8]/pcden,1e3*g[7]/pcden,1e3*g[9]/pcden,1e3*g[10]/pcden,gc[6],1e3*g[11]/itden,1e3*g[12]/itden,1e3*unaccounted/itden,
+    g[1]>0?(g[2]+g[3]+g[4]+g[5])/g[1]:0.0,g[6]>0?(g[7]+g[8]+g[9]+g[10])/g[6]:0.0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static unsigned long long customPressurePCGWorkspaceBytes(const CustomPressurePCGWorkspace& W) {
+  return (unsigned long long)(W.x.capacity()+W.r.capacity()+W.z.capacity()+W.p.capacity())*sizeof(double);
+}
+
+// M4B live physical pressure MatShell. PETSc owns Krylov vectors and GAMG only;
+// B/B^T/rAU arithmetic is custom C++ FP64 with peer-only MPI communication.
+struct CustomFactoredPressureContext {
+  CustomPressureBPlan *B=nullptr;
+  const CustomMomentumCSR *M=nullptr;
+  std::vector<double> xOwned,yOwned;
+};
+
+static PetscErrorCode customFactoredPressureMult(Mat A,Vec x,Vec y) {
+  PetscFunctionBeginUser;
+  CustomFactoredPressureContext *C=nullptr; PetscCall(MatShellGetContext(A,&C));
+  if(!C || !C->B || !C->M) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4B custom factored pressure context is incomplete");
+  PetscCall(customVecOwnedRange(x,C->B->pressureHalo.start,C->B->pressureHalo.end,C->xOwned));
+  PetscCall(customPressureSchurApply(*C->B,*C->M,C->xOwned,C->yOwned));
+  PetscCall(customVecWriteOwnedRange(y,C->B->pressureHalo.start,C->B->pressureHalo.end,C->yOwned));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode createCustomFactoredPressure(CustomPressureBPlan& B,const CustomMomentumCSR& M,Vec pressureTemplate,
+  CustomFactoredPressureContext& C,Mat *A) {
+  PetscFunctionBeginUser;
+  C.B=&B; C.M=&M;
+  PetscInt plocal=0,pglobal=0; PetscCall(VecGetLocalSize(pressureTemplate,&plocal)); PetscCall(VecGetSize(pressureTemplate,&pglobal));
+  PetscCall(MatCreateShell(PETSC_COMM_WORLD,plocal,plocal,pglobal,pglobal,&C,A));
+  PetscCall(MatShellSetOperation(*A,MATOP_MULT,(void(*)(void))customFactoredPressureMult));
+  PetscCall(MatSetOption(*A,MAT_SYMMETRIC,PETSC_TRUE));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customPressureSchurParity(Mat factored,const Discrete& D,CustomPressureBPlan& P,const CustomMomentumCSR& M,double tol) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr; PetscCall(VecDuplicate(D.volumes,&x)); PetscCall(VecDuplicate(D.volumes,&y)); PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(x,&s,&e));
+  { PetscScalar *a=nullptr; PetscCall(VecGetArray(x,&a)); for(PetscInt i=0;i<e-s;++i){const double g=(double)(s+i+1);a[i]=(PetscScalar)(std::sin(0.001013*g)+0.31*std::cos(0.000617*g));} PetscCall(VecRestoreArray(x,&a)); }
+  PetscCall(customVecOwnedRange(x,s,e,P.pOwned)); PetscCall(customPressureSchurApply(P,M,P.pOwned,P.pressureWork)); PetscCall(MatMult(factored,x,y)); CustomPressureParityNorm n; PetscCall(customPressureCompareOwned(P.pressureWork,y,n));
+  const bool ok=n.rel<=tol; PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4A_SCHUR_PARITY SRel=%.3e SMaxAbs=%.3e tol=%.3e arithmetic=custom_FP64_B_rAU_Bt reference=PETSc_PetscScalar_factored status=%s\n",n.rel,n.maxAbs,tol,ok?"PASS":"CHECK"));
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y)); if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4A custom factored Schur parity failed"); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customPressureLiveSchurParity(Mat explicitRef,const Discrete& D,CustomPressureBPlan& P,const CustomMomentumCSR& M,double tol) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr; PetscCall(VecDuplicate(D.volumes,&x)); PetscCall(VecDuplicate(D.volumes,&y)); PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(x,&s,&e));
+  { PetscScalar *a=nullptr; PetscCall(VecGetArray(x,&a)); for(PetscInt i=0;i<e-s;++i){const double g=(double)(s+i+1);a[i]=(PetscScalar)(std::sin(0.001013*g)+0.31*std::cos(0.000617*g));} PetscCall(VecRestoreArray(x,&a)); }
+  PetscCall(customVecOwnedRange(x,s,e,P.pOwned)); PetscCall(customPressureSchurApply(P,M,P.pOwned,P.pressureWork)); PetscCall(MatMult(explicitRef,x,y)); CustomPressureParityNorm n; PetscCall(customPressureCompareOwned(P.pressureWork,y,n));
+  const bool ok=n.rel<=tol; PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_LIVE_SCHUR_PARITY SRel=%.3e SMaxAbs=%.3e tol=%.3e live=custom_FP64_B_rAU_Bt reference=explicit_FP64_Pmat_snapshot status=%s\n",n.rel,n.maxAbs,tol,ok?"PASS":"CHECK"));
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y)); if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M4B live custom pressure operator parity failed"); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumLoadFromPetsc(Mat M,const CustomMomentumCSR& A,std::vector<double>& vals) {
+  PetscFunctionBeginUser;
+  if(A.colGid.empty() && A.rowPtr.back()>0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M1 colGid was released after setup; PETSc matrix-value shadow loading is setup-only");
+  if(vals.size()!=A.colGid.size()) vals.assign(A.colGid.size(),0.0); else std::fill(vals.begin(),vals.end(),0.0);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    const PetscInt row=A.rstart+i; PetscInt ncols=0; const PetscInt *cols=nullptr; const PetscScalar *mv=nullptr;
+    PetscCall(MatGetRow(M,row,&ncols,&cols,&mv));
+    const PetscInt b=A.rowPtr[(std::size_t)i],e=A.rowPtr[(std::size_t)i+1];
+    for(PetscInt k=0;k<ncols;++k) {
+      auto it=std::lower_bound(A.colGid.begin()+b,A.colGid.begin()+e,cols[k]);
+      if(it==A.colGid.begin()+e || *it!=cols[k]) {
+        PetscCall(MatRestoreRow(M,row,&ncols,&cols,&mv));
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"PETSc momentum matrix contains a column absent from custom owned-row topology");
+      }
+      vals[(std::size_t)(it-A.colGid.begin())]=(double)PetscRealPart(mv[k]);
+    }
+    PetscCall(MatRestoreRow(M,row,&ncols,&cols,&mv));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumExchange(CustomMomentumCSR& A,const std::vector<double>& xOwned) {
+  PetscFunctionBeginUser;
+  if((PetscInt)xOwned.size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum owned vector size mismatch");
+  for(std::size_t k=0;k<A.reqRecvLocalOffset.size();++k) A.exchangeSend[k]=xOwned[(std::size_t)A.reqRecvLocalOffset[k]];
+  // Reverse the one-time GID request traffic with peer-only value messages.
+  // No per-iteration all-to-all is used: receive only from ranks that own our
+  // ghosts and send only to ranks that actually requested one of our values.
+  int nr=0; PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD,&nr)); int q=0; constexpr int tag=48173;
+  for(int r=0;r<nr;++r) if(A.reqSendCounts[(std::size_t)r]>0)
+    PetscCallMPI(MPI_Irecv(A.ghostValues.data()+A.reqSendDispls[(std::size_t)r],A.reqSendCounts[(std::size_t)r],MPI_DOUBLE,r,tag,PETSC_COMM_WORLD,&A.exchangeRequests[(std::size_t)q++]));
+  for(int r=0;r<nr;++r) if(A.reqRecvCounts[(std::size_t)r]>0)
+    PetscCallMPI(MPI_Isend(A.exchangeSend.data()+A.reqRecvDispls[(std::size_t)r],A.reqRecvCounts[(std::size_t)r],MPI_DOUBLE,r,tag,PETSC_COMM_WORLD,&A.exchangeRequests[(std::size_t)q++]));
+  if(q!=(int)A.exchangeRequests.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom momentum peer request count changed unexpectedly");
+  if(q>0) PetscCallMPI(MPI_Waitall(q,A.exchangeRequests.data(),MPI_STATUSES_IGNORE));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumVecOwned(Vec v,const CustomMomentumCSR& A,std::vector<double>& out);
+
+
+static PetscInt customMomentumLocalIndex(const CustomMomentumCSR& A,PetscInt gid) {
+  if(gid>=A.rstart && gid<A.rend) return gid-A.rstart;
+  auto it=std::lower_bound(A.ghostGid.begin(),A.ghostGid.end(),gid);
+  if(it==A.ghostGid.end() || *it!=gid) return -1;
+  return A.nOwned+(PetscInt)(it-A.ghostGid.begin());
+}
+
+static PetscErrorCode customMomentumGatherVelocity(CustomMomentumCSR& A,Vec U[3]) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) {
+    PetscCall(customMomentumVecOwned(U[d],A,A.fieldOwned[d]));
+    PetscCall(customMomentumExchange(A,A.fieldOwned[d]));
+    A.fieldGhost[d]=A.ghostValues;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumGatherVelocityNative(CustomMomentumCSR& A,const std::array<std::vector<double>,3>& U) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) {
+    if((PetscInt)U[(std::size_t)d].size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B native velocity size mismatch");
+    A.fieldOwned[(std::size_t)d]=U[(std::size_t)d];
+    PetscCall(customMomentumExchange(A,A.fieldOwned[(std::size_t)d]));
+    A.fieldGhost[(std::size_t)d]=A.ghostValues;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static inline double customMomentumFieldValue(const CustomMomentumCSR& A,int d,PetscInt li) {
+  return (li<A.nOwned)?A.fieldOwned[d][(std::size_t)li]:A.fieldGhost[d][(std::size_t)(li-A.nOwned)];
+}
+
+struct CustomDynamicAssemblyPlan;
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale);
+
+static PetscErrorCode customMomentumResetPhysical(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double nu,PetscBool legacyReference) {
+  PetscFunctionBeginUser;
+  // Gate-only legacy reference retains cached nu*K. Production M2 rebuilds nu*K
+  // directly into the sole active CSR values from the compact reference tensor.
+  if(legacyReference) {
+    if(A.kNu.size()!=A.aRel.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 legacy reference missing cached kNu");
+    A.aRel=A.kNu;
+  } else PetscCall(assembleStaticDiffusionCustom(P,A,nu));
+  for(int d=0;d<3;++d) { std::fill(A.convRhs[d].begin(),A.convRhs[d].end(),0.0); std::fill(A.supgRhs[d].begin(),A.supgRhs[d].end(),0.0); std::fill(A.mixlenRhs[d].begin(),A.mixlenRhs[d].end(),0.0); }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+static PetscErrorCode buildCellBlockJacobiPlan(const Mesh& M,const Discrete& D,int rank,
+  const CustomMomentumCSR& A,CellBlockJacobiPlan& P) {
+  PetscFunctionBeginUser;
+  (void)rank;
+  if(P.built) PetscFunctionReturn(PETSC_SUCCESS);
+  const PetscInt nv=(PetscInt)M.points.size();
+  const int nr=(int)D.velCount.size();
+  std::vector<PetscInt> off(D.velCount.size()+1,0);
+  for(std::size_t r=0;r<D.velCount.size();++r) off[r+1]=off[r]+D.velCount[r];
+
+  std::unordered_map<PetscInt,PetscInt> ghostIndex;
+  ghostIndex.reserve(A.ghostGid.size()*2+1);
+  for(PetscInt i=0;i<(PetscInt)A.ghostGid.size();++i) ghostIndex.emplace(A.ghostGid[(std::size_t)i],i);
+  std::vector<std::vector<PetscInt>> rows(A.ghostGid.size());
+  std::vector<std::vector<PetscInt>> ownedRows((std::size_t)A.nOwned);
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    PetscInt ent[8],gid[8];
+    for(int i=0;i<4;++i) ent[i]=M.tets[(std::size_t)c][i];
+    for(int i=0;i<4;++i) ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int i=0;i<8;++i) gid[i]=D.g2free[(std::size_t)ent[i]];
+    for(int a=0;a<8;++a) if(gid[a]>=0) {
+      if(gid[a]>=A.rstart && gid[a]<A.rend) {
+        auto& rr=ownedRows[(std::size_t)(gid[a]-A.rstart)];
+        for(int b=0;b<8;++b) if(gid[b]>=0) rr.push_back(gid[b]);
+      }
+      auto it=ghostIndex.find(gid[a]);
+      if(it==ghostIndex.end()) continue;
+      auto& rr=rows[(std::size_t)it->second];
+      for(int b=0;b<8;++b) if(gid[b]>=0) rr.push_back(gid[b]);
+    }
+  }
+
+  // FIX2: materialize the sparse OWNED-row principal lookup before M1 releases
+  // A.colGid.  Runtime then uses only these retained columns plus permanent
+  // indices into A.aRel, preserving M1 memory hygiene without a dangling
+  // dependency on the released full CSR column array.
+  P.ownedRowPtr.assign((std::size_t)A.nOwned+1,0);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    auto& rr=ownedRows[(std::size_t)i];
+    std::sort(rr.begin(),rr.end()); rr.erase(std::unique(rr.begin(),rr.end()),rr.end());
+    const PetscInt row=A.rstart+i;
+    if(!std::binary_search(rr.begin(),rr.end(),row))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi owned row topology is missing diagonal");
+    P.ownedRowPtr[(std::size_t)i+1]=P.ownedRowPtr[(std::size_t)i]+(PetscInt)rr.size();
+  }
+  P.ownedRowColGid.resize((std::size_t)P.ownedRowPtr.back());
+  P.ownedRowValuePos.resize((std::size_t)P.ownedRowPtr.back(),-1);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    PetscInt q=P.ownedRowPtr[(std::size_t)i];
+    const PetscInt b=A.rowPtr[(std::size_t)i],e=A.rowPtr[(std::size_t)i+1];
+    for(PetscInt col:ownedRows[(std::size_t)i]) {
+      auto it=std::lower_bound(A.colGid.begin()+b,A.colGid.begin()+e,col);
+      if(it==A.colGid.begin()+e || *it!=col)
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi owned principal entry is absent from assembled CSR");
+      P.ownedRowColGid[(std::size_t)q]=col;
+      P.ownedRowValuePos[(std::size_t)q]=(PetscInt)(it-A.colGid.begin());
+      ++q;
+    }
+  }
+  std::vector<std::vector<PetscInt>>().swap(ownedRows);
+
+  P.ghostRowPtr.assign(A.ghostGid.size()+1,0);
+  for(PetscInt i=0;i<(PetscInt)A.ghostGid.size();++i) {
+    auto& rr=rows[(std::size_t)i];
+    std::sort(rr.begin(),rr.end()); rr.erase(std::unique(rr.begin(),rr.end()),rr.end());
+    if(!std::binary_search(rr.begin(),rr.end(),A.ghostGid[(std::size_t)i]))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi ghost row topology is missing diagonal");
+    P.ghostRowPtr[(std::size_t)i+1]=P.ghostRowPtr[(std::size_t)i]+(PetscInt)rr.size();
+  }
+  P.ghostRowColGid.resize((std::size_t)P.ghostRowPtr.back());
+  for(PetscInt i=0;i<(PetscInt)A.ghostGid.size();++i) {
+    PetscInt q=P.ghostRowPtr[(std::size_t)i];
+    for(PetscInt g:rows[(std::size_t)i]) P.ghostRowColGid[(std::size_t)q++]=g;
+  }
+  P.ghostRowValues.assign(P.ghostRowColGid.size(),0.0);
+
+  // -------------------------------------------------------------------------
+  // Build an exact sparse value-request halo.
+  //
+  // FIX1: the original port counted only the principal-block entries needed on
+  // the receiver, but packed each sender's COMPLETE CSR row.  Those counts are
+  // different whenever an assembled row has couplings outside the requesting
+  // tetrahedron, hence the setup-time "ghost row value-count mismatch".
+  //
+  // Instead exchange requested (rowGid,colGid) PAIRS once.  The row owner maps
+  // each pair to an exact owned CSR slot.  Runtime refresh then communicates
+  // one double per requested pair, so sender/receiver counts are identical by
+  // construction and no unnecessary row entries cross MPI.
+  // -------------------------------------------------------------------------
+  P.recvCounts.assign((std::size_t)nr,0); // values this rank requests FROM each owner
+  P.sendCounts.assign((std::size_t)nr,0); // values this rank must send TO each peer
+  for(PetscInt gi=0;gi<(PetscInt)A.ghostGid.size();++gi) {
+    const PetscInt row=A.ghostGid[(std::size_t)gi];
+    const int owner=customMomentumOwnerOfGid(off,row);
+    if(owner<0 || owner>=nr) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi ghost row has invalid owner");
+    const PetscInt len=P.ghostRowPtr[(std::size_t)gi+1]-P.ghostRowPtr[(std::size_t)gi];
+    if(len>INT_MAX-P.recvCounts[(std::size_t)owner]) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"cell-block Jacobi recv count overflow");
+    P.recvCounts[(std::size_t)owner]+=(int)len;
+  }
+  PetscCallMPI(MPI_Alltoall(P.recvCounts.data(),1,MPI_INT,P.sendCounts.data(),1,MPI_INT,PETSC_COMM_WORLD));
+
+  P.sendDispls.assign((std::size_t)nr,0); P.recvDispls.assign((std::size_t)nr,0);
+  for(int r=1;r<nr;++r) {
+    P.sendDispls[(std::size_t)r]=P.sendDispls[(std::size_t)r-1]+P.sendCounts[(std::size_t)r-1];
+    P.recvDispls[(std::size_t)r]=P.recvDispls[(std::size_t)r-1]+P.recvCounts[(std::size_t)r-1];
+  }
+  int nsend=0,nrecv=0; for(int v:P.sendCounts) nsend+=v; for(int v:P.recvCounts) nrecv+=v;
+  if((std::size_t)nrecv!=P.ghostRowValues.size())
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse request count does not match ghost-row storage");
+
+  // Requests leaving this rank are grouped by owner.  recvDest preserves where
+  // the returned packed value belongs in ghostRowValues.
+  std::vector<PetscInt> requestPairsOut((std::size_t)2*nrecv,-1);
+  P.recvDest.assign((std::size_t)nrecv,-1);
+  std::vector<int> cursor=P.recvDispls;
+  for(PetscInt gi=0;gi<(PetscInt)A.ghostGid.size();++gi) {
+    const PetscInt row=A.ghostGid[(std::size_t)gi];
+    const int owner=customMomentumOwnerOfGid(off,row);
+    for(PetscInt k=P.ghostRowPtr[(std::size_t)gi];k<P.ghostRowPtr[(std::size_t)gi+1];++k) {
+      const int slot=cursor[(std::size_t)owner]++;
+      requestPairsOut[(std::size_t)2*slot]=row;
+      requestPairsOut[(std::size_t)2*slot+1]=P.ghostRowColGid[(std::size_t)k];
+      P.recvDest[(std::size_t)slot]=k;
+    }
+  }
+  for(int r=0;r<nr;++r) if(cursor[(std::size_t)r]!=P.recvDispls[(std::size_t)r]+P.recvCounts[(std::size_t)r])
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse request packing mismatch");
+
+  std::vector<int> pairSendCounts((std::size_t)nr,0),pairSendDispls((std::size_t)nr,0),pairRecvCounts((std::size_t)nr,0),pairRecvDispls((std::size_t)nr,0);
+  for(int r=0;r<nr;++r) {
+    if(P.recvCounts[(std::size_t)r]>INT_MAX/2 || P.sendCounts[(std::size_t)r]>INT_MAX/2)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"cell-block Jacobi request-pair count overflow");
+    pairSendCounts[(std::size_t)r]=2*P.recvCounts[(std::size_t)r];
+    pairRecvCounts[(std::size_t)r]=2*P.sendCounts[(std::size_t)r];
+    pairSendDispls[(std::size_t)r]=2*P.recvDispls[(std::size_t)r];
+    pairRecvDispls[(std::size_t)r]=2*P.sendDispls[(std::size_t)r];
+  }
+  std::vector<PetscInt> requestPairsIn((std::size_t)2*nsend,-1);
+  PetscCallMPI(MPI_Alltoallv(requestPairsOut.empty()?nullptr:requestPairsOut.data(),pairSendCounts.data(),pairSendDispls.data(),MPIU_INT,
+                             requestPairsIn.empty()?nullptr:requestPairsIn.data(),pairRecvCounts.data(),pairRecvDispls.data(),MPIU_INT,PETSC_COMM_WORLD));
+
+  // Map every request received from a peer to one exact position in the owned
+  // assembled relaxed CSR.  This mapping is topology-only and reused forever.
+  P.sendValuePos.assign((std::size_t)nsend,-1);
+  for(int q=0;q<nsend;++q) {
+    const PetscInt row=requestPairsIn[(std::size_t)2*q],col=requestPairsIn[(std::size_t)2*q+1];
+    if(row<A.rstart || row>=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi peer requested a non-owned row");
+    const PetscInt i=row-A.rstart,b=A.rowPtr[(std::size_t)i],e=A.rowPtr[(std::size_t)i+1];
+    auto it=std::lower_bound(A.colGid.begin()+b,A.colGid.begin()+e,col);
+    if(it==A.colGid.begin()+e || *it!=col)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi requested principal entry is absent from owned CSR");
+    P.sendValuePos[(std::size_t)q]=(PetscInt)(it-A.colGid.begin());
+  }
+
+  P.sendValues.assign((std::size_t)nsend,0.0);
+  P.recvPackedValues.assign((std::size_t)nrecv,0.0);
+  P.exchangedValuesPerRefresh=(unsigned long long)nsend+(unsigned long long)nrecv;
+
+  P.ownedMultiplicity.assign((std::size_t)A.nOwned,0);
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    PetscInt ent[8],gid[8]; bool hit=false;
+    for(int i=0;i<4;++i) ent[i]=M.tets[(std::size_t)c][i];
+    for(int i=0;i<4;++i) ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int i=0;i<8;++i) { gid[i]=D.g2free[(std::size_t)ent[i]]; if(gid[i]>=A.rstart && gid[i]<A.rend) hit=true; }
+    if(!hit) continue;
+    P.supportCells.push_back(c);
+    for(int a=0;a<8;++a) if(gid[a]>=A.rstart && gid[a]<A.rend) ++P.ownedMultiplicity[(std::size_t)(gid[a]-A.rstart)];
+  }
+  for(PetscInt i=0;i<A.nOwned;++i) if(P.ownedMultiplicity[(std::size_t)i]<=0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi owned row has zero incident-cell multiplicity");
+
+  unsigned long long ls=(unsigned long long)P.supportCells.size(),gs=0,lgr=(unsigned long long)A.ghostGid.size(),ggr=0;
+  unsigned long long lgn=(unsigned long long)P.ghostRowValues.size(),ggn=0,lex=P.exchangedValuesPerRefresh,gex=0;
+  unsigned long long lop=(unsigned long long)P.ownedRowValuePos.size(),gop=0;
+  PetscCallMPI(MPI_Allreduce(&ls,&gs,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lgr,&ggr,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lgn,&ggn,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lex,&gex,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lop,&gop,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  P.built=PETSC_TRUE;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_RAU_CELL_BLOCK_PLAN status=PASS mode=global_principal_tet_inverse_diag supportCellsSummed=%llu ownedPrincipalEntriesSummed=%llu ghostRowsSummed=%llu ghostPrincipalEntriesSummed=%llu exchangedValuesSummedPerRefresh=%llu exchangedMiBSummedPerRefresh=%.6f halo=sparse_requested_row_col_pairs ownedLookup=retained_sparse_col_and_aRel_position survives_M1_colGid_release=1 aggregation=mean_incident_cell_inverse_diagonal diagonalSanity=exact_for_global_diagonal_Arel\n",
+    gs,gop,ggr,ggn,gex,(double)gex*sizeof(double)/(1024.0*1024.0)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode exchangeCellBlockGhostRows(const CustomMomentumCSR& A,CellBlockJacobiPlan& P) {
+  PetscFunctionBeginUser;
+  if(!P.built) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONGSTATE,"cell-block Jacobi plan is not built");
+  if(P.sendValuePos.size()!=P.sendValues.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse send map size mismatch");
+  if(P.recvDest.size()!=P.recvPackedValues.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse receive map size mismatch");
+  for(std::size_t q=0;q<P.sendValuePos.size();++q) {
+    const PetscInt k=P.sendValuePos[q];
+    if(k<0 || (std::size_t)k>=A.aRel.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse send CSR position out of range");
+    P.sendValues[q]=A.aRel[(std::size_t)k];
+  }
+  PetscCallMPI(MPI_Alltoallv(P.sendValues.empty()?nullptr:P.sendValues.data(),P.sendCounts.data(),P.sendDispls.data(),MPI_DOUBLE,
+                              P.recvPackedValues.empty()?nullptr:P.recvPackedValues.data(),P.recvCounts.data(),P.recvDispls.data(),MPI_DOUBLE,PETSC_COMM_WORLD));
+  for(std::size_t q=0;q<P.recvDest.size();++q) {
+    const PetscInt k=P.recvDest[q];
+    if(k<0 || (std::size_t)k>=P.ghostRowValues.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi sparse receive destination out of range");
+    P.ghostRowValues[(std::size_t)k]=P.recvPackedValues[q];
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static double cellBlockJacobiEntry(const CustomMomentumCSR& A,const CellBlockJacobiPlan& P,PetscInt rowGid,PetscInt colGid) {
+  if(rowGid>=A.rstart && rowGid<A.rend) {
+    const PetscInt i=rowGid-A.rstart,b=P.ownedRowPtr[(std::size_t)i],e=P.ownedRowPtr[(std::size_t)i+1];
+    auto it=std::lower_bound(P.ownedRowColGid.begin()+b,P.ownedRowColGid.begin()+e,colGid);
+    if(it==P.ownedRowColGid.begin()+e || *it!=colGid) throw std::runtime_error("cell-block Jacobi owned principal entry missing from retained sparse topology");
+    const PetscInt q=(PetscInt)(it-P.ownedRowColGid.begin());
+    const PetscInt pos=P.ownedRowValuePos[(std::size_t)q];
+    if(pos<0 || (std::size_t)pos>=A.aRel.size()) throw std::runtime_error("cell-block Jacobi owned principal CSR position out of range");
+    return A.aRel[(std::size_t)pos];
+  }
+  auto git=std::lower_bound(A.ghostGid.begin(),A.ghostGid.end(),rowGid);
+  if(git==A.ghostGid.end() || *git!=rowGid) throw std::runtime_error("cell-block Jacobi principal row is neither owned nor in ghost-row halo");
+  const PetscInt gi=(PetscInt)(git-A.ghostGid.begin()),b=P.ghostRowPtr[(std::size_t)gi],e=P.ghostRowPtr[(std::size_t)gi+1];
+  auto it=std::lower_bound(P.ghostRowColGid.begin()+b,P.ghostRowColGid.begin()+e,colGid);
+  if(it==P.ghostRowColGid.begin()+e || *it!=colGid) throw std::runtime_error("cell-block Jacobi ghost principal entry missing from reconstructed CSR");
+  return P.ghostRowValues[(std::size_t)(it-P.ghostRowColGid.begin())];
+}
+
+static bool invertDenseCellBlock(int n,const double *a,double *inv,double pivotTol,double& minPivotRel) {
+  double m[64]={0.0};
+  double scale=0.0;
+  for(int i=0;i<n*n;++i) { m[i]=a[i]; scale=std::max(scale,std::abs(a[i])); inv[i]=0.0; }
+  for(int i=0;i<n;++i) inv[i*n+i]=1.0;
+  if(!(scale>0.0) || !std::isfinite(scale)) return false;
+  minPivotRel=std::numeric_limits<double>::infinity();
+  for(int k=0;k<n;++k) {
+    int piv=k; double pv=std::abs(m[k*n+k]);
+    for(int i=k+1;i<n;++i) if(std::abs(m[i*n+k])>pv) { pv=std::abs(m[i*n+k]); piv=i; }
+    minPivotRel=std::min(minPivotRel,pv/scale);
+    if(!std::isfinite(pv) || pv<=pivotTol*scale) return false;
+    if(piv!=k) for(int j=0;j<n;++j) { std::swap(m[k*n+j],m[piv*n+j]); std::swap(inv[k*n+j],inv[piv*n+j]); }
+    const double d=m[k*n+k];
+    for(int j=0;j<n;++j) { m[k*n+j]/=d; inv[k*n+j]/=d; }
+    for(int i=0;i<n;++i) if(i!=k) {
+      const double f=m[i*n+k]; if(f==0.0) continue;
+      for(int j=0;j<n;++j) { m[i*n+j]-=f*m[k*n+j]; inv[i*n+j]-=f*inv[k*n+j]; }
+    }
+  }
+  return true;
+}
+
+static PetscErrorCode updateRauCellBlockDiag(const Mesh& M,const Discrete& D,CustomMomentumCSR& A,
+  CellBlockJacobiPlan& P,double rauScale,double blockBlend,double ratioMin,double ratioMax,double pivotTol,
+  const std::string& blockFallback,PetscInt simpleIt) {
+  PetscFunctionBeginUser;
+  PetscCall(exchangeCellBlockGhostRows(A,P));
+  const PetscInt nv=(PetscInt)M.points.size();
+  std::vector<double> sum((std::size_t)A.nOwned,0.0);
+  std::vector<PetscInt> cnt((std::size_t)A.nOwned,0);
+  unsigned long long localBlocks=0,localBlockFallbacks=0,localDiagFallbacks=0;
+  double localPivotMin=1.0,localBaseMin=std::numeric_limits<double>::infinity(),localBaseMax=0.0,localBaseSum=0.0;
+  double localRawRatioMin=std::numeric_limits<double>::infinity(),localRawRatioMax=0.0,localRawRatioSum=0.0;
+  double localUsedRatioMin=std::numeric_limits<double>::infinity(),localUsedRatioMax=0.0,localUsedRatioSum=0.0;
+  for(PetscInt c:P.supportCells) {
+    PetscInt ent[8],gid[8]; int n=0;
+    for(int i=0;i<4;++i) ent[i]=M.tets[(std::size_t)c][i];
+    for(int i=0;i<4;++i) ent[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int i=0;i<8;++i) { const PetscInt g=D.g2free[(std::size_t)ent[i]]; if(g>=0) gid[n++]=g; }
+    if(n<=0) continue;
+    double b[64]={0.0},bi[64]={0.0};
+    try {
+      for(int a=0;a<n;++a) for(int q=0;q<n;++q) b[a*n+q]=cellBlockJacobiEntry(A,P,gid[a],gid[q]);
+    } catch(const std::exception& e) { SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,e.what()); }
+    double piv=1.0; const bool ok=invertDenseCellBlock(n,b,bi,pivotTol,piv); ++localBlocks; localPivotMin=std::min(localPivotMin,piv);
+    if(!ok) {
+      ++localBlockFallbacks;
+      if(blockFallback=="error") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"cell-block Jacobi principal block failed pivot test with fallback=error");
+    }
+    for(int a=0;a<n;++a) if(gid[a]>=A.rstart && gid[a]<A.rend) {
+      const PetscInt li=gid[a]-A.rstart;
+      double v=ok?bi[a*n+a]:std::numeric_limits<double>::quiet_NaN();
+      if(!(v>0.0) || !std::isfinite(v)) {
+        if(blockFallback=="error") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"cell-block Jacobi inverse diagonal is nonpositive/nonfinite with fallback=error");
+        v=1.0/A.relaxedDiag[(std::size_t)li]; ++localDiagFallbacks;
+      }
+      sum[(std::size_t)li]+=v; ++cnt[(std::size_t)li];
+    }
+  }
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    if(cnt[(std::size_t)i]!=P.ownedMultiplicity[(std::size_t)i] || cnt[(std::size_t)i]<=0)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"cell-block Jacobi incident-cell accumulation mismatch");
+    const double rawBase=sum[(std::size_t)i]/(double)cnt[(std::size_t)i];
+    if(!(rawBase>0.0) || !std::isfinite(rawBase))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"cell-block Jacobi produced invalid mean inverse diagonal");
+    const double diagBase=1.0/A.relaxedDiag[(std::size_t)i];
+    const double rawRatio=rawBase/diagBase;
+    double clippedRatio=rawRatio;
+    if(ratioMin>0.0) clippedRatio=std::max(clippedRatio,ratioMin);
+    if(ratioMax>0.0) clippedRatio=std::min(clippedRatio,ratioMax);
+    const double blockBase=clippedRatio*diagBase;
+    const double base=(1.0-blockBlend)*diagBase+blockBlend*blockBase;
+    if(!(base>0.0) || !std::isfinite(base))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"cell-block Jacobi blend/clamp produced invalid inverse diagonal");
+    const double usedRatio=base/diagBase;
+    A.rAU[(std::size_t)i]=rauScale*base;
+    A.metric[(std::size_t)i]=1.0/base;
+    localBaseMin=std::min(localBaseMin,base); localBaseMax=std::max(localBaseMax,base); localBaseSum+=base;
+    localRawRatioMin=std::min(localRawRatioMin,rawRatio); localRawRatioMax=std::max(localRawRatioMax,rawRatio); localRawRatioSum+=rawRatio;
+    localUsedRatioMin=std::min(localUsedRatioMin,usedRatio); localUsedRatioMax=std::max(localUsedRatioMax,usedRatio); localUsedRatioSum+=usedRatio;
+  }
+
+  unsigned long long gBlocks=0,gBlockFallbacks=0,gDiagFallbacks=0;
+  PetscCallMPI(MPI_Allreduce(&localBlocks,&gBlocks,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localBlockFallbacks,&gBlockFallbacks,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localDiagFallbacks,&gDiagFallbacks,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  double gPivotMin=0,gBaseMin=0,gBaseMax=0,gBaseSum=0;
+  double gRawRatioMin=0,gRawRatioMax=0,gRawRatioSum=0,gUsedRatioMin=0,gUsedRatioMax=0,gUsedRatioSum=0;
+  PetscCallMPI(MPI_Allreduce(&localPivotMin,&gPivotMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localBaseMin,&gBaseMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localBaseMax,&gBaseMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localBaseSum,&gBaseSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRawRatioMin,&gRawRatioMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRawRatioMax,&gRawRatioMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRawRatioSum,&gRawRatioSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localUsedRatioMin,&gUsedRatioMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localUsedRatioMax,&gUsedRatioMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localUsedRatioSum,&gUsedRatioSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  if(simpleIt<=10 || simpleIt%10==0) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_RAU_CELL_BLOCK it=%" PetscInt_FMT " blocksSummed=%llu blockFallbacks=%llu diagFallbackContribs=%llu minPivotRel=%.3e pivotTol=%.3e baseInvDiag=[%.6e,%.6e,%.6e] rawRatioToDiagInv=[%.6e,%.6e,%.6e] usedRatioToDiagInv=[%.6e,%.6e,%.6e] blockBlend=%.6g ratioClamp=[%.6g,%.6g] fallback=%s rauScale=%.6g semantics=mean_diag_inverse_of_global_relaxed_tet_principal_block_then_optional_ratio_clamp_and_diag_blend\n",
+    simpleIt,gBlocks,gBlockFallbacks,gDiagFallbacks,gPivotMin,pivotTol,gBaseMin,D.ns?gBaseSum/(double)D.ns:0.0,gBaseMax,
+    gRawRatioMin,D.ns?gRawRatioSum/(double)D.ns:0.0,gRawRatioMax,
+    gUsedRatioMin,D.ns?gUsedRatioSum/(double)D.ns:0.0,gUsedRatioMax,
+    blockBlend,ratioMin,ratioMax,blockFallback.c_str(),rauScale));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumFinalizeRelaxation(CustomMomentumCSR& A,
+  const std::string& uRelaxMode,double alphaU,const std::string& simpleVariant,const std::string& rauMode,
+  double simplecBlend,double floorFraction,const std::string& fallback,double rauScale) {
+  PetscFunctionBeginUser;
+  const double relaxFactor=1.0/alphaU-1.0;
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    const PetscInt dpos=A.diagPos[(std::size_t)i];
+    const double d=A.aRel[(std::size_t)dpos]; A.physDiag[(std::size_t)i]=d;
+    double relaxMetric=d;
+    if(uRelaxMode=="row_l1") {
+      relaxMetric=0.0;
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) relaxMetric+=std::abs(A.aRel[(std::size_t)k]);
+    }
+    const double delta=relaxFactor*relaxMetric; A.relaxDelta[(std::size_t)i]=delta;
+    A.aRel[(std::size_t)dpos]+=delta; A.relaxedDiag[(std::size_t)i]=A.aRel[(std::size_t)dpos];
+  }
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    double use=0.0;
+    if(simpleVariant=="simplec") {
+      double raw=0.0; for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) raw+=A.aRel[(std::size_t)k];
+      const double d=A.relaxedDiag[(std::size_t)i], blended=(1.0-simplecBlend)*d+simplecBlend*raw, threshold=floorFraction*d;
+      use=blended;
+      if(!(use>threshold) || !std::isfinite(use)) {
+        if(fallback=="diag") use=d;
+        else if(fallback=="floor") use=std::max(threshold,std::numeric_limits<double>::min());
+        else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"custom SIMPLEC hit fallback=error");
+      }
+    } else if(rauMode=="diag" || rauMode=="cell_block_diag") use=A.relaxedDiag[(std::size_t)i];
+    else if(rauMode=="row_l1") { use=0.0; for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) use+=std::abs(A.aRel[(std::size_t)k]); }
+    else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"unknown custom rAU mode");
+    if(!(use>0.0) || !std::isfinite(use)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"invalid custom momentum correction metric");
+    A.metric[(std::size_t)i]=use; A.rAU[(std::size_t)i]=rauScale/use;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumMatVec(CustomMomentumCSR& A,const std::vector<double>& vals,const std::vector<double>& xOwned,std::vector<double>& yOwned) {
+  PetscFunctionBeginUser;
+  if(vals.size()!=(std::size_t)A.rowPtr.back()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum matrix value size mismatch");
+  PetscCall(customMomentumExchange(A,xOwned));
+  if((PetscInt)yOwned.size()!=A.nOwned) yOwned.resize((std::size_t)A.nOwned);
+  std::fill(yOwned.begin(),yOwned.end(),0.0);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    double s=0.0;
+    for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+      const PetscInt li=A.colLocal[(std::size_t)k];
+      const double x=(li<A.nOwned)?xOwned[(std::size_t)li]:A.ghostValues[(std::size_t)(li-A.nOwned)];
+      s+=vals[(std::size_t)k]*x;
+    }
+    yOwned[(std::size_t)i]=s;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// NODALS_TET_MOMENTUM_BUDGET_20260908
+// Exact algebraic axial-momentum budget on the final converged P1+BF3 state.
+// The window test is P1-only: BF3 test coefficients are identically zero.
+// This is intentional because the physical constant test is represented by
+// the P1 partition of unity, not by summing the enrichment functions.
+static double axialBudgetP1VertexWeight(const Vec3& x,const PipeGeometry& pipe,double z0D,double z1D) {
+  const double zD=(x.z-pipe.zIn)/pipe.D;
+  const double tol=1.0e-10*std::max(1.0,std::max(std::abs(z0D),std::abs(z1D)));
+  if(zD<z0D-tol || zD>z1D+tol) return 0.0;
+  // Half weight on an exactly aligned endpoint plane gives a symmetric
+  // discrete box; the effective wall length is measured from this same test.
+  if(std::abs(zD-z0D)<=tol || std::abs(zD-z1D)<=tol) return 0.5;
+  return 1.0;
+}
+
+static PetscErrorCode buildAxialBudgetP1TestOwned(
+    const Mesh& M,const Discrete& D,const PipeGeometry& pipe,
+    const CustomMomentumCSR& A,double z0D,double z1D,std::vector<double>& wOwned) {
+  PetscFunctionBeginUser;
+  wOwned.assign((std::size_t)A.nOwned,0.0);
+  for(PetscInt v=0;v<(PetscInt)M.points.size();++v) {
+    if((std::size_t)v>=D.g2free.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"axial budget vertex/entity map out of range");
+    const PetscInt gid=D.g2free[(std::size_t)v];
+    if(gid>=A.rstart && gid<A.rend)
+      wOwned[(std::size_t)(gid-A.rstart)]=axialBudgetP1VertexWeight(M.points[(std::size_t)v],pipe,z0D,z1D);
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static double axialBudgetEffectiveWallLengthRoot(
+    const Mesh& M,const ProblemConfig& cfg,double z0D,double z1D) {
+  if(!(cfg.pipe.L>0.0)) return 0.0;
+  double wallArea=0.0,chiArea=0.0;
+  auto addPatch=[&](int pi) {
+    if(pi<0 || pi>=(int)M.patches.size()) return;
+    const auto& P=M.patches[(std::size_t)pi];
+    for(PetscInt f=P.startFace;f<P.startFace+P.nFaces;++f) {
+      const auto& F=M.faces[(std::size_t)f];
+      const double area=triangleArea(M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]);
+      const double c=(axialBudgetP1VertexWeight(M.points[(std::size_t)F.v[0]],cfg.pipe,z0D,z1D)
+                    +axialBudgetP1VertexWeight(M.points[(std::size_t)F.v[1]],cfg.pipe,z0D,z1D)
+                    +axialBudgetP1VertexWeight(M.points[(std::size_t)F.v[2]],cfg.pipe,z0D,z1D))/3.0;
+      wallArea+=area; chiArea+=area*c;
+    }
+  };
+  if(cfg.pipe.wall>=0) addPatch(cfg.pipe.wall);
+  else for(int pi:cfg.boundary.walls) addPatch(pi);
+  if(!(wallArea>0.0)) return 0.0;
+  const double perimeterEquivalent=wallArea/cfg.pipe.L;
+  return chiArea/std::max(perimeterEquivalent,1.0e-300);
+}
+
+static PetscErrorCode printAxialMomentumBudget(
+    const Mesh& M,const Mesh* rootGeometryMesh,const Discrete& D,const ProblemConfig& cfg,int rank,
+    CustomMomentumCSR& A,const std::array<std::vector<double>,3>& U,
+    const std::vector<double>& actionMolecular,
+    const std::vector<double>& actionAfterMix,
+    const std::vector<double>& actionAfterWall,
+    const std::vector<double>& actionAfterConvection,
+    const std::vector<double>& actionFinal,
+    const std::vector<double>& pressureBtZ,
+    PetscBool mixingLength,PetscBool weakWallFunction,PetscBool centralConvection,PetscBool useSupg) {
+  PetscFunctionBeginUser;
+  if((PetscInt)actionFinal.size()!=A.nOwned || (PetscInt)pressureBtZ.size()!=A.nOwned)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"axial momentum budget vector size mismatch");
+  const double windows[3][2]={{12.0,14.0},{14.0,16.0},{16.0,18.0}};
+  std::vector<double> test;
+  for(int wi=0;wi<3;++wi) {
+    const double z0D=windows[wi][0],z1D=windows[wi][1];
+    PetscCall(buildAxialBudgetP1TestOwned(M,D,cfg.pipe,A,z0D,z1D,test));
+    double local[10]={0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+    for(PetscInt i=0;i<A.nOwned;++i) {
+      const double w=test[(std::size_t)i];
+      if(w==0.0) continue;
+      const double molecular=actionMolecular[(std::size_t)i];
+      const double mix=(actionAfterMix[(std::size_t)i]-actionMolecular[(std::size_t)i])
+        -(mixingLength?A.mixlenRhs[2][(std::size_t)i]:0.0);
+      const double wall=(actionAfterWall[(std::size_t)i]-actionAfterMix[(std::size_t)i])
+        -(weakWallFunction?A.wallRhs[2][(std::size_t)i]:0.0);
+      const double conv=(actionAfterConvection[(std::size_t)i]-actionAfterWall[(std::size_t)i])
+        -(centralConvection?A.convRhs[2][(std::size_t)i]:0.0);
+      const double supg=(actionFinal[(std::size_t)i]-actionAfterConvection[(std::size_t)i])
+        -(useSupg?A.supgRhs[2][(std::size_t)i]:0.0);
+      const double base=-D.rhsOwnedFP64[2][(std::size_t)i];
+      const double pressure=-pressureBtZ[(std::size_t)i];
+      const double sum=molecular+mix+wall+conv+supg+base+pressure;
+      const double direct=actionFinal[(std::size_t)i]-D.rhsOwnedFP64[2][(std::size_t)i]
+        -(mixingLength?A.mixlenRhs[2][(std::size_t)i]:0.0)
+        -(weakWallFunction?A.wallRhs[2][(std::size_t)i]:0.0)
+        -(centralConvection?A.convRhs[2][(std::size_t)i]:0.0)
+        -(useSupg?A.supgRhs[2][(std::size_t)i]:0.0)
+        -pressureBtZ[(std::size_t)i];
+      local[0]+=w*molecular;
+      local[1]+=w*mix;
+      local[2]+=w*wall;
+      local[3]+=w*conv;
+      local[4]+=w*supg;
+      local[5]+=w*base;
+      local[6]+=w*pressure;
+      local[7]+=w*sum;
+      local[8]+=w*direct;
+      local[9]+=w;
+    }
+    double global[10]={0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0};
+    PetscCallMPI(MPI_Allreduce(local,global,10,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    double Leff=0.0;
+    if(rank==0) {
+      if(!rootGeometryMesh) SETERRQ(PETSC_COMM_SELF,PETSC_ERR_PLIB,"axial momentum budget missing root geometry mesh");
+      Leff=axialBudgetEffectiveWallLengthRoot(*rootGeometryMesh,cfg,z0D,z1D);
+    }
+    PetscCallMPI(MPI_Bcast(&Leff,1,MPI_DOUBLE,0,PETSC_COMM_WORLD));
+    const double Asec=cfg.pipe.inletArea;
+    const double Ubulk=cfg.pipe.bulkVelocity;
+    const double scale=(Leff>0.0 && Asec>0.0 && Ubulk>0.0)
+      ? 2.0*cfg.pipe.D/(Leff*Asec*Ubulk*Ubulk) : 0.0;
+    const double drive=-global[6];
+    const double resistanceNoPressure=global[0]+global[1]+global[2]+global[3]+global[4]+global[5];
+    const double closure=global[7]-global[8];
+    const double denom=std::max(std::abs(drive),1.0e-300);
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_MOM_BUDGET window=%.0f-%.0fD test=P1_nodal_box_half_endpoints BF3test=zero nominalLengthD=%.6f effectiveLengthD=%.12f "
+      "raw=[pressure=%.12e wall=%.12e molecular=%.12e eddy=%.12e convection=%.12e supg=%.12e baseSourceElim=%.12e resistanceNoPressure=%.12e residualSum=%.12e directResidual=%.12e closure=%.3e] "
+      "fEq=[pressure=%.10f wall=%.10f molecular=%.10f eddy=%.10f convection=%.10f supg=%.10f baseSourceElim=%.10f residual=%.10f] "
+      "shareOfDrive=[wall=%.6f molecular=%.6f eddy=%.6f convection=%.6f supg=%.6f baseSourceElim=%.6f resistance=%.6f] status=%s\n",
+      z0D,z1D,z1D-z0D,Leff/cfg.pipe.D,
+      global[6],global[2],global[0],global[1],global[3],global[4],global[5],resistanceNoPressure,global[7],global[8],closure,
+      scale*global[6],scale*global[2],scale*global[0],scale*global[1],scale*global[3],scale*global[4],scale*global[5],scale*global[8],
+      global[2]/denom,global[0]/denom,global[1]/denom,global[3]/denom,global[4]/denom,global[5]/denom,resistanceNoPressure/denom,
+      std::abs(closure)<=1.0e-10*std::max(1.0,std::abs(global[8]))?"PASS":"CHECK"));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumDerive(CustomMomentumCSR& A,bool centralConvection,bool implicitSupg,
+  const std::string& uRelaxMode,double alphaU,const std::string& simpleVariant,const std::string& rauMode,
+  double simplecBlend,double floorFraction,const std::string& fallback,double rauScale) {
+  PetscFunctionBeginUser;
+  if(A.kNu.size()!=A.aRel.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"legacy custom momentum shadow derive requires persistent kNu and is disabled in M1+M2 production branch");
+  const double relaxFactor=1.0/alphaU-1.0;
+  for(std::size_t k=0;k<A.aPhys.size();++k)
+    A.aPhys[k]=A.kNu[k]+(centralConvection?A.convection[k]:0.0)+(implicitSupg?A.supg[k]:0.0);
+  A.aRel=A.aPhys;
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    const PetscInt dpos=A.diagPos[(std::size_t)i];
+    const double d=A.aPhys[(std::size_t)dpos]; A.physDiag[(std::size_t)i]=d;
+    double relaxMetric=d;
+    if(uRelaxMode=="row_l1") {
+      relaxMetric=0.0;
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) relaxMetric+=std::abs(A.aPhys[(std::size_t)k]);
+    }
+    const double delta=relaxFactor*relaxMetric; A.relaxDelta[(std::size_t)i]=delta;
+    A.aRel[(std::size_t)dpos]+=delta; A.relaxedDiag[(std::size_t)i]=A.aRel[(std::size_t)dpos];
+  }
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    double use=0.0;
+    if(simpleVariant=="simplec") {
+      double raw=0.0; for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) raw+=A.aRel[(std::size_t)k];
+      const double d=A.relaxedDiag[(std::size_t)i]; const double blended=(1.0-simplecBlend)*d+simplecBlend*raw; const double threshold=floorFraction*d;
+      use=blended;
+      if(!(use>threshold) || !std::isfinite(use)) {
+        if(fallback=="diag") use=d;
+        else if(fallback=="floor") use=std::max(threshold,std::numeric_limits<double>::min());
+        else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"custom SIMPLEC shadow hit fallback=error");
+      }
+    } else if(rauMode=="diag" || rauMode=="cell_block_diag") use=A.relaxedDiag[(std::size_t)i];
+    else if(rauMode=="row_l1") {
+      use=0.0; for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) use+=std::abs(A.aRel[(std::size_t)k]);
+    } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"unknown custom shadow rAU mode");
+    if(!(use>0.0) || !std::isfinite(use)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"invalid custom momentum correction metric");
+    A.metric[(std::size_t)i]=use; A.rAU[(std::size_t)i]=rauScale/use;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct CustomParityNorm { double rel=0.0,maxAbs=0.0; };
+
+static PetscErrorCode customMomentumCompareArrays(const std::vector<double>& got,const std::vector<double>& ref,CustomParityNorm& out) {
+  PetscFunctionBeginUser;
+  if(got.size()!=ref.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum comparison size mismatch");
+  double ld2=0.0,lr2=0.0,lmax=0.0;
+  for(std::size_t i=0;i<got.size();++i) { const double d=got[i]-ref[i]; ld2+=d*d; lr2+=ref[i]*ref[i]; lmax=std::max(lmax,std::abs(d)); }
+  double gd2=0.0,gr2=0.0,gmax=0.0;
+  PetscCallMPI(MPI_Allreduce(&ld2,&gd2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lr2,&gr2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lmax,&gmax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  out.rel=std::sqrt(gd2)/std::max(std::sqrt(gr2),1.0e-300); out.maxAbs=gmax;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumVecOwned(Vec v,const CustomMomentumCSR& A,std::vector<double>& out) {
+  PetscFunctionBeginUser;
+  PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(v,&s,&e));
+  if(s!=A.rstart || e!=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum Vec ownership mismatch");
+  const PetscScalar *va=nullptr; PetscCall(VecGetArrayRead(v,&va)); out.resize((std::size_t)A.nOwned);
+  for(PetscInt i=0;i<A.nOwned;++i) out[(std::size_t)i]=(double)PetscRealPart(va[i]);
+  PetscCall(VecRestoreArrayRead(v,&va)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumMatrixParity(Mat M,const CustomMomentumCSR& A,const std::vector<double>& got,CustomParityNorm& out) {
+  PetscFunctionBeginUser;
+  std::vector<double> ref; PetscCall(customMomentumLoadFromPetsc(M,A,ref));
+  PetscCall(customMomentumCompareArrays(got,ref,out)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumVecParity(Vec v,const CustomMomentumCSR& A,const std::vector<double>& got,CustomParityNorm& out) {
+  PetscFunctionBeginUser;
+  std::vector<double> ref; PetscCall(customMomentumVecOwned(v,A,ref));
+  PetscCall(customMomentumCompareArrays(got,ref,out)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumActionParity(Mat M,CustomMomentumCSR& A,const std::vector<double>& vals,CustomParityNorm& out) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr; PetscCall(MatCreateVecs(M,&x,&y));
+  PetscScalar *xa=nullptr; PetscCall(VecGetArray(x,&xa)); std::vector<double> xo((std::size_t)A.nOwned,0.0);
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    const double g=(double)(A.rstart+i+1); const double v=std::sin(0.017*g)+0.37*std::cos(0.031*g);
+    xa[i]=(PetscScalar)v; xo[(std::size_t)i]=v;
+  }
+  PetscCall(VecRestoreArray(x,&xa)); PetscCall(MatMult(M,x,y));
+  std::vector<double> yc,yr; PetscCall(customMomentumMatVec(A,vals,xo,yc)); PetscCall(customMomentumVecOwned(y,A,yr));
+  PetscCall(customMomentumCompareArrays(yc,yr,out)); PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumSymmetricGS(CustomMomentumCSR& A,const std::vector<double>& b,std::vector<double>& x,double omega,PetscInt localSweeps,const std::vector<char>* clamp=nullptr) {
+  PetscFunctionBeginUser;
+  if((PetscInt)b.size()!=A.nOwned || (PetscInt)x.size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom SGS vector size mismatch");
+  if(clamp && (PetscInt)clamp->size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom SGS clamp size mismatch");
+  if(clamp) for(PetscInt i=0;i<A.nOwned;++i) if((*clamp)[(std::size_t)i]) x[(std::size_t)i]=0.0;
+  auto& beff=A.workBeff;
+  if((PetscInt)beff.size()!=A.nOwned) beff.assign((std::size_t)A.nOwned,0.0);
+  // MPIAIJ local-SOR semantics: freeze the off-rank values for this outer SOR
+  // application, form the effective local RHS once, then perform the requested
+  // number of local symmetric sweeps on the owned-owned block.
+  PetscCall(customMomentumExchange(A,x));
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    if(clamp && (*clamp)[(std::size_t)i]) { beff[(std::size_t)i]=0.0; continue; }
+    double v=b[(std::size_t)i];
+    for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+      const PetscInt li=A.colLocal[(std::size_t)k]; if(li>=A.nOwned) v-=A.aRel[(std::size_t)k]*A.ghostValues[(std::size_t)(li-A.nOwned)];
+    }
+    beff[(std::size_t)i]=v;
+  }
+  for(PetscInt sweep=0;sweep<localSweeps;++sweep) {
+    for(PetscInt i=0;i<A.nOwned;++i) {
+      if(clamp && (*clamp)[(std::size_t)i]) { x[(std::size_t)i]=0.0; continue; }
+      const double old=x[(std::size_t)i],diag=A.aRel[(std::size_t)A.diagPos[(std::size_t)i]]; double rhs=beff[(std::size_t)i];
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+        const PetscInt li=A.colLocal[(std::size_t)k]; if(li<A.nOwned && li!=i) rhs-=A.aRel[(std::size_t)k]*x[(std::size_t)li];
+      }
+      x[(std::size_t)i]=(1.0-omega)*old+omega*(rhs/diag);
+    }
+    for(PetscInt ii=A.nOwned;ii>0;--ii) {
+      const PetscInt i=ii-1;
+      if(clamp && (*clamp)[(std::size_t)i]) { x[(std::size_t)i]=0.0; continue; }
+      const double old=x[(std::size_t)i],diag=A.aRel[(std::size_t)A.diagPos[(std::size_t)i]]; double rhs=beff[(std::size_t)i];
+      for(PetscInt k=A.rowPtr[(std::size_t)i];k<A.rowPtr[(std::size_t)i+1];++k) {
+        const PetscInt li=A.colLocal[(std::size_t)k]; if(li<A.nOwned && li!=i) rhs-=A.aRel[(std::size_t)k]*x[(std::size_t)li];
+      }
+      x[(std::size_t)i]=(1.0-omega)*old+omega*(rhs/diag);
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumWriteOwned(Vec v,const CustomMomentumCSR& A,const std::vector<double>& in) {
+  PetscFunctionBeginUser;
+  if((PetscInt)in.size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum write size mismatch");
+  PetscInt s=0,e=0; PetscCall(VecGetOwnershipRange(v,&s,&e));
+  if(s!=A.rstart || e!=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom momentum Vec ownership mismatch on write");
+  PetscScalar *va=nullptr; PetscCall(VecGetArray(v,&va));
+  for(PetscInt i=0;i<A.nOwned;++i) va[i]=(PetscScalar)in[(std::size_t)i];
+  PetscCall(VecRestoreArray(v,&va));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumNorm2(const std::vector<double>& x,double& nrm) {
+  PetscFunctionBeginUser;
+  double local=0.0; for(double v:x) local+=v*v;
+  double global=0.0; PetscCallMPI(MPI_Allreduce(&local,&global,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  nrm=std::sqrt(global); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customGlobalMinMax(const std::vector<double>& v,double& gmin,double& gmax) {
+  PetscFunctionBeginUser;
+  if(v.empty()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B empty native vector in min/max");
+  const double lmin=*std::min_element(v.begin(),v.end()),lmax=*std::max_element(v.begin(),v.end());
+  PetscCallMPI(MPI_Allreduce(&lmin,&gmin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lmax,&gmax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumResidualNorm(CustomMomentumCSR& A,const std::vector<double>& b,const std::vector<double>& x,double& rn,const std::vector<char>* clamp=nullptr) {
+  PetscFunctionBeginUser;
+  if(clamp && (PetscInt)clamp->size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"custom residual clamp size mismatch");
+  PetscCall(customMomentumMatVec(A,A.aRel,x,A.workY));
+  double local=0.0;
+  for(PetscInt i=0;i<A.nOwned;++i) {
+    if(clamp && (*clamp)[(std::size_t)i]) continue;
+    const double r=b[(std::size_t)i]-A.workY[(std::size_t)i]; local+=r*r;
+  }
+  double global=0.0; PetscCallMPI(MPI_Allreduce(&local,&global,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  rn=std::sqrt(global);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode smoothSolveCustomMomentumMPI(CustomMomentumCSR& A,Vec b,Vec x, PetscReal rtol, PetscReal relDrop,
+  PetscInt maxIts, PetscInt checkEvery, PetscReal omega, PetscInt localSweeps, PetscInt *parallelIts, PetscReal *relres) {
+  PetscFunctionBeginUser;
+  PetscCall(customMomentumVecOwned(b,A,A.workB)); PetscCall(customMomentumVecOwned(x,A,A.workX));
+  double bn=0.0,rn=0.0,rnInitial=-1.0; PetscCall(customMomentumNorm2(A.workB,bn));
+  if(!std::isfinite(bn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"custom momentum RHS norm is NaN/Inf before local SGS");
+  if(bn==0.0) bn=1.0;
+
+  if(relDrop>0.0) {
+    PetscCall(customMomentumResidualNorm(A,A.workB,A.workX,rn)); rnInitial=rn;
+    if(!std::isfinite(rnInitial)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"custom momentum initial residual is NaN/Inf");
+    if(rnInitial/bn<rtol) { *parallelIts=0; *relres=(PetscReal)(rnInitial/bn); PetscCall(customMomentumWriteOwned(x,A,A.workX)); PetscFunctionReturn(PETSC_SUCCESS); }
+  }
+
+  PetscInt it=0;
+  while(it<maxIts) {
+    const PetscInt chunk=PetscMin(checkEvery,maxIts-it);
+    // Match MPIAIJ MatSOR semantics: each outer SOR iteration refreshes the
+    // processor-boundary values, then performs localSweeps symmetric GS sweeps.
+    for(PetscInt q=0;q<chunk;++q) PetscCall(customMomentumSymmetricGS(A,A.workB,A.workX,(double)omega,localSweeps));
+    it+=chunk;
+    PetscCall(customMomentumResidualNorm(A,A.workB,A.workX,rn));
+    if(!std::isfinite(rn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"custom momentum local SGS generated NaN/Inf after %" PetscInt_FMT " sweeps",it);
+    if(rn/bn<rtol) break;
+    if(relDrop>0.0 && rnInitial>0.0 && rn<=relDrop*rnInitial) break;
+  }
+  PetscCall(customMomentumWriteOwned(x,A,A.workX));
+  *parallelIts=it; *relres=(PetscReal)(rn/bn);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode smoothSolveCustomMomentumNative(CustomMomentumCSR& A,const std::vector<double>& b,std::vector<double>& x, double rtol,double atol,double relDrop,
+  PetscInt maxIts,PetscInt checkEvery,double omega,PetscInt localSweeps,PetscInt *parallelIts,double *relres,const std::vector<char>* clamp=nullptr) {
+  PetscFunctionBeginUser;
+  if((PetscInt)b.size()!=A.nOwned || (PetscInt)x.size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B native momentum state size mismatch");
+  if(clamp && (PetscInt)clamp->size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B native clamp size mismatch");
+  if(clamp) for(PetscInt i=0;i<A.nOwned;++i) if((*clamp)[(std::size_t)i]) x[(std::size_t)i]=0.0;
+  double bn=0.0,rn=0.0,rnInitial=-1.0; PetscCall(customMomentumNorm2(b,bn));
+  if(!std::isfinite(bn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"M6B native momentum RHS norm NaN/Inf");
+  if(bn==0.0) bn=1.0;
+  PetscCall(customMomentumResidualNorm(A,b,x,rn,clamp)); rnInitial=rn; if(!std::isfinite(rnInitial)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"M6B native initial momentum residual NaN/Inf");
+  const double target=std::max((double)atol,(double)rtol*bn);
+  if(rnInitial<=target){*parallelIts=0;*relres=rnInitial/bn;PetscFunctionReturn(PETSC_SUCCESS);}
+  PetscInt it=0; while(it<maxIts){ const PetscInt chunk=PetscMin(checkEvery,maxIts-it); for(PetscInt q=0;q<chunk;++q) PetscCall(customMomentumSymmetricGS(A,b,x,omega,localSweeps,clamp)); it+=chunk;
+    PetscCall(customMomentumResidualNorm(A,b,x,rn,clamp)); if(!std::isfinite(rn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"M6B native SGS NaN/Inf");
+    if(rn<=target) break; if(relDrop>0.0 && rnInitial>0.0 && rn<=relDrop*rnInitial) break; }
+  *parallelIts=it; *relres=rn/bn; PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumSgsParity(Mat Ar,Vec b,Vec x0,CustomMomentumCSR& A,double omega,PetscInt localSweeps,CustomParityNorm& out) {
+  PetscFunctionBeginUser;
+  Vec xp=nullptr; PetscCall(VecDuplicate(b,&xp)); PetscCall(VecCopy(x0,xp));
+  std::vector<double> bc,xc,xpOwned; PetscCall(customMomentumVecOwned(b,A,bc)); PetscCall(customMomentumVecOwned(x0,A,xc));
+  PetscCall(MatSOR(Ar,b,omega,SOR_LOCAL_SYMMETRIC_SWEEP,0.0,1,localSweeps,xp));
+  PetscCall(customMomentumSymmetricGS(A,bc,xc,omega,localSweeps)); PetscCall(customMomentumVecOwned(xp,A,xpOwned));
+  PetscCall(customMomentumCompareArrays(xc,xpOwned,out)); PetscCall(VecDestroy(&xp)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumShadowGate(PetscInt it,CustomMomentumCSR& A,Mat C,Mat Sg,Mat Aphys,Mat Ar,
+  Vec diag,Vec relaxDiag,Vec relaxedDiag,Vec metric,Vec rAU,bool centralConvection,bool implicitSupg,
+  const std::string& uRelaxMode,double alphaU,const std::string& simpleVariant,const std::string& rauMode,
+  double simplecBlend,double floorFraction,const std::string& fallback,double rauScale,double tol,PetscBool strict) {
+  PetscFunctionBeginUser;
+  if(centralConvection) PetscCall(customMomentumLoadFromPetsc(C,A,A.convection)); else std::fill(A.convection.begin(),A.convection.end(),0.0);
+  if(implicitSupg) PetscCall(customMomentumLoadFromPetsc(Sg,A,A.supg)); else std::fill(A.supg.begin(),A.supg.end(),0.0);
+  PetscCall(customMomentumDerive(A,centralConvection,implicitSupg,uRelaxMode,alphaU,simpleVariant,rauMode,simplecBlend,floorFraction,fallback,rauScale));
+
+  CustomParityNorm ap,ar,act,pd,rd,rdiag,met,rau;
+  PetscCall(customMomentumMatrixParity(Aphys,A,A.aPhys,ap)); PetscCall(customMomentumMatrixParity(Ar,A,A.aRel,ar));
+  PetscCall(customMomentumActionParity(Ar,A,A.aRel,act)); PetscCall(customMomentumVecParity(diag,A,A.physDiag,pd));
+  PetscCall(customMomentumVecParity(relaxDiag,A,A.relaxDelta,rd)); PetscCall(customMomentumVecParity(relaxedDiag,A,A.relaxedDiag,rdiag));
+  if(metric) PetscCall(customMomentumVecParity(metric,A,A.metric,met)); else { met.rel=0.0; met.maxAbs=0.0; }
+  PetscCall(customMomentumVecParity(rAU,A,A.rAU,rau));
+  const double worst=std::max({ap.rel,ar.rel,act.rel,pd.rel,rd.rel,rdiag.rel,met.rel,rau.rel});
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_CUSTOM_MOM_SHADOW it=%" PetscInt_FMT " AphysRel=%.3e ArRel=%.3e actionRel=%.3e physDiagRel=%.3e relaxDeltaRel=%.3e relaxedDiagRel=%.3e metricRel=%.3e rAURel=%.3e maxAbsAction=%.3e tol=%.3e status=%s\n",
+    it,ap.rel,ar.rel,act.rel,pd.rel,rd.rel,rdiag.rel,met.rel,rau.rel,act.maxAbs,tol,worst<=tol?"PASS":"CHECK"));
+  if(strict && worst>tol) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"custom momentum shadow parity exceeded tolerance");
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct CentralCellPlan {
+  PetscInt cell=-1;
+  PetscInt entity[8]={0,0,0,0,0,0,0,0};
+  PetscInt gid[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt localIndex[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt freeBasis[8]={0,0,0,0,0,0,0,0};
+  PetscInt freeGid[8]={0,0,0,0,0,0,0,0};
+  PetscInt nfree=0;
+  double det=0.0;
+  double invJ[3][3]={{0}};
+};
+
+struct CentralAssemblyPlan {
+  std::vector<CentralCellPlan> cells;
+};
+
+static PetscErrorCode buildCentralAssemblyPlan(const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,CentralAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size();
+  P.cells.clear();
+  P.cells.reserve(D.cellCount[rank]);
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) if(D.cellOwner[c]==rank) {
+    CentralCellPlan cp; cp.cell=c;
+    const auto t=M.tets[c];
+    const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};
+    cp.det=det3(J);
+    if(cp.det<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"non-positive tet orientation at cell %" PetscInt_FMT,c);
+    inv3(J,cp.invJ);
+    for(int i=0;i<4;++i) cp.entity[i]=t[i];
+    for(int i=0;i<4;++i) cp.entity[4+i]=nv+M.oppFace[c][i];
+    for(int a=0;a<8;++a) {
+      cp.gid[a]=D.g2free[cp.entity[a]];
+      if(cp.gid[a]>=0) {
+        cp.localIndex[a]=velocityLocalIndex(G,cp.gid[a]);
+        cp.freeBasis[cp.nfree]=a;
+        cp.freeGid[cp.nfree]=cp.gid[a];
+        cp.nfree++;
+      }
+    }
+    P.cells.push_back(cp);
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_CENTRAL_PLAN cachedAffineGeometry=1 cachedEntityMaps=1 ownedCells=%zu tensorQuadrature=collapsed_5x5x5_degree8 matrixInsertion=batched_element_MatSetValues\n",
+    P.cells.size()));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleCentralConvectionFastMPI(const Mesh& M,const Discrete& D,const GhostPlan& G,const CentralAssemblyPlan& P,Vec U[3],Mat C,Vec dirRhs[3]) {
+  PetscFunctionBeginUser;
+  PetscCall(MatZeroEntries(C));
+  for(int d=0;d<3;++d) PetscCall(VecSet(dirRhs[d],0.0));
+  Vec Ul[3]={nullptr,nullptr,nullptr};
+  const PetscScalar* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) {
+    PetscCall(VecGhostUpdateBegin(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostUpdateEnd(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostGetLocalForm(U[d],&Ul[d]));
+    PetscCall(VecGetArrayRead(Ul[d],&ua[d]));
+  }
+  const auto& T=centralTensor();
+  for(const auto& cp:P.cells) {
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(cp.gid[m]>=0) {
+        const PetscInt li=cp.localIndex[m];
+        for(int d=0;d<3;++d) coeff[d][m]=PetscRealPart(ua[d][li]);
+      } else {
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,cp.entity[m]);
+      }
+    }
+    double uref[8][3]={{0}};
+    for(int m=0;m<8;++m)
+      for(int j=0;j<3;++j)
+        for(int d=0;d<3;++d)
+          uref[m][j] += coeff[d][m]*cp.invJ[j][d];
+
+    double Cl[8][8]={{0}};
+    for(int a=0;a<8;++a)
+      for(int b=0;b<8;++b) {
+        double v=0.0;
+        for(int m=0;m<8;++m)
+          for(int j=0;j<3;++j)
+            v += uref[m][j]*T.t[a][m][b][j];
+        Cl[a][b]=cp.det*v;
+      }
+
+    if(cp.nfree>0) {
+      PetscScalar vals[64];
+      for(PetscInt ii=0;ii<cp.nfree;++ii) {
+        const int a=(int)cp.freeBasis[ii];
+        for(PetscInt jj=0;jj<cp.nfree;++jj) {
+          const int b=(int)cp.freeBasis[jj];
+          vals[ii*cp.nfree+jj]=(PetscScalar)Cl[a][b];
+        }
+      }
+      PetscCall(MatSetValues(C,cp.nfree,cp.freeGid,cp.nfree,cp.freeGid,vals,ADD_VALUES));
+
+      for(int d=0;d<3;++d) {
+        PetscScalar rv[8];
+        PetscBool any=PETSC_FALSE;
+        for(PetscInt ii=0;ii<cp.nfree;++ii) {
+          const int a=(int)cp.freeBasis[ii];
+          double v=0.0;
+          for(int b=0;b<8;++b) if(cp.gid[b]<0) {
+            const double ud=entityDirValue(D,d,cp.entity[b]);
+            if(ud!=0.0) v-=Cl[a][b]*ud;
+          }
+          rv[ii]=(PetscScalar)v;
+          if(v!=0.0) any=PETSC_TRUE;
+        }
+        if(any) PetscCall(VecSetValues(dirRhs[d],cp.nfree,cp.freeGid,rv,ADD_VALUES));
+      }
+    }
+  }
+  for(int d=0;d<3;++d) {
+    PetscCall(VecRestoreArrayRead(Ul[d],&ua[d]));
+    PetscCall(VecGhostRestoreLocalForm(U[d],&Ul[d]));
+  }
+  PetscCall(MatAssemblyBegin(C,MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(C,MAT_FINAL_ASSEMBLY));
+  for(int d=0;d<3;++d){PetscCall(VecAssemblyBegin(dirRhs[d]));PetscCall(VecAssemblyEnd(dirRhs[d]));}
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleCentralConvectionMPI(const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,Vec U[3],Mat C,Vec dirRhs[3]) {
+  PetscFunctionBeginUser;
+  PetscCall(MatZeroEntries(C));
+  for(int d=0;d<3;++d) PetscCall(VecSet(dirRhs[d],0.0));
+  Vec Ul[3]={nullptr,nullptr,nullptr};
+  const PetscScalar* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) {
+    PetscCall(VecGhostUpdateBegin(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostUpdateEnd(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostGetLocalForm(U[d],&Ul[d]));
+    PetscCall(VecGetArrayRead(Ul[d],&ua[d]));
+  }
+  const auto& T=centralTensor();
+  const PetscInt nv=(PetscInt)M.points.size();
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) if(D.cellOwner[c]==rank) {
+    const auto t=M.tets[c];
+    const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},invJ[3][3];
+    const double det=det3(J);
+    inv3(J,invJ);
+    PetscInt lg[8];
+    for(int i=0;i<4;++i) lg[i]=t[i];
+    for(int i=0;i<4;++i) lg[4+i]=nv+M.oppFace[c][i];
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      const PetscInt gid=D.g2free[lg[m]];
+      if(gid>=0) {
+        const PetscInt li=velocityLocalIndex(G,gid);
+        for(int d=0;d<3;++d) coeff[d][m]=PetscRealPart(ua[d][li]);
+      } else {
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,lg[m]);
+      }
+    }
+    double uref[8][3]={{0}};
+    for(int m=0;m<8;++m)
+      for(int j=0;j<3;++j)
+        for(int d=0;d<3;++d)
+          uref[m][j] += coeff[d][m]*invJ[j][d];
+
+    double Cl[8][8]={{0}};
+    for(int a=0;a<8;++a)
+      for(int b=0;b<8;++b) {
+        double v=0;
+        for(int m=0;m<8;++m)
+          for(int j=0;j<3;++j)
+            v += uref[m][j]*T.t[a][m][b][j];
+        Cl[a][b]=det*v;
+      }
+
+    for(int a=0;a<8;++a) {
+      const PetscInt ia=D.g2free[lg[a]];
+      if(ia<0) continue;
+      for(int b=0;b<8;++b) {
+        const PetscInt ib=D.g2free[lg[b]];
+        if(ib>=0) PetscCall(MatSetValue(C,ia,ib,Cl[a][b],ADD_VALUES));
+        else for(int d=0;d<3;++d) {
+          const double ud=entityDirValue(D,d,lg[b]);
+          if(ud!=0.0) PetscCall(VecSetValue(dirRhs[d],ia,-Cl[a][b]*ud,ADD_VALUES));
+        }
+      }
+    }
+  }
+  for(int d=0;d<3;++d) {
+    PetscCall(VecRestoreArrayRead(Ul[d],&ua[d]));
+    PetscCall(VecGhostRestoreLocalForm(U[d],&Ul[d]));
+  }
+  PetscCall(MatAssemblyBegin(C,MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(C,MAT_FINAL_ASSEMBLY));
+  for(int d=0;d<3;++d){PetscCall(VecAssemblyBegin(dirRhs[d]));PetscCall(VecAssemblyEnd(dirRhs[d]));}
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+struct SupgStats {
+  PetscReal tauMin=0,tauMean=0,tauMax=0;
+};
+
+static PetscErrorCode assembleSupgLegacyMPI(
+    const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,Vec U[3],
+    const ProblemConfig& P,double tauScale,double supgMagic,Mat Sg,Vec supgRhs[3],SupgStats& stats) {
+  PetscFunctionBeginUser;
+  PetscCall(MatZeroEntries(Sg));
+  for(int d=0;d<3;++d) PetscCall(VecSet(supgRhs[d],0.0));
+
+  Vec Ul[3]={nullptr,nullptr,nullptr};
+  const PetscScalar* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) {
+    PetscCall(VecGhostUpdateBegin(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostUpdateEnd(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostGetLocalForm(U[d],&Ul[d]));
+    PetscCall(VecGetArrayRead(Ul[d],&ua[d]));
+  }
+
+  const auto Q=tetDuffy5();
+  const PetscInt nv=(PetscInt)M.points.size();
+  double localTauMin=1.0e300,localTauMax=0.0,localTauWeighted=0.0,localWeight=0.0;
+
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) if(D.cellOwner[c]==rank) {
+    const auto t=M.tets[c];
+    const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},invJ[3][3];
+    const double det=det3(J);
+    inv3(J,invJ);
+    const double h=tetDiameter(X),h2=h*h;
+    if(!(h2>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"zero tetrahedron diameter in SUPG");
+
+    PetscInt lg[8];
+    for(int i=0;i<4;++i) lg[i]=t[i];
+    for(int i=0;i<4;++i) lg[4+i]=nv+M.oppFace[c][i];
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      const PetscInt gid=D.g2free[lg[m]];
+      if(gid>=0) {
+        const PetscInt li=velocityLocalIndex(G,gid);
+        for(int d=0;d<3;++d) coeff[d][m]=PetscRealPart(ua[d][li]);
+      } else {
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,lg[m]);
+      }
+    }
+
+    double Sl[8][8]={{0}};
+    double Fr[3][8]={{0}};
+    for(const auto& q:Q) {
+      double val[8],grr[8][3],Href[8][3][3];
+      basis(q.lam,val,grr);
+      referenceHessian(q.lam,Href);
+      double gr[8][3]={{0}},lap[8]={0};
+      for(int a=0;a<8;++a) {
+        for(int d=0;d<3;++d) for(int j=0;j<3;++j) gr[a][d]+=grr[a][j]*invJ[j][d];
+        for(int d=0;d<3;++d) for(int r=0;r<3;++r) for(int ss=0;ss<3;++ss)
+          lap[a]+=Href[a][r][ss]*invJ[r][d]*invJ[ss][d];
+      }
+
+      double adv[3]={0,0,0};
+      for(int d=0;d<3;++d) for(int m=0;m<8;++m) adv[d]+=coeff[d][m]*val[m];
+      double speed2=0.0; for(int d=0;d<3;++d) speed2+=adv[d]*adv[d];
+      const double diffusive=4.0*P.nu/h2;
+      const double denominator=std::max(4.0*speed2/h2 + supgMagic*diffusive*diffusive,1.0e-30);
+      const double tau=tauScale/std::sqrt(denominator);
+      const double w=q.w*det;
+      localTauMin=std::min(localTauMin,tau); localTauMax=std::max(localTauMax,tau);
+      localTauWeighted+=tau*w; localWeight+=w;
+
+      double stream[8]={0},strongTrial[8]={0};
+      for(int a=0;a<8;++a) {
+        for(int d=0;d<3;++d) stream[a]+=adv[d]*gr[a][d];
+        strongTrial[a]=-P.nu*lap[a]+stream[a];
+      }
+      double x=0,y=0,z=0;
+      for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;}
+      double ff[3]; problemForcing(P,x,y,z,ff);
+
+      for(int a=0;a<8;++a) {
+        const double tv=tau*stream[a]*w;
+        for(int b=0;b<8;++b) Sl[a][b]+=tv*strongTrial[b];
+        for(int d=0;d<3;++d) Fr[d][a]+=tv*ff[d];
+      }
+    }
+
+    for(int a=0;a<8;++a) {
+      const PetscInt ia=D.g2free[lg[a]];
+      if(ia<0) continue;
+      for(int b=0;b<8;++b) {
+        const PetscInt ib=D.g2free[lg[b]];
+        if(ib>=0) PetscCall(MatSetValue(Sg,ia,ib,Sl[a][b],ADD_VALUES));
+        else for(int d=0;d<3;++d) Fr[d][a]-=Sl[a][b]*entityDirValue(D,d,lg[b]);
+      }
+      for(int d=0;d<3;++d) PetscCall(VecSetValue(supgRhs[d],ia,Fr[d][a],ADD_VALUES));
+    }
+  }
+
+  for(int d=0;d<3;++d) {
+    PetscCall(VecRestoreArrayRead(Ul[d],&ua[d]));
+    PetscCall(VecGhostRestoreLocalForm(U[d],&Ul[d]));
+  }
+  PetscCall(MatAssemblyBegin(Sg,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(Sg,MAT_FINAL_ASSEMBLY));
+  for(int d=0;d<3;++d){PetscCall(VecAssemblyBegin(supgRhs[d]));PetscCall(VecAssemblyEnd(supgRhs[d]));}
+
+  double globalMin=0,globalMax=0,globalTauWeighted=0,globalWeight=0;
+  PetscCallMPI(MPI_Allreduce(&localTauMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauWeighted,&globalTauWeighted,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWeight,&globalWeight,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  stats.tauMin=globalMin; stats.tauMax=globalMax;
+  stats.tauMean=(globalWeight>0)?globalTauWeighted/globalWeight:0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+struct SupgReferencePoint {
+  std::array<double,4> lam{};
+  double w=0.0;
+  double phi[8]={0};
+  double gradRef[8][3]={{0}};
+  double hessRef[8][3][3]={{{0}}};
+};
+
+struct SupgCellPlan {
+  PetscInt cell=-1;
+  PetscInt entity[8]={0,0,0,0,0,0,0,0};
+  PetscInt gid[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt localIndex[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt freeBasis[8]={0,0,0,0,0,0,0,0};
+  PetscInt freeGid[8]={0,0,0,0,0,0,0,0};
+  PetscInt nfree=0;
+  double det=0.0;
+  double h2=0.0;
+  // Compact affine geometry: physical gradients of the four barycentric
+  // coordinates.  P1 gradients are these directly.  BF3 gradients and
+  // Laplacians are reconstructed analytically from lambda(q) at runtime.
+  // This replaces the old O(nQ*8) per-cell physical-gradient/Hessian caches.
+  double gradLambda[4][3]={{0}};
+};
+
+struct SupgAssemblyPlan {
+  PetscInt nQ=0;
+  std::vector<SupgReferencePoint> ref;
+  std::vector<SupgCellPlan> cells;
+  // No per-cell/per-quadrature physical derivative caches.  Affine BF3
+  // derivatives are reconstructed from SupgCellPlan::gradLambda and lambda(q).
+  // Only allocated for MMS.  Pipe/generic-flow forcing is identically zero.
+  std::vector<double> forcing;
+  PetscBool forcingZero=PETSC_TRUE;
+  double nu=0.0;
+};
+
+static PetscErrorCode buildSupgAssemblyPlan(
+    const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,const ProblemConfig& problem,
+    PetscInt nQ,SupgAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  const auto Q=supgQuadrature(nQ);
+  P.nQ=(PetscInt)Q.size(); P.nu=problem.nu;
+  P.ref.resize(Q.size());
+  double wsum=0.0,wabs=0.0,wmin=1.0e300,wmax=-1.0e300;
+  for(std::size_t q=0;q<Q.size();++q) {
+    P.ref[q].lam=Q[q].lam; P.ref[q].w=Q[q].w;
+    basis(Q[q].lam,P.ref[q].phi,P.ref[q].gradRef);
+    referenceHessian(Q[q].lam,P.ref[q].hessRef);
+    wsum+=Q[q].w; wabs+=std::abs(Q[q].w); wmin=std::min(wmin,Q[q].w); wmax=std::max(wmax,Q[q].w);
+  }
+  P.cells.clear(); P.cells.reserve(D.cellCount[rank]);
+  const PetscInt nv=(PetscInt)M.points.size();
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) if(D.cellOwner[c]==rank) {
+    SupgCellPlan cp; cp.cell=c;
+    const auto t=M.tets[c];
+    const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},invJ[3][3];
+    cp.det=det3(J);
+    if(cp.det<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"non-positive tet orientation in SUPG plan at cell %" PetscInt_FMT,c);
+    inv3(J,invJ);
+    // Reference barycentric gradients are (-1,-1,-1), (1,0,0), (0,1,0),
+    // (0,0,1).  Transform them once per affine cell and retain only these
+    // 12 doubles; all BF3 q-point derivatives are reconstructed from them.
+    const double gradLambdaRef[4][3]={{-1.0,-1.0,-1.0},{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}};
+    for(int i=0;i<4;++i) for(int d=0;d<3;++d) {
+      double g=0.0;
+      for(int j=0;j<3;++j) g+=gradLambdaRef[i][j]*invJ[j][d];
+      cp.gradLambda[i][d]=g;
+    }
+    const double h=tetDiameter(X); cp.h2=h*h;
+    if(!(cp.h2>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"zero tetrahedron diameter in SUPG plan");
+    for(int i=0;i<4;++i) cp.entity[i]=t[i];
+    for(int i=0;i<4;++i) cp.entity[4+i]=nv+M.oppFace[c][i];
+    for(int a=0;a<8;++a) {
+      cp.gid[a]=D.g2free[cp.entity[a]];
+      if(cp.gid[a]>=0) {
+        cp.localIndex[a]=velocityLocalIndex(G,cp.gid[a]);
+        cp.freeBasis[cp.nfree]=a; cp.freeGid[cp.nfree]=cp.gid[a]; cp.nfree++;
+      }
+    }
+    P.cells.push_back(cp);
+  }
+
+  const std::size_t nqtot=P.cells.size()*Q.size();
+  P.forcingZero=(problem.mode==ProblemMode::MMS)?PETSC_FALSE:PETSC_TRUE;
+  if(!P.forcingZero) {
+    P.forcing.assign(nqtot*3,0.0);
+    for(std::size_t ic=0;ic<P.cells.size();++ic) {
+      const auto& cp=P.cells[ic];
+      const auto t=M.tets[cp.cell];
+      const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+      for(std::size_t q=0;q<Q.size();++q) {
+        const std::size_t iq=ic*Q.size()+q;
+        double x=0.0,y=0.0,z=0.0;
+        for(int i=0;i<4;++i) { x+=P.ref[q].lam[i]*X[i].x; y+=P.ref[q].lam[i]*X[i].y; z+=P.ref[q].lam[i]*X[i].z; }
+        double f[3]; problemForcing(problem,x,y,z,f);
+        for(int d=0;d<3;++d) P.forcing[iq*3+d]=f[d];
+      }
+    }
+  } else P.forcing.clear();
+
+  const double compactGeomMiB=(double)(P.cells.size()*12*sizeof(double))/(1024.0*1024.0);
+  const double forceMiB=(double)(P.forcing.size()*sizeof(double))/(1024.0*1024.0);
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_SUPG_PLAN quadraturePoints=%" PetscInt_FMT " ownedCells=%zu affinePhysicalGradCached=0 viscousStrongCached=0 compactGradLambdaCached=1 compactGeomMiB=%.3f p1LaplacianSkipped=1 forcingCached=%d forcingMiB=%.3f weightSum=%.16e weightAbsSum=%.16e weightRange=[%.6e,%.6e]\n",
+    P.nQ,P.cells.size(),compactGeomMiB,P.forcingZero?0:1,forceMiB,wsum,wabs,wmin,wmax));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gatherSupgCellCoefficients(
+    const Discrete& D,const GhostPlan& G,const SupgCellPlan& cp,const PetscScalar* ua[3],double coeff[3][8]) {
+  PetscFunctionBeginUser;
+  for(int m=0;m<8;++m) {
+    if(cp.gid[m]>=0) {
+      const PetscInt li=cp.localIndex[m];
+      for(int d=0;d<3;++d) coeff[d][m]=PetscRealPart(ua[d][li]);
+    } else {
+      for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,cp.entity[m]);
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleSupgFastMPI(
+    const Discrete& D,const GhostPlan& G,const SupgAssemblyPlan& P,Vec U[3],
+    double tauScale,double supgMagic,const std::string& form,Mat Sg,Vec supgRhs[3],SupgStats& stats) {
+  PetscFunctionBeginUser;
+  const bool implicit=(form=="implicit");
+  if(!implicit && form!="explicit") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"SUPG form must be implicit or explicit");
+  if(implicit) PetscCall(MatZeroEntries(Sg));
+  for(int d=0;d<3;++d) PetscCall(VecSet(supgRhs[d],0.0));
+
+  Vec Ul[3]={nullptr,nullptr,nullptr};
+  const PetscScalar* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) {
+    PetscCall(VecGhostUpdateBegin(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostUpdateEnd(U[d],INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostGetLocalForm(U[d],&Ul[d]));
+    PetscCall(VecGetArrayRead(Ul[d],&ua[d]));
+  }
+
+  double localTauMin=1.0e300,localTauMax=0.0,localTauWeighted=0.0,localWeight=0.0;
+  for(std::size_t ic=0;ic<P.cells.size();++ic) {
+    const auto& cp=P.cells[ic];
+    double coeff[3][8]={{0}};
+    PetscCall(gatherSupgCellCoefficients(D,G,cp,ua,coeff));
+    double Sl[8][8]={{0}};
+    double Vr[3][8]={{0}};
+    double gradLambdaDot[4][4]={{0}};
+    for(int i=0;i<4;++i) for(int j=i;j<4;++j) {
+      double v=0.0; for(int d=0;d<3;++d) v+=cp.gradLambda[i][d]*cp.gradLambda[j][d];
+      gradLambdaDot[i][j]=gradLambdaDot[j][i]=v;
+    }
+
+    for(PetscInt q=0;q<P.nQ;++q) {
+      const std::size_t iq=ic*(std::size_t)P.nQ+(std::size_t)q;
+      const auto& rq=P.ref[(std::size_t)q];
+      double adv[3]={0.0,0.0,0.0};
+      for(int d=0;d<3;++d) for(int m=0;m<8;++m) adv[d]+=coeff[d][m]*rq.phi[m];
+      const double speed2=adv[0]*adv[0]+adv[1]*adv[1]+adv[2]*adv[2];
+      // tau is deliberately lagged: adv comes from the previous SIMPLE state U
+      // supplied to this assembly call.  No derivative of tau enters either form.
+      double stream[8]={0},strongTrial[8]={0};
+      // Compact affine reconstruction.  P1 gradients are the physical
+      // barycentric gradients.  For b_i = 27*prod_{j!=i} lambda_j,
+      //   grad b_i = 27*sum_{j!=i}(prod_{m!=i,j}lambda_m) grad lambda_j,
+      //   Delta b_i = 54*sum_pair lambda_remaining*(grad lambda_j.grad lambda_k).
+      // Pairwise barycentric-gradient dots are cell constants and are formed
+      // once per cell outside the q loop below.
+      double gradBasis[8][3]={{0}};
+      for(int a=0;a<4;++a) for(int d=0;d<3;++d) gradBasis[a][d]=cp.gradLambda[a][d];
+      for(int i=0;i<4;++i) {
+        int js[3],kk=0; for(int j=0;j<4;++j) if(j!=i) js[kk++]=j;
+        for(int d=0;d<3;++d) {
+          gradBasis[4+i][d]=27.0*(
+              rq.lam[js[1]]*rq.lam[js[2]]*cp.gradLambda[js[0]][d]
+             +rq.lam[js[0]]*rq.lam[js[2]]*cp.gradLambda[js[1]][d]
+             +rq.lam[js[0]]*rq.lam[js[1]]*cp.gradLambda[js[2]][d]);
+        }
+      }
+      for(int a=0;a<8;++a)
+        stream[a]=adv[0]*gradBasis[a][0]+adv[1]*gradBasis[a][1]+adv[2]*gradBasis[a][2];
+      for(int a=0;a<4;++a) strongTrial[a]=stream[a]; // Delta(P1)=0 exactly.
+      for(int i=0;i<4;++i) {
+        int js[3],kk=0; for(int j=0;j<4;++j) if(j!=i) js[kk++]=j;
+        const double lap=54.0*(
+            rq.lam[js[2]]*gradLambdaDot[js[0]][js[1]]
+           +rq.lam[js[1]]*gradLambdaDot[js[0]][js[2]]
+           +rq.lam[js[0]]*gradLambdaDot[js[1]][js[2]]);
+        strongTrial[4+i]=-P.nu*lap+stream[4+i];
+      }
+      const double diff=4.0*P.nu/cp.h2;
+      const double denominator=std::max(4.0*speed2/cp.h2 + supgMagic*diff*diff,1.0e-30);
+      const double tau=tauScale/std::sqrt(denominator);
+      const double w=tau*rq.w*cp.det;
+      const double volumeW=rq.w*cp.det;
+      localTauMin=std::min(localTauMin,tau); localTauMax=std::max(localTauMax,tau);
+      localTauWeighted+=tau*volumeW; localWeight+=volumeW;
+
+      if(implicit) {
+        // Rank-one outer product at each quadrature point:
+        //   tau*w * stream_test[:] \otimes strongTrial[:].
+        for(int a=0;a<8;++a) {
+          const double ta=w*stream[a];
+          for(int b=0;b<8;++b) Sl[a][b]+=ta*strongTrial[b];
+          if(!P.forcingZero) for(int d=0;d<3;++d) Vr[d][a]+=ta*P.forcing[iq*3+d];
+        }
+      } else {
+        // Fully explicit SUPG residual from the previous SIMPLE iterate:
+        // RHS += -(S(Ulag)*Ulag - F(Ulag)).  This avoids a global SUPG matrix.
+        double strongResidual[3]={0.0,0.0,0.0};
+        for(int d=0;d<3;++d) {
+          for(int b=0;b<8;++b) strongResidual[d]+=coeff[d][b]*strongTrial[b];
+          if(!P.forcingZero) strongResidual[d]-=P.forcing[iq*3+d];
+        }
+        for(int a=0;a<8;++a) {
+          const double ta=-w*stream[a];
+          for(int d=0;d<3;++d) Vr[d][a]+=ta*strongResidual[d];
+        }
+      }
+    }
+
+    if(cp.nfree>0) {
+      if(implicit) {
+        PetscScalar vals[64];
+        for(PetscInt ii=0;ii<cp.nfree;++ii) {
+          const int a=(int)cp.freeBasis[ii];
+          for(PetscInt jj=0;jj<cp.nfree;++jj) {
+            const int b=(int)cp.freeBasis[jj];
+            vals[ii*cp.nfree+jj]=(PetscScalar)Sl[a][b];
+          }
+        }
+        PetscCall(MatSetValues(Sg,cp.nfree,cp.freeGid,cp.nfree,cp.freeGid,vals,ADD_VALUES));
+        for(int d=0;d<3;++d) {
+          PetscScalar rv[8]; PetscBool any=PETSC_FALSE;
+          for(PetscInt ii=0;ii<cp.nfree;++ii) {
+            const int a=(int)cp.freeBasis[ii]; double v=Vr[d][a];
+            for(int b=0;b<8;++b) if(cp.gid[b]<0) v-=Sl[a][b]*entityDirValue(D,d,cp.entity[b]);
+            rv[ii]=(PetscScalar)v; if(v!=0.0) any=PETSC_TRUE;
+          }
+          if(any) PetscCall(VecSetValues(supgRhs[d],cp.nfree,cp.freeGid,rv,ADD_VALUES));
+        }
+      } else {
+        for(int d=0;d<3;++d) {
+          PetscScalar rv[8]; PetscBool any=PETSC_FALSE;
+          for(PetscInt ii=0;ii<cp.nfree;++ii) {
+            const int a=(int)cp.freeBasis[ii]; rv[ii]=(PetscScalar)Vr[d][a]; if(Vr[d][a]!=0.0) any=PETSC_TRUE;
+          }
+          if(any) PetscCall(VecSetValues(supgRhs[d],cp.nfree,cp.freeGid,rv,ADD_VALUES));
+        }
+      }
+    }
+  }
+
+  for(int d=0;d<3;++d) {
+    PetscCall(VecRestoreArrayRead(Ul[d],&ua[d]));
+    PetscCall(VecGhostRestoreLocalForm(U[d],&Ul[d]));
+  }
+  if(implicit) { PetscCall(MatAssemblyBegin(Sg,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(Sg,MAT_FINAL_ASSEMBLY)); }
+  for(int d=0;d<3;++d) { PetscCall(VecAssemblyBegin(supgRhs[d])); PetscCall(VecAssemblyEnd(supgRhs[d])); }
+
+  double globalMin=0,globalMax=0,globalTauWeighted=0,globalWeight=0;
+  PetscCallMPI(MPI_Allreduce(&localTauMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauWeighted,&globalTauWeighted,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWeight,&globalWeight,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  stats.tauMin=globalMin; stats.tauMax=globalMax; stats.tauMean=(globalWeight!=0.0)?globalTauWeighted/globalWeight:0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// M2B direct owned-row dynamic momentum assembly
+// -----------------------------------------------------------------------------
+struct CustomDynamicCellPlan {
+  PetscInt cell=-1;
+  PetscInt entity[8]={0,0,0,0,0,0,0,0};
+  PetscInt gid[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt localIndex[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  PetscInt ownedBasis[8]={0,0,0,0,0,0,0,0};
+  PetscInt nOwnedRows=0;
+  // Per-cell row-local CSR slots: 255 means fixed/inactive.  A P1+BF3 cell has
+  // at most eight trial columns, so one byte is sufficient and removes all
+  // sparse-column searches from the nonlinear assembly hot path.
+  std::uint8_t rowSlot[8][8]={{0}};
+  double det=0.0,invJ[3][3]={{0}},gradLambda[4][3]={{0}},h2=0.0;
+  // Retained only in the non-compact diagnostic/runtime path. PLAN-C1 already
+  // carries the same x/y vertices in CustomDynamicRuntimeCellPlan.
+  double xy[4][2]={{0}};
+};
+
+struct CustomDynamicAssemblyPlan {
+  std::vector<CustomDynamicCellPlan> cells;
+  PetscInt nQ=0;
+  std::vector<SupgReferencePoint> ref;
+  std::vector<double> forcing;
+  PetscBool forcingZero=PETSC_TRUE;
+  double nu=0.0;
+};
+
+static PetscErrorCode buildCustomDynamicAssemblyPlan(const Mesh& M,const Discrete& D,const ProblemConfig& problem,
+  const CustomMomentumCSR& A,PetscInt nQ,CustomDynamicAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size();
+  const auto Q=supgQuadrature(nQ);
+  P.nQ=(PetscInt)Q.size(); P.nu=problem.nu; P.ref.resize(Q.size());
+  double wsum=0.0,wabs=0.0,wmin=1e300,wmax=-1e300;
+  for(std::size_t q=0;q<Q.size();++q) {
+    P.ref[q].lam=Q[q].lam; P.ref[q].w=Q[q].w;
+    basis(Q[q].lam,P.ref[q].phi,P.ref[q].gradRef); referenceHessian(Q[q].lam,P.ref[q].hessRef);
+    wsum+=Q[q].w; wabs+=std::abs(Q[q].w); wmin=std::min(wmin,Q[q].w); wmax=std::max(wmax,Q[q].w);
+  }
+  // A2 memory hygiene: exact two-pass reserve for distributed row-support cells.
+  // This avoids geometric vector-capacity jumps (e.g. ~2x retained capacity)
+  // without changing which cells are included in the plan.
+  std::size_t rowSupportCount=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    const auto t=M.tets[(std::size_t)c];
+    bool any=false;
+    for(int i=0;i<4 && !any;++i) { const PetscInt g=D.g2free[(std::size_t)t[i]]; if(g>=A.rstart && g<A.rend) any=true; }
+    for(int i=0;i<4 && !any;++i) { const PetscInt g=D.g2free[(std::size_t)(nv+M.oppFace[(std::size_t)c][i])]; if(g>=A.rstart && g<A.rend) any=true; }
+    if(any) ++rowSupportCount;
+  }
+  P.cells.clear(); P.cells.reserve(rowSupportCount);
+  // Row-support halo: include a tet on this rank iff at least one of its free
+  // scalar velocity rows is owned here. Each global row is therefore assembled
+  // exactly once, while partition-boundary cells may be evaluated by two ranks.
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    CustomDynamicCellPlan cp; cp.cell=c;
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) cp.rowSlot[a][b]=255;
+    const auto t=M.tets[(std::size_t)c];
+    for(int i=0;i<4;++i) cp.entity[i]=t[i];
+    for(int i=0;i<4;++i) cp.entity[4+i]=nv+M.oppFace[(std::size_t)c][i];
+    for(int a=0;a<8;++a) {
+      cp.gid[a]=D.g2free[(std::size_t)cp.entity[a]];
+      if(cp.gid[a]>=A.rstart && cp.gid[a]<A.rend) cp.ownedBasis[cp.nOwnedRows++]=a;
+    }
+    if(cp.nOwnedRows==0) continue;
+    for(int a=0;a<8;++a) if(cp.gid[a]>=0) {
+      cp.localIndex[a]=customMomentumLocalIndex(A,cp.gid[a]);
+      if(cp.localIndex[a]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A dynamic plan free gid absent from custom halo");
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.gid[a]-A.rstart;
+      const PetscInt rb=A.rowPtr[(std::size_t)lr],re=A.rowPtr[(std::size_t)lr+1];
+      if(re-rb>=255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A one-byte cell CSR slot overflow");
+      for(int b=0;b<8;++b) if(cp.gid[b]>=0) {
+        auto it=std::lower_bound(A.colGid.begin()+rb,A.colGid.begin()+re,cp.gid[b]);
+        if(it==A.colGid.begin()+re || *it!=cp.gid[b]) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A dynamic plan missing CSR column");
+        cp.rowSlot[a][b]=(std::uint8_t)(it-(A.colGid.begin()+rb));
+      }
+    }
+    const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    for(int i=0;i<4;++i) { cp.xy[i][0]=X[i].x; cp.xy[i][1]=X[i].y; }
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};
+    cp.det=det3(J); if(cp.det<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"non-positive tet in M3A dynamic plan");
+    inv3(J,cp.invJ);
+    const double gradLambdaRef[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};
+    for(int i=0;i<4;++i) for(int d=0;d<3;++d) for(int j=0;j<3;++j) cp.gradLambda[i][d]+=gradLambdaRef[i][j]*cp.invJ[j][d];
+    const double h=tetDiameter(X); cp.h2=h*h; if(!(cp.h2>0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"zero tet diameter in M2B plan");
+    P.cells.push_back(cp);
+  }
+  P.forcingZero=(problem.mode==ProblemMode::MMS)?PETSC_FALSE:PETSC_TRUE;
+  if(!P.forcingZero) {
+    P.forcing.assign(P.cells.size()*Q.size()*3,0.0);
+    for(std::size_t ic=0;ic<P.cells.size();++ic) {
+      const auto t=M.tets[(std::size_t)P.cells[ic].cell];
+      const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+      for(std::size_t q=0;q<Q.size();++q) {
+        double x=0,y=0,z=0; for(int i=0;i<4;++i){x+=P.ref[q].lam[i]*X[i].x;y+=P.ref[q].lam[i]*X[i].y;z+=P.ref[q].lam[i]*X[i].z;}
+        double f[3]; problemForcing(problem,x,y,z,f); const std::size_t iq=(ic*Q.size()+q)*3;
+        for(int d=0;d<3;++d) P.forcing[iq+d]=f[d];
+      }
+    }
+  } else P.forcing.clear();
+  unsigned long long lc=(unsigned long long)P.cells.size(),gc=0,lrows=0,grows=0;
+  for(const auto& cp:P.cells) lrows+=(unsigned long long)cp.nOwnedRows;
+  PetscCallMPI(MPI_Allreduce(&lc,&gc,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lrows,&grows,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_M3A_DYNAMIC_PLAN summedRowSupportCells=%llu globalCells=%zu supportReplication=%.6f ownedRowIncidences=%llu quadraturePoints=%" PetscInt_FMT " matrixAssembly=direct_custom_owned_rows no_offrank_insertion=1 weightSum=%.16e weightAbsSum=%.16e weightRange=[%.6e,%.6e]\n",
+    gc,(std::size_t)distributedGlobalCellCount(D),distributedGlobalCellCount(D)?(double)gc/(double)distributedGlobalCellCount(D):0.0,grows,P.nQ,wsum,wabs,wmin,wmax));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// PLAN-C1 compact live dynamic assembly plan.
+// The full CustomDynamicCellPlan is useful during setup, but several fields are
+// redundant once static RHS/topology construction is complete.  Keep only the
+// data required by repeated diffusion/convection/SUPG assembly.
+// ref[a] >= 0 : custom momentum local index for a free velocity entity.
+// ref[a] <  0 : encoded fixed entity id as -(entity+1).
+// For an owned basis, ref[a] is exactly the owned local row index.
+// -----------------------------------------------------------------------------
+struct CustomDynamicRuntimeCellPlan {
+  PetscInt ref[8]={-1,-1,-1,-1,-1,-1,-1,-1};
+  std::uint8_t ownedBasis[8]={0,0,0,0,0,0,0,0};
+  std::uint8_t nOwnedRows=0;
+  std::uint8_t diagnosticOwner=0;
+  std::uint8_t rowSlot[8][8]={{0}};
+  double det=0.0,invJ[3][3]={{0}},h2=0.0;
+  // Stage-2 RANS pipe geometry.  x/y are already required by the physical
+  // mixing-length model.  The compact float z coordinates and pressure/cell
+  // global id are diagnostic-only metadata used by -mixlen_audit.
+  double xy[4][2]={{0}};
+  float z[4]={0.0f,0.0f,0.0f,0.0f};
+  PetscInt diagnosticCellGid=-1;
+};
+struct CustomDynamicRuntimeWallFace {
+  std::uint32_t cellIndex=0;
+  std::uint8_t opp=0;
+  std::uint8_t diagnosticOwner=0;
+  double hn=0.0,area=0.0,normal[3]={0.0,0.0,0.0};
+};
+struct CustomDynamicRuntimePlan {
+  std::vector<CustomDynamicRuntimeCellPlan> cells;
+  std::vector<CustomDynamicRuntimeWallFace> wallFaces;
+  std::vector<CustomDynamicRuntimeWallFace> inletFaces;
+  PetscInt nQ=0;
+  std::vector<SupgReferencePoint> ref;
+  std::vector<double> forcing;
+  PetscBool forcingZero=PETSC_TRUE;
+  double nu=0.0;
+};
+
+struct MixingLengthMaxAudit {
+  long long cellGid=-1;
+  int q=-1,rank=-1;
+  double x=0.0,y=0.0,z=0.0,zOverL=0.0,rOverR=0.0,yPlusRefBlasius=0.0,lmOverR=0.0;
+  // nuTRatio/twoSdotS/strain are the ACTIVE strain-mode values used to build
+  // the momentum diffusion. Raw/deviatoric values are always carried so one
+  // run can compare both models at exactly the same physical point.
+  double nuTRatio=0.0,twoSdotS=0.0,strain=0.0;
+  double divU=0.0;
+  double nuTRatioRaw=0.0,twoSdotSRaw=0.0,strainRaw=0.0;
+  double nuTRatioDev=0.0,twoSdotSDev=0.0,strainDev=0.0;
+  double Sxx=0.0,Syy=0.0,Szz=0.0,Sxy=0.0,Sxz=0.0,Syz=0.0;
+};
+struct MixingLengthStats {
+  double nuTRatioMin=0.0,nuTRatioMean=0.0,nuTRatioMax=0.0;
+  double ellMin=0.0,ellMax=0.0,strainMax=0.0;
+  double nuTRatioP95=0.0,nuTRatioP99=0.0,nuTRatioP999=0.0;
+  double volFracGT100=0.0,volFracGT300=0.0,volFracGT1000=0.0;
+  // Raw-vs-deviatoric shadow statistics. Diagnostic only: the active operator
+  // still uses exactly one mode selected by -mixlen_strain_mode.
+  double rawP95=0.0,rawP99=0.0,rawP999=0.0,rawMax=0.0,rawStrainMax=0.0;
+  double devP95=0.0,devP99=0.0,devP999=0.0,devMax=0.0,devStrainMax=0.0;
+  MixingLengthMaxAudit maxAudit{};
+  unsigned long long quadratureSamples=0;
+};
+static inline PetscBool dynRefFree(PetscInt r){ return r>=0 ? PETSC_TRUE:PETSC_FALSE; }
+static inline PetscInt dynFixedEntity(PetscInt r){ return -r-1; }
+static inline void dynGradLambdaFromInvJ(const double invJ[3][3],double g[4][3]) {
+  for(int d=0;d<3;++d) {
+    g[1][d]=invJ[0][d]; g[2][d]=invJ[1][d]; g[3][d]=invJ[2][d];
+    g[0][d]=-(g[1][d]+g[2][d]+g[3][d]);
+  }
+}
+static PetscErrorCode compactCustomDynamicPlan(const Mesh& M,const Discrete& D,const ProblemConfig& problem,CustomDynamicAssemblyPlan& P,CustomDynamicRuntimePlan& R) {
+  PetscFunctionBeginUser;
+  int rank=0; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
+  R.cells.clear(); R.cells.reserve(P.cells.size());
+  R.wallFaces.clear();
+  R.inletFaces.clear();
+  for(const auto& cp:P.cells) {
+    CustomDynamicRuntimeCellPlan rp;
+    for(int a=0;a<8;++a) {
+      rp.ref[a]=(cp.gid[a]>=0)?cp.localIndex[a]:-(cp.entity[a]+1);
+      rp.ownedBasis[a]=(std::uint8_t)cp.ownedBasis[a];
+      for(int b=0;b<8;++b) rp.rowSlot[a][b]=cp.rowSlot[a][b];
+    }
+    rp.nOwnedRows=(std::uint8_t)cp.nOwnedRows; rp.det=cp.det; rp.h2=cp.h2;
+    rp.diagnosticOwner=(std::uint8_t)(D.cellOwner[(std::size_t)cp.cell]==rank ? 1 : 0);
+    for(int j=0;j<3;++j) for(int d=0;d<3;++d) rp.invJ[j][d]=cp.invJ[j][d];
+    const auto t=M.tets[(std::size_t)cp.cell];
+    for(int i=0;i<4;++i) {
+      const Vec3& X=M.points[(std::size_t)t[i]];
+      rp.xy[i][0]=X.x; rp.xy[i][1]=X.y; rp.z[i]=(float)X.z;
+    }
+    rp.diagnosticCellGid=D.pGid[(std::size_t)cp.cell];
+    const std::uint32_t runtimeCellIndex=(std::uint32_t)R.cells.size();
+    if(!D.wallEntity.empty()) {
+      const PetscInt nv=(PetscInt)M.points.size();
+      for(int i=0;i<4;++i) {
+        const PetscInt f=M.oppFace[(std::size_t)cp.cell][i];
+        if(f<0 || nv+f>=(PetscInt)D.wallEntity.size() || !D.wallEntity[(std::size_t)(nv+f)]) continue;
+        const Vec3 sf=faceOutwardAreaVector(M,f);
+        const double area=norm3(sf);
+        if(!(area>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"Stage-3 degenerate wall face");
+        CustomDynamicRuntimeWallFace wf;
+        wf.cellIndex=runtimeCellIndex; wf.opp=(std::uint8_t)i; wf.diagnosticOwner=rp.diagnosticOwner;
+        wf.area=area; wf.hn=cp.det/(2.0*area); // 3*(det/6)/A
+        wf.normal[0]=sf.x/area; wf.normal[1]=sf.y/area; wf.normal[2]=sf.z/area;
+        R.wallFaces.push_back(wf);
+      }
+    }
+    if(dgNumericalTraceInlet(problem)) {
+      int io=-1; Vec3 sf{};
+      if(dgNumericalTraceFaceGeom(M,problem,cp.cell,io,sf)) {
+        const double area=norm3(sf);
+        if(!(area>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"weak DG inlet has degenerate face");
+        CustomDynamicRuntimeWallFace inf;
+        inf.cellIndex=runtimeCellIndex; inf.opp=(std::uint8_t)io; inf.diagnosticOwner=rp.diagnosticOwner;
+        inf.area=area; inf.normal[0]=sf.x/area; inf.normal[1]=sf.y/area; inf.normal[2]=sf.z/area;
+        R.inletFaces.push_back(inf);
+      }
+    }
+    R.cells.push_back(rp);
+  }
+  R.nQ=P.nQ; R.ref=std::move(P.ref); R.forcing=std::move(P.forcing);
+  R.forcingZero=P.forcingZero; R.nu=P.nu;
+  const unsigned long long oldLocal=(unsigned long long)P.cells.capacity()*sizeof(CustomDynamicCellPlan);
+  const unsigned long long newLocal=(unsigned long long)R.cells.capacity()*sizeof(CustomDynamicRuntimeCellPlan)
+    +(unsigned long long)(R.wallFaces.capacity()+R.inletFaces.capacity())*sizeof(CustomDynamicRuntimeWallFace);
+  unsigned long long oldGlobal=0,newGlobal=0;
+  PetscCallMPI(MPI_Allreduce(&oldLocal,&oldGlobal,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&newLocal,&newGlobal,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  std::vector<CustomDynamicCellPlan>().swap(P.cells);
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DYNPLAN_COMPACT fullCellBytes=%zu compactCellBytes=%zu oldCellMiB=%.3f compactCellMiB=%.3f savedCellMiB=%.3f ratio=%.6f status=PASS\n",
+    sizeof(CustomDynamicCellPlan),sizeof(CustomDynamicRuntimeCellPlan),(double)oldGlobal/(1024.0*1024.0),(double)newGlobal/(1024.0*1024.0),(double)(oldGlobal-newGlobal)/(1024.0*1024.0),oldGlobal?(double)newGlobal/(double)oldGlobal:0.0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
+  const auto& R=diffusionTensor();
+  for(const auto& cp:P.cells) {
+    double metric[3][3]={{0}};
+    for(int j=0;j<3;++j) for(int k=0;k<3;++k) for(int d=0;d<3;++d) metric[j][k]+=cp.invJ[j][d]*cp.invJ[k][d];
+    double Kl[8][8]={{0}};
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) { double v=0.0; for(int j=0;j<3;++j) for(int k=0;k<3;++k) v+=R.t[a][b][j][k]*metric[j][k]; Kl[a][b]=scale*cp.det*v; }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a];
+      for(int b=0;b<8;++b) if(dynRefFree(cp.ref[b])) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact static diffusion missing row slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kl[a][b]; }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode customMomentumResetPhysical(const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double nu,PetscBool) {
+  PetscFunctionBeginUser;
+  PetscCall(assembleStaticDiffusionCustom(P,A,nu));
+  for(int d=0;d<3;++d) std::fill(A.mixlenRhs[d].begin(),A.mixlenRhs[d].end(),0.0);
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+// -----------------------------------------------------------------------------
+// Stage-2 algebraic RANS: Nikuradse smooth-pipe mixing length.
+//
+// Molecular nu*K is already in A.aRel. This adds only the lagged eddy-viscosity
+// contribution int_K nu_t grad(phi_a).grad(phi_b) dV. The three component
+// momentum solves therefore remain scalar and share the same operator.
+//
+// For the present straight pipe, U=(0,0,Uz(r)), this is the exact axial
+// Boussinesq stress contribution. The general variable-viscosity transpose-
+// gradient term is intentionally deferred beyond Stage 2.
+//
+// Frozen NodalS pipe convention: pipe axis=z, radial plane=(x,y).
+// -----------------------------------------------------------------------------
+static PetscErrorCode assembleNikuradseMixingLengthCustom(
+    const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,
+    const PipeGeometry& pipe,double nu,double nutScale,PetscBool deviatoricStrain,
+    PetscBool detailedAudit,MixingLengthStats& stats) {
+  PetscFunctionBeginUser;
+  if(!(nu>0.0) || !(pipe.R>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"mixing-length model requires nu>0 and pipe.R>0");
+  if(nutScale<0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"mixlen scale must be >= 0");
+  for(int d=0;d<3;++d) {
+    if((PetscInt)A.mixlenRhs[d].size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"mixing-length RHS storage not enabled");
+    std::fill(A.mixlenRhs[d].begin(),A.mixlenRhs[d].end(),0.0);
+  }
+
+  double localMin=1e300,localMax=0.0,localWeighted=0.0,localWeight=0.0;
+  double localEllMin=1e300,localEllMax=0.0,localStrainMax=0.0;
+  double localRawMax=0.0,localDevMax=0.0,localRawStrainMax=0.0,localDevStrainMax=0.0;
+  double localWeightGT100=0.0,localWeightGT300=0.0,localWeightGT1000=0.0;
+  unsigned long long localSamples=0;
+  int rank=0; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
+  MixingLengthMaxAudit localMaxAudit{}; localMaxAudit.rank=rank;
+  constexpr int auditBins=2048;
+  constexpr double auditMaxRatio=1.0e6;
+  const double auditLogMax=std::log1p(auditMaxRatio);
+  std::vector<double> localHist,localRawHist,localDevHist;
+  if(detailedAudit) {
+    localHist.assign(auditBins,0.0);
+    localRawHist.assign(auditBins,0.0);
+    localDevHist.assign(auditBins,0.0);
+  }
+
+  for(const auto& cp:P.cells) {
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(dynRefFree(cp.ref[m])) {
+        for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]);
+      } else {
+        const PetscInt e=dynFixedEntity(cp.ref[m]);
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e);
+      }
+    }
+
+    double Kt[8][8]={{0}};
+    for(PetscInt q=0;q<P.nQ;++q) {
+      const auto& rq=P.ref[(std::size_t)q];
+
+      double gradBasis[8][3]={{0}};
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d)
+        for(int j=0;j<3;++j) gradBasis[a][d]+=rq.gradRef[a][j]*cp.invJ[j][d];
+
+      double gradU[3][3]={{0}};
+      for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+        for(int a=0;a<8;++a) gradU[i][j]+=coeff[i][a]*gradBasis[a][j];
+
+      double S[3][3]={{0}},ssRaw=0.0;
+      for(int i=0;i<3;++i) for(int j=0;j<3;++j) {
+        S[i][j]=0.5*(gradU[i][j]+gradU[j][i]);
+        ssRaw+=S[i][j]*S[i][j];
+      }
+      const double divU=gradU[0][0]+gradU[1][1]+gradU[2][2];
+      const double thirdDiv=divU/3.0;
+      double ssDev=0.0;
+      for(int i=0;i<3;++i) for(int j=0;j<3;++j) {
+        const double sd=S[i][j]-((i==j)?thirdDiv:0.0);
+        ssDev+=sd*sd;
+      }
+      const double twoSdotSRaw=std::max(0.0,2.0*ssRaw);
+      const double twoSdotSDev=std::max(0.0,2.0*ssDev);
+      const double strainRaw=std::sqrt(twoSdotSRaw);
+      const double strainDev=std::sqrt(twoSdotSDev);
+      const double twoSdotS=deviatoricStrain?twoSdotSDev:twoSdotSRaw;
+      const double strain=deviatoricStrain?strainDev:strainRaw;
+
+      double xq=0.0,yq=0.0;
+      for(int i=0;i<4;++i) { xq+=rq.lam[i]*cp.xy[i][0]; yq+=rq.lam[i]*cp.xy[i][1]; }
+      const double dx=xq-pipe.cx,dy=yq-pipe.cy;
+      const double r=std::sqrt(dx*dx+dy*dy);
+      const double eta=std::min(1.0,std::max(0.0,r/pipe.R));
+      const double eta2=eta*eta,eta4=eta2*eta2;
+      const double ell=pipe.R*std::max(0.0,0.14-0.08*eta2-0.06*eta4);
+      const double nuTRaw=nutScale*ell*ell*strainRaw;
+      const double nuTDev=nutScale*ell*ell*strainDev;
+      const double nuT=deviatoricStrain?nuTDev:nuTRaw;
+      const double w=rq.w*cp.det;
+
+      for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
+        double gd=0.0; for(int d=0;d<3;++d) gd+=gradBasis[a][d]*gradBasis[b][d];
+        Kt[a][b]+=nuT*gd*w;
+      }
+
+      if(cp.diagnosticOwner) {
+        const double ratio=nuT/nu;
+        const double ratioRaw=nuTRaw/nu,ratioDev=nuTDev/nu;
+        localMin=std::min(localMin,ratio);
+        localWeighted+=ratio*w; localWeight+=w;
+        localEllMin=std::min(localEllMin,ell); localEllMax=std::max(localEllMax,ell);
+        localStrainMax=std::max(localStrainMax,strain);
+        localRawMax=std::max(localRawMax,ratioRaw); localDevMax=std::max(localDevMax,ratioDev);
+        localRawStrainMax=std::max(localRawStrainMax,strainRaw); localDevStrainMax=std::max(localDevStrainMax,strainDev);
+        ++localSamples;
+        if(detailedAudit) {
+          if(ratio>100.0) localWeightGT100+=w;
+          if(ratio>300.0) localWeightGT300+=w;
+          if(ratio>1000.0) localWeightGT1000+=w;
+          auto addAuditHist=[&](double v,std::vector<double>& hist) {
+            const double clipped=std::min(auditMaxRatio,std::max(0.0,v));
+            int ib=(int)std::floor((std::log1p(clipped)/auditLogMax)*(auditBins-1));
+            ib=std::max(0,std::min(auditBins-1,ib));
+            hist[(std::size_t)ib]+=w;
+          };
+          addAuditHist(ratio,localHist);
+          addAuditHist(ratioRaw,localRawHist);
+          addAuditHist(ratioDev,localDevHist);
+        }
+        if(ratio>localMax) {
+          localMax=ratio;
+          double zq=0.0; for(int i=0;i<4;++i) zq+=rq.lam[i]*(double)cp.z[i];
+          const double fRef=(pipe.re>0.0)?0.3164*std::pow(pipe.re,-0.25):0.0;
+          const double uTauRef=std::abs(pipe.bulkVelocity)*std::sqrt(std::max(0.0,fRef/8.0));
+          localMaxAudit.cellGid=(long long)cp.diagnosticCellGid;
+          localMaxAudit.q=(int)q; localMaxAudit.x=xq; localMaxAudit.y=yq; localMaxAudit.z=zq;
+          localMaxAudit.zOverL=(pipe.L>0.0)?(zq-pipe.zIn)/pipe.L:0.0;
+          localMaxAudit.rOverR=(pipe.R>0.0)?r/pipe.R:0.0;
+          localMaxAudit.yPlusRefBlasius=(pipe.R>0.0)?std::max(0.0,pipe.R-r)*uTauRef/nu:0.0;
+          localMaxAudit.lmOverR=(pipe.R>0.0)?ell/pipe.R:0.0;
+          localMaxAudit.nuTRatio=ratio; localMaxAudit.twoSdotS=twoSdotS; localMaxAudit.strain=strain;
+          localMaxAudit.divU=divU;
+          localMaxAudit.nuTRatioRaw=ratioRaw; localMaxAudit.twoSdotSRaw=twoSdotSRaw; localMaxAudit.strainRaw=strainRaw;
+          localMaxAudit.nuTRatioDev=ratioDev; localMaxAudit.twoSdotSDev=twoSdotSDev; localMaxAudit.strainDev=strainDev;
+          localMaxAudit.Sxx=S[0][0]; localMaxAudit.Syy=S[1][1]; localMaxAudit.Szz=S[2][2];
+          localMaxAudit.Sxy=S[0][1]; localMaxAudit.Sxz=S[0][2]; localMaxAudit.Syz=S[1][2];
+        }
+      }
+    }
+
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a];
+      for(int b=0;b<8;++b) {
+        if(dynRefFree(cp.ref[b])) {
+          const std::uint8_t slot=cp.rowSlot[a][b];
+          if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"mixing-length diffusion missing row slot");
+          A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kt[a][b];
+        } else {
+          const PetscInt e=dynFixedEntity(cp.ref[b]);
+          for(int d=0;d<3;++d) {
+            const double ud=entityDirValue(D,d,e);
+            if(ud!=0.0) A.mixlenRhs[d][(std::size_t)lr]-=Kt[a][b]*ud;
+          }
+        }
+      }
+    }
+  }
+
+  double globalMin=0.0,globalMax=0.0,globalWeighted=0.0,globalWeight=0.0;
+  double globalEllMin=0.0,globalEllMax=0.0,globalStrainMax=0.0;
+  double globalRawMax=0.0,globalDevMax=0.0,globalRawStrainMax=0.0,globalDevStrainMax=0.0;
+  unsigned long long globalSamples=0;
+  PetscCallMPI(MPI_Allreduce(&localMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWeighted,&globalWeighted,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWeight,&globalWeight,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localEllMin,&globalEllMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localEllMax,&globalEllMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localStrainMax,&globalStrainMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRawMax,&globalRawMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localDevMax,&globalDevMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRawStrainMax,&globalRawStrainMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localDevStrainMax,&globalDevStrainMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localSamples,&globalSamples,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+
+  stats.nuTRatioMin=globalSamples?globalMin:0.0;
+  stats.nuTRatioMean=(globalWeight>0.0)?globalWeighted/globalWeight:0.0;
+  stats.nuTRatioMax=globalSamples?globalMax:0.0;
+  stats.ellMin=globalSamples?globalEllMin:0.0;
+  stats.ellMax=globalSamples?globalEllMax:0.0;
+  stats.strainMax=globalStrainMax;
+  stats.nuTRatioP95=stats.nuTRatioP99=stats.nuTRatioP999=0.0;
+  stats.volFracGT100=stats.volFracGT300=stats.volFracGT1000=0.0;
+  stats.rawP95=stats.rawP99=stats.rawP999=0.0; stats.rawMax=globalRawMax; stats.rawStrainMax=globalRawStrainMax;
+  stats.devP95=stats.devP99=stats.devP999=0.0; stats.devMax=globalDevMax; stats.devStrainMax=globalDevStrainMax;
+  stats.maxAudit={};
+  stats.quadratureSamples=globalSamples;
+
+  if(detailedAudit && globalSamples) {
+    double localGT[3]={localWeightGT100,localWeightGT300,localWeightGT1000},globalGT[3]={0,0,0};
+    PetscCallMPI(MPI_Allreduce(localGT,globalGT,3,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    if(globalWeight>0.0) {
+      stats.volFracGT100=globalGT[0]/globalWeight; stats.volFracGT300=globalGT[1]/globalWeight; stats.volFracGT1000=globalGT[2]/globalWeight;
+    }
+    std::vector<double> globalHist(auditBins,0.0),globalRawHist(auditBins,0.0),globalDevHist(auditBins,0.0);
+    PetscCallMPI(MPI_Allreduce(localHist.data(),globalHist.data(),auditBins,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(localRawHist.data(),globalRawHist.data(),auditBins,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(localDevHist.data(),globalDevHist.data(),auditBins,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    auto histQuantile=[&](const std::vector<double>& hist,double qv) {
+      if(!(globalWeight>0.0)) return 0.0;
+      const double target=qv*globalWeight; double c=0.0; int ib=auditBins-1;
+      for(int i=0;i<auditBins;++i) { c+=hist[(std::size_t)i]; if(c>=target) { ib=i; break; } }
+      const double t=((double)ib+0.5)/(double)(auditBins-1);
+      return std::expm1(std::min(1.0,t)*auditLogMax);
+    };
+    stats.nuTRatioP95=histQuantile(globalHist,0.95); stats.nuTRatioP99=histQuantile(globalHist,0.99); stats.nuTRatioP999=histQuantile(globalHist,0.999);
+    stats.rawP95=histQuantile(globalRawHist,0.95); stats.rawP99=histQuantile(globalRawHist,0.99); stats.rawP999=histQuantile(globalRawHist,0.999);
+    stats.devP95=histQuantile(globalDevHist,0.95); stats.devP99=histQuantile(globalDevHist,0.99); stats.devP999=histQuantile(globalDevHist,0.999);
+
+    struct { double value; int rank; } localPair{localMax,rank},globalPair{0.0,0};
+    PetscCallMPI(MPI_Allreduce(&localPair,&globalPair,1,MPI_DOUBLE_INT,MPI_MAXLOC,PETSC_COMM_WORLD));
+    if(rank==globalPair.rank) stats.maxAudit=localMaxAudit;
+    PetscCallMPI(MPI_Bcast(&stats.maxAudit,(int)sizeof(stats.maxAudit),MPI_BYTE,globalPair.rank,PETSC_COMM_WORLD));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// Stage-3 weak Spalding wall function for the straight z-axis pipe.
+//
+// The cylindrical wall has n_z=0, therefore the axial Uz trace is exactly
+// tangential.  We keep Ux/Uy strongly zero through the algebraic wall clamp and
+// impose only the axial condition weakly:
+//
+//   -int_Gamma nu (dn u) w
+//   -int_Gamma nu (dn w) u
+//   +int_Gamma beta_w u w,
+//       beta_w = u_tau^2 / |u_t|
+//
+// with u_tau obtained from Spalding's all-y+ law using y = distanceFactor*h_n,
+// h_n=3V/A_f.  At U_t -> 0 the coefficient tends smoothly to nu/y.
+//
+// No extra C*nu/h tangential penalty is added: beta_w itself is the wall-model
+// penalty.  The legacy/default linearization is the lagged secant beta_w.
+// An optional consistent-tangent mode replaces only the wall Jacobian and adds
+// the compensating RHS required to preserve the exact same nonlinear fixed point.
+// -----------------------------------------------------------------------------
+struct WallFunctionStats {
+  double betaMin=0.0,betaMean=0.0,betaMax=0.0;
+  double tangentMin=0.0,tangentMean=0.0,tangentMax=0.0;
+  double usedJacMin=0.0,usedJacMean=0.0,usedJacMax=0.0;
+  double tangentRatioMin=0.0,tangentRatioMean=0.0,tangentRatioMax=0.0;
+  double tangentRhsAbsMin=0.0,tangentRhsAbsMean=0.0,tangentRhsAbsMax=0.0;
+  double yPlusMin=0.0,yPlusMean=0.0,yPlusMax=0.0;
+  double uTauMin=0.0,uTauMean=0.0,uTauMax=0.0;
+  double uTau2Mean=0.0,fWallSpalding=0.0;
+  std::array<double,10> axialArea{};
+  std::array<double,10> axialUTau2Integral{};
+  double slipMin=0.0,slipMean=0.0,slipMax=0.0;
+  double yMin=0.0,yMean=0.0,yMax=0.0;
+  double maxAbsNormalZ=0.0;
+  unsigned long long wallFaces=0,quadratureSamples=0,rootFailures=0,tangentFailures=0;
+};
+
+struct TriangleQuadPoint {
+  double l[3];
+  double w;
+};
+
+static const std::array<TriangleQuadPoint,7>& triangleDunavant7() {
+  static const std::array<TriangleQuadPoint,7> Q={{
+    {{1.0/3.0,1.0/3.0,1.0/3.0},0.225000000000000},
+    {{0.059715871789770,0.470142064105115,0.470142064105115},0.132394152788506},
+    {{0.470142064105115,0.059715871789770,0.470142064105115},0.132394152788506},
+    {{0.470142064105115,0.470142064105115,0.059715871789770},0.132394152788506},
+    {{0.797426985353087,0.101286507323456,0.101286507323456},0.125939180544827},
+    {{0.101286507323456,0.797426985353087,0.101286507323456},0.125939180544827},
+    {{0.101286507323456,0.101286507323456,0.797426985353087},0.125939180544827}
+  }};
+  return Q;
+}
+
+static double spaldingYPlusFromUPlus(double up,double kappa,double B) {
+  if(!(up>=0.0)) return std::numeric_limits<double>::quiet_NaN();
+  const double x=kappa*up;
+  double rem=0.0;
+  if(std::abs(x)<1e-3) {
+    const double x2=x*x,x4=x2*x2;
+    rem=x4*(1.0/24.0 + x/120.0 + x2/720.0 + x2*x/5040.0);
+  } else {
+    rem=std::expm1(x)-x-0.5*x*x-(x*x*x)/6.0;
+  }
+  return up + std::exp(-kappa*B)*rem;
+}
+
+// Derivative d(y+)/d(u+) of the Spalding map above.  A small-x series
+// avoids cancellation in exp(x)-1-x-x^2/2.
+static double spaldingYPlusDerivativeFromUPlus(double up,double kappa,double B) {
+  if(!(up>=0.0)) return std::numeric_limits<double>::quiet_NaN();
+  const double x=kappa*up;
+  double remPrimeOverKappa=0.0;
+  if(std::abs(x)<1e-3) {
+    const double x2=x*x,x3=x2*x;
+    remPrimeOverKappa=x3*(1.0/6.0 + x/24.0 + x2/120.0 + x3/720.0);
+  } else {
+    remPrimeOverKappa=std::expm1(x)-x-0.5*x*x;
+  }
+  return 1.0 + std::exp(-kappa*B)*kappa*remPrimeOverKappa;
+}
+
+// Consistent scalar tangent of signed Spalding wall traction
+// tau_w(U)=u_tau(|U|)^2 sign(U).  beta is the secant tau_w/U.
+// For U -> 0 the wall law is linear and tangent == beta == nu/y.
+static bool spaldingTangentFromSolvedState(
+    double uPlus,double beta,double kappa,double B,double& tangent,double& tangentRatio) {
+  if(!(beta>0.0) || !std::isfinite(beta) || !(uPlus>=0.0) || !std::isfinite(uPlus)) return false;
+  if(uPlus<=1e-14) { tangent=beta; tangentRatio=1.0; return true; }
+  const double F=spaldingYPlusFromUPlus(uPlus,kappa,B);
+  const double Fp=spaldingYPlusDerivativeFromUPlus(uPlus,kappa,B);
+  const double den=F+uPlus*Fp;
+  if(!(F>0.0) || !(Fp>0.0) || !(den>0.0) || !std::isfinite(den)) return false;
+  tangentRatio=2.0*uPlus*Fp/den;
+  tangent=beta*tangentRatio;
+  return std::isfinite(tangent) && tangent>0.0 && std::isfinite(tangentRatio) && tangentRatio>0.0;
+}
+
+static bool spaldingPenaltyFromSlip(double slip,double y,double nu,double kappa,double B,
+                                    double& uTau,double& yPlus,double& uPlus,double& beta) {
+  if(!(y>0.0) || !(nu>0.0) || !(kappa>0.0) || !(B>0.0) || !std::isfinite(slip))
+    return false;
+  const double U=std::abs(slip);
+  const double reY=y*U/nu;
+  if(reY<=1e-14) {
+    uTau=0.0; yPlus=0.0; uPlus=0.0; beta=nu/y;
+    return std::isfinite(beta);
+  }
+
+  auto g=[&](double up)->double {
+    return up*spaldingYPlusFromUPlus(up,kappa,B)-reY;
+  };
+
+  double lo=0.0,hi=std::max(1.0,std::sqrt(reY)+1.0);
+  int expand=0;
+  while(g(hi)<0.0 && expand<40) { hi*=2.0; ++expand; }
+  if(!std::isfinite(g(hi)) || g(hi)<0.0) return false;
+
+  for(int it=0;it<70;++it) {
+    const double mid=0.5*(lo+hi);
+    if(g(mid)>0.0) hi=mid; else lo=mid;
+  }
+  uPlus=0.5*(lo+hi);
+  if(!(uPlus>0.0) || !std::isfinite(uPlus)) return false;
+  uTau=U/uPlus;
+  yPlus=y*uTau/nu;
+  beta=(uTau*uTau)/U;
+  return std::isfinite(uTau) && std::isfinite(yPlus) && std::isfinite(beta) && beta>0.0;
+}
+
+// NODALS_TET_WALL_FIREDRAKE_PARITY_BCD_20260908
+// NODALS_TET_WALL_AXIAL_FRICTION_BINS_20260908
+// legacy_face_trace + molecularConsistency=1 remains the historical oracle.
+// offwall_quarterplane evaluates the exact P1+BF3 trial trace at the tet
+// barycentric plane lambda_opp=distanceFactor and measures the physical radial
+// wall-to-sample distance.  Molecular Nitsche consistency is independently
+// switchable so B/C/D isolate the two changes.
+static PetscErrorCode assembleSpaldingWeakWallCustom(
+    const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,
+    double nu,double kappa,double B,double distanceFactor,double betaScale,double pipeCx,double pipeCy,
+    const std::string& wallLinearization,double wallTangentBlend,
+    const std::string& wallSampleMode,PetscBool wallMolecularConsistency,double bulkVelocity,
+    double pipeZIn,double pipeLength,
+    WallFunctionStats& stats) {
+  PetscFunctionBeginUser;
+  if(!(nu>0.0) || !(kappa>0.0) || !(B>0.0) || !(distanceFactor>0.0) || betaScale<0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"invalid Stage-3 Spalding wall parameters");
+  if(wallLinearization!="secant" && wallLinearization!="consistent_tangent")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"wall linearization must be secant or consistent_tangent");
+  if(!(wallTangentBlend>=0.0 && wallTangentBlend<=1.0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"wall tangent blend must satisfy 0 <= blend <= 1");
+  const bool useConsistentTangent=(wallLinearization=="consistent_tangent");
+  const bool offwallSample=(wallSampleMode=="offwall_quarterplane");
+  if(wallSampleMode!="legacy_face_trace" && !offwallSample)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"wall sample mode must be legacy_face_trace or offwall_quarterplane");
+  if(offwallSample && !(distanceFactor>0.0 && distanceFactor<1.0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"offwall_quarterplane requires 0 < wall_distance_factor < 1");
+  if(!(bulkVelocity>0.0) || !std::isfinite(bulkVelocity))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"Spalding wall diagnostic requires positive bulk velocity");
+  if(!(pipeLength>0.0) || !std::isfinite(pipeZIn) || !std::isfinite(pipeLength))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"Spalding axial-bin diagnostic requires finite zIn and positive pipe length");
+  for(int d=0;d<3;++d) {
+    if((PetscInt)A.wallRhs[d].size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Stage-3 wall RHS storage not enabled");
+    std::fill(A.wallRhs[d].begin(),A.wallRhs[d].end(),0.0);
+  }
+
+  double lBetaMin=1e300,lBetaMax=0.0,lBetaW=0.0;
+  double lTanMin=1e300,lTanMax=0.0,lTanW=0.0;
+  double lUsedJacMin=1e300,lUsedJacMax=0.0,lUsedJacW=0.0;
+  double lTanRatioMin=1e300,lTanRatioMax=0.0,lTanRatioW=0.0;
+  double lTanRhsMin=1e300,lTanRhsMax=0.0,lTanRhsW=0.0;
+  double lYpMin=1e300,lYpMax=0.0,lYpW=0.0;
+  double lUtMin=1e300,lUtMax=0.0,lUtW=0.0,lUt2W=0.0;
+  double lSlipMin=1e300,lSlipMax=0.0,lSlipW=0.0;
+  double lYMin=1e300,lYMax=0.0,lYW=0.0,lAreaW=0.0,lNz=0.0;
+  std::array<double,10> lAxialArea{};
+  std::array<double,10> lAxialUTau2Integral{};
+  unsigned long long lFaces=0,lSamples=0,lFail=0,lTanFail=0;
+
+  const auto& FQ=triangleDunavant7();
+  for(const auto& wf:P.wallFaces) {
+    if((std::size_t)wf.cellIndex>=P.cells.size())
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Stage-3 wall-face references invalid runtime cell");
+    const auto& cp=P.cells[(std::size_t)wf.cellIndex];
+    const int opp=(int)wf.opp;
+    if(opp<0 || opp>3 || !(wf.area>0.0) || !(wf.hn>0.0))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"invalid Stage-3 wall-face geometry");
+    const double legacyY=distanceFactor*wf.hn;
+    // Individual planar facets on the triangulated cylinder can have n_z != 0
+    // even though the underlying physical cylinder is exactly z-aligned. Use
+    // the analytic radial cylinder normal for the weak wall flux and retain the
+    // facet |n_z| only as a geometry diagnostic.
+    const double nz=std::abs(wf.normal[2]);
+
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(dynRefFree(cp.ref[m])) {
+        for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]);
+      } else {
+        const PetscInt e=dynFixedEntity(cp.ref[m]);
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e);
+      }
+    }
+
+    int fv[3],kk=0;
+    for(int i=0;i<4;++i) if(i!=opp) fv[kk++]=i;
+    double W[8][8]={{0}};
+    double Rtangent[8]={0};
+
+    for(const auto& q:FQ) {
+      std::array<double,4> lam{{0.0,0.0,0.0,0.0}};
+      for(int j=0;j<3;++j) lam[fv[j]]=q.l[j];
+      double phiWall[8],gradRefWall[8][3],gradWall[8][3]={{0}};
+      basis(lam,phiWall,gradRefWall);
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d)
+        for(int j=0;j<3;++j) gradWall[a][d]+=gradRefWall[a][j]*cp.invJ[j][d];
+
+      double xq=0.0,yq=0.0;
+      for(int i=0;i<4;++i) { xq+=lam[i]*cp.xy[i][0]; yq+=lam[i]*cp.xy[i][1]; }
+      const double rx=xq-pipeCx, ry=yq-pipeCy, rr=std::hypot(rx,ry);
+      if(!(rr>0.0) || !std::isfinite(rr))
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"invalid Stage-3 analytic radial wall normal");
+      const double nwx=rx/rr, nwy=ry/rr; // analytic cylinder normal; n_w,z = 0 exactly
+
+      // Trial trace used by the Spalding traction.  The legacy path samples on
+      // the wall face.  Firedrake-parity mode moves the wall quadrature point
+      // to a parallel interior tet plane:
+      //   lambda_opp = distanceFactor,
+      //   lambda_i   = (1-distanceFactor)*lambda_i_wall, i != opp.
+      // With distanceFactor=0.25 this is the affine-tet centroid depth because
+      // a tet centroid has all four barycentric coordinates equal to 1/4.
+      double phiSample[8];
+      for(int a=0;a<8;++a) phiSample[a]=phiWall[a];
+      double y=legacyY;
+      if(offwallSample) {
+        std::array<double,4> lamSample=lam;
+        for(int i=0;i<4;++i) if(i!=opp) lamSample[i]*=(1.0-distanceFactor);
+        lamSample[opp]=distanceFactor;
+        double gradRefSampleDummy[8][3];
+        basis(lamSample,phiSample,gradRefSampleDummy);
+
+        double xsx=0.0,xsy=0.0;
+        for(int i=0;i<4;++i) { xsx+=lamSample[i]*cp.xy[i][0]; xsy+=lamSample[i]*cp.xy[i][1]; }
+        y=std::abs((xq-xsx)*nwx + (yq-xsy)*nwy);
+        if(!(y>0.0) || !std::isfinite(y))
+          SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"invalid tet off-wall Spalding sample distance");
+      }
+
+      double uz=0.0;
+      for(int a=0;a<8;++a) uz+=coeff[2][a]*phiSample[a];
+      const double slip=std::abs(uz);
+
+      double uTau=0.0,yPlus=0.0,uPlus=0.0,beta=0.0;
+      const bool ok=spaldingPenaltyFromSlip(slip,y,nu,kappa,B,uTau,yPlus,uPlus,beta);
+      if(!ok) {
+        if(wf.diagnosticOwner) ++lFail;
+        beta=nu/y; uTau=0.0; yPlus=0.0; uPlus=0.0;
+      }
+
+      // beta is the current secant tau_w/U.  The consistent tangent is the
+      // exact derivative d(tau_w)/dU of the same signed Spalding traction.
+      // betaScale multiplies both so changing the linearization does not alter
+      // the nonlinear wall law.  In consistent_tangent mode a blend theta is
+      // allowed between the old secant and the full tangent.
+      double tangent=beta,tangentRatio=1.0;
+      if(ok && !spaldingTangentFromSolvedState(uPlus,beta,kappa,B,tangent,tangentRatio)) {
+        if(wf.diagnosticOwner) ++lTanFail;
+        tangent=beta; tangentRatio=1.0;
+      }
+      beta*=betaScale;
+      tangent*=betaScale;
+      const double usedJac=useConsistentTangent ? beta+wallTangentBlend*(tangent-beta) : beta;
+      // Residual has +tau_w(U).  Newton/Picard linearization
+      // tau_w(U_new) ~= usedJac*U_new + (beta-usedJac)*U_old, hence
+      // A*U_new = ... + (usedJac-beta)*U_old.  This compensating RHS is
+      // essential: omitting it would change the converged wall condition.
+      const double tangentRhsDensity=(usedJac-beta)*uz;
+      const double tangentRhsAbs=std::abs(tangentRhsDensity);
+      const double w=q.w*wf.area;
+
+      double dnWall[8]={0};
+      for(int a=0;a<8;++a)
+        dnWall[a]=gradWall[a][0]*nwx+gradWall[a][1]*nwy;
+
+      for(int a=0;a<8;++a) {
+        for(int b=0;b<8;++b) {
+          // Keep the historical molecular Nitsche pair strictly wall-wall when
+          // enabled.  This makes B isolate sampling and C isolate consistency.
+          const double molecular=wallMolecularConsistency
+            ? (-nu*dnWall[b]*phiWall[a]-nu*dnWall[a]*phiWall[b]) : 0.0;
+          // Spalding Robin traction is wall-test x sampled-trial in off-wall
+          // mode, and reduces exactly to wall-test x wall-trial in legacy mode.
+          W[a][b]+=(molecular+usedJac*phiWall[a]*phiSample[b])*w;
+        }
+        Rtangent[a]+=tangentRhsDensity*phiWall[a]*w;
+      }
+
+      if(wf.diagnosticOwner) {
+        lBetaMin=std::min(lBetaMin,beta); lBetaMax=std::max(lBetaMax,beta); lBetaW+=beta*w;
+        lTanMin=std::min(lTanMin,tangent); lTanMax=std::max(lTanMax,tangent); lTanW+=tangent*w;
+        lUsedJacMin=std::min(lUsedJacMin,usedJac); lUsedJacMax=std::max(lUsedJacMax,usedJac); lUsedJacW+=usedJac*w;
+        lTanRatioMin=std::min(lTanRatioMin,tangentRatio); lTanRatioMax=std::max(lTanRatioMax,tangentRatio); lTanRatioW+=tangentRatio*w;
+        lTanRhsMin=std::min(lTanRhsMin,tangentRhsAbs); lTanRhsMax=std::max(lTanRhsMax,tangentRhsAbs); lTanRhsW+=tangentRhsAbs*w;
+        lYpMin=std::min(lYpMin,yPlus); lYpMax=std::max(lYpMax,yPlus); lYpW+=yPlus*w;
+        lUtMin=std::min(lUtMin,uTau); lUtMax=std::max(lUtMax,uTau); lUtW+=uTau*w; lUt2W+=uTau*uTau*w;
+        lSlipMin=std::min(lSlipMin,slip); lSlipMax=std::max(lSlipMax,slip); lSlipW+=slip*w;
+        lYMin=std::min(lYMin,y); lYMax=std::max(lYMax,y); lYW+=y*w;
+        lAreaW+=w; lNz=std::max(lNz,nz); ++lSamples;
+        double zq=0.0;
+        for(int i=0;i<4;++i) zq+=lam[i]*(double)cp.z[i];
+        const double zFrac=(zq-pipeZIn)/pipeLength;
+        int axialBin=(int)std::floor(10.0*zFrac);
+        axialBin=std::max(0,std::min(9,axialBin));
+        lAxialArea[(std::size_t)axialBin]+=w;
+        lAxialUTau2Integral[(std::size_t)axialBin]+=uTau*uTau*w;
+      }
+    }
+
+    if(wf.diagnosticOwner) ++lFaces;
+
+    // The matrix is shared by all scalar components.  For Ux/Uy every wall
+    // trace DOF is clamped to zero, so these Nitsche rows/columns are inactive.
+    // For Uz the same entries provide the weak wall-function operator.
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii];
+      const PetscInt lr=cp.ref[a];
+      A.wallRhs[2][(std::size_t)lr]+=Rtangent[a];
+      for(int b=0;b<8;++b) {
+        if(dynRefFree(cp.ref[b])) {
+          const std::uint8_t slot=cp.rowSlot[a][b];
+          if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Stage-3 wall operator missing row slot");
+          A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=W[a][b];
+        } else {
+          const PetscInt e=dynFixedEntity(cp.ref[b]);
+          const double uzFixed=entityDirValue(D,2,e);
+          if(uzFixed!=0.0) A.wallRhs[2][(std::size_t)lr]-=W[a][b]*uzFixed;
+        }
+      }
+    }
+  }
+
+  auto redMin=[&](double l,double& g){PetscCallMPI(MPI_Allreduce(&l,&g,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));return PETSC_SUCCESS;};
+  auto redMax=[&](double l,double& g){PetscCallMPI(MPI_Allreduce(&l,&g,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));return PETSC_SUCCESS;};
+  auto redSum=[&](double l,double& g){PetscCallMPI(MPI_Allreduce(&l,&g,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));return PETSC_SUCCESS;};
+  double gBetaMin=0,gBetaMax=0,gBetaW=0,gTanMin=0,gTanMax=0,gTanW=0,gUsedJacMin=0,gUsedJacMax=0,gUsedJacW=0;
+  double gTanRatioMin=0,gTanRatioMax=0,gTanRatioW=0,gTanRhsMin=0,gTanRhsMax=0,gTanRhsW=0;
+  double gYpMin=0,gYpMax=0,gYpW=0,gUtMin=0,gUtMax=0,gUtW=0,gUt2W=0;
+  double gSlipMin=0,gSlipMax=0,gSlipW=0,gYMin=0,gYMax=0,gYW=0,gAreaW=0,gNz=0;
+  std::array<double,10> gAxialArea{};
+  std::array<double,10> gAxialUTau2Integral{};
+  PetscCall(redMin(lBetaMin,gBetaMin)); PetscCall(redMax(lBetaMax,gBetaMax)); PetscCall(redSum(lBetaW,gBetaW));
+  PetscCall(redMin(lTanMin,gTanMin)); PetscCall(redMax(lTanMax,gTanMax)); PetscCall(redSum(lTanW,gTanW));
+  PetscCall(redMin(lUsedJacMin,gUsedJacMin)); PetscCall(redMax(lUsedJacMax,gUsedJacMax)); PetscCall(redSum(lUsedJacW,gUsedJacW));
+  PetscCall(redMin(lTanRatioMin,gTanRatioMin)); PetscCall(redMax(lTanRatioMax,gTanRatioMax)); PetscCall(redSum(lTanRatioW,gTanRatioW));
+  PetscCall(redMin(lTanRhsMin,gTanRhsMin)); PetscCall(redMax(lTanRhsMax,gTanRhsMax)); PetscCall(redSum(lTanRhsW,gTanRhsW));
+  PetscCall(redMin(lYpMin,gYpMin)); PetscCall(redMax(lYpMax,gYpMax)); PetscCall(redSum(lYpW,gYpW));
+  PetscCall(redMin(lUtMin,gUtMin)); PetscCall(redMax(lUtMax,gUtMax)); PetscCall(redSum(lUtW,gUtW)); PetscCall(redSum(lUt2W,gUt2W));
+  PetscCall(redMin(lSlipMin,gSlipMin)); PetscCall(redMax(lSlipMax,gSlipMax)); PetscCall(redSum(lSlipW,gSlipW));
+  PetscCall(redMin(lYMin,gYMin)); PetscCall(redMax(lYMax,gYMax)); PetscCall(redSum(lYW,gYW));
+  PetscCall(redSum(lAreaW,gAreaW)); PetscCall(redMax(lNz,gNz));
+  PetscCallMPI(MPI_Allreduce(lAxialArea.data(),gAxialArea.data(),10,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(lAxialUTau2Integral.data(),gAxialUTau2Integral.data(),10,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  unsigned long long gFaces=0,gSamples=0,gFail=0,gTanFail=0;
+  PetscCallMPI(MPI_Allreduce(&lFaces,&gFaces,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lSamples,&gSamples,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lFail,&gFail,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lTanFail,&gTanFail,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+
+  if(gFaces==0 || gSamples==0 || !(gAreaW>0.0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"Stage-3 weak wall enabled but no cylindrical wall-face quadrature samples were found");
+  stats.wallFaces=gFaces; stats.quadratureSamples=gSamples; stats.rootFailures=gFail; stats.tangentFailures=gTanFail; stats.maxAbsNormalZ=gNz;
+  if(gSamples && gAreaW>0.0) {
+    stats.betaMin=gBetaMin; stats.betaMean=gBetaW/gAreaW; stats.betaMax=gBetaMax;
+    stats.tangentMin=gTanMin; stats.tangentMean=gTanW/gAreaW; stats.tangentMax=gTanMax;
+    stats.usedJacMin=gUsedJacMin; stats.usedJacMean=gUsedJacW/gAreaW; stats.usedJacMax=gUsedJacMax;
+    stats.tangentRatioMin=gTanRatioMin; stats.tangentRatioMean=gTanRatioW/gAreaW; stats.tangentRatioMax=gTanRatioMax;
+    stats.tangentRhsAbsMin=gTanRhsMin; stats.tangentRhsAbsMean=gTanRhsW/gAreaW; stats.tangentRhsAbsMax=gTanRhsMax;
+    stats.yPlusMin=gYpMin; stats.yPlusMean=gYpW/gAreaW; stats.yPlusMax=gYpMax;
+    stats.uTauMin=gUtMin; stats.uTauMean=gUtW/gAreaW; stats.uTauMax=gUtMax;
+    stats.uTau2Mean=gUt2W/gAreaW;
+    stats.fWallSpalding=8.0*betaScale*stats.uTau2Mean/(bulkVelocity*bulkVelocity);
+    stats.axialArea=gAxialArea;
+    stats.axialUTau2Integral=gAxialUTau2Integral;
+    stats.slipMin=gSlipMin; stats.slipMean=gSlipW/gAreaW; stats.slipMax=gSlipMax;
+    stats.yMin=gYMin; stats.yMean=gYW/gAreaW; stats.yMax=gYMax;
+  } else stats={};
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleCentralConvectionCustom(const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A) {
+  PetscFunctionBeginUser;
+  const auto& T=centralTensor(); for(auto& r:A.convRhs) std::fill(r.begin(),r.end(),0.0);
+  for(const auto& cp:P.cells) {
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) { if(dynRefFree(cp.ref[m])) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]); else { const PetscInt e=dynFixedEntity(cp.ref[m]); for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e); } }
+    double uref[8][3]={{0}}; for(int m=0;m<8;++m) for(int j=0;j<3;++j) for(int d=0;d<3;++d) uref[m][j]+=coeff[d][m]*cp.invJ[j][d];
+    double Cl[8][8]={{0}}; for(int a=0;a<8;++a) for(int b=0;b<8;++b) { double v=0.0; for(int m=0;m<8;++m) for(int j=0;j<3;++j) v+=uref[m][j]*T.t[a][m][b][j]; Cl[a][b]=cp.det*v; }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) { const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a]; for(int b=0;b<8;++b) { if(dynRefFree(cp.ref[b])) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact central missing row slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Cl[a][b]; } else { const PetscInt e=dynFixedEntity(cp.ref[b]); for(int d=0;d<3;++d) A.convRhs[d][(std::size_t)lr]-=Cl[a][b]*entityDirValue(D,d,e); } } }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static inline double supgNikuradseNuT(
+    const double coeff[3][8],const double gradBasis[8][3],const std::array<double,4>& lam,
+    const double xy[4][2],const PipeGeometry& pipe,double nutScale) {
+  if(!(nutScale>0.0) || !(pipe.R>0.0)) return 0.0;
+  double gradU[3][3]={{0}};
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+    for(int a=0;a<8;++a) gradU[i][j]+=coeff[i][a]*gradBasis[a][j];
+  double ss=0.0;
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j) {
+    const double sij=0.5*(gradU[i][j]+gradU[j][i]);
+    ss+=sij*sij;
+  }
+  const double strain=std::sqrt(std::max(0.0,2.0*ss));
+  double xq=0.0,yq=0.0;
+  for(int i=0;i<4;++i) { xq+=lam[(std::size_t)i]*xy[i][0]; yq+=lam[(std::size_t)i]*xy[i][1]; }
+  const double dx=xq-pipe.cx,dy=yq-pipe.cy;
+  const double eta=std::min(1.0,std::max(0.0,std::sqrt(dx*dx+dy*dy)/pipe.R));
+  const double eta2=eta*eta,eta4=eta2*eta2;
+  const double ell=pipe.R*std::max(0.0,0.14-0.08*eta2-0.06*eta4);
+  return nutScale*ell*ell*strain;
+}
+
+
+static const std::array<TriangleQuadPoint,12>& triangleDunavant12Degree6() {
+  static const std::array<TriangleQuadPoint,12> Q={{
+    {{0.063089014491502,0.063089014491502,0.873821971016996},0.050844906370207},
+    {{0.063089014491502,0.873821971016996,0.063089014491502},0.050844906370207},
+    {{0.873821971016996,0.063089014491502,0.063089014491502},0.050844906370207},
+    {{0.249286745170910,0.249286745170910,0.501426509658180},0.116786275726379},
+    {{0.249286745170910,0.501426509658180,0.249286745170910},0.116786275726379},
+    {{0.501426509658180,0.249286745170910,0.249286745170910},0.116786275726379},
+    {{0.053145049844816,0.310352451033785,0.636502499121399},0.082851075618374},
+    {{0.053145049844816,0.636502499121399,0.310352451033785},0.082851075618374},
+    {{0.310352451033785,0.053145049844816,0.636502499121399},0.082851075618374},
+    {{0.310352451033785,0.636502499121399,0.053145049844816},0.082851075618374},
+    {{0.636502499121399,0.053145049844816,0.310352451033785},0.082851075618374},
+    {{0.636502499121399,0.310352451033785,0.053145049844816},0.082851075618374}
+  }};
+  return Q;
+}
+
+static inline double dgInletNikuradseNuT(
+    const double coeff[3][8],const double gradBasis[8][3],const std::array<double,4>& lam,
+    const double xy[4][2],const PipeGeometry& pipe,double nutScale,PetscBool deviatoricStrain) {
+  if(!(nutScale>0.0) || !(pipe.R>0.0)) return 0.0;
+  double gradU[3][3]={{0}};
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j)
+    for(int a=0;a<8;++a) gradU[i][j]+=coeff[i][a]*gradBasis[a][j];
+  double S[3][3]={{0}},ssRaw=0.0;
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j) {
+    S[i][j]=0.5*(gradU[i][j]+gradU[j][i]);
+    ssRaw+=S[i][j]*S[i][j];
+  }
+  const double divU=gradU[0][0]+gradU[1][1]+gradU[2][2];
+  const double thirdDiv=divU/3.0;
+  double ssDev=0.0;
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j) {
+    const double sd=S[i][j]-((i==j)?thirdDiv:0.0);
+    ssDev+=sd*sd;
+  }
+  const double strain=std::sqrt(std::max(0.0,2.0*(deviatoricStrain?ssDev:ssRaw)));
+  double xq=0.0,yq=0.0;
+  for(int i=0;i<4;++i) { xq+=lam[(std::size_t)i]*xy[i][0]; yq+=lam[(std::size_t)i]*xy[i][1]; }
+  const double dx=xq-pipe.cx,dy=yq-pipe.cy;
+  const double eta=std::min(1.0,std::max(0.0,std::sqrt(dx*dx+dy*dy)/pipe.R));
+  const double eta2=eta*eta,eta4=eta2*eta2;
+  const double ell=pipe.R*std::max(0.0,0.14-0.08*eta2-0.06*eta4);
+  return nutScale*ell*ell*strain;
+}
+
+static PetscErrorCode assembleDgNumericalTraceInletCustom(
+    const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,
+    const BoundaryGeometry& B,const PipeGeometry& pipe,double nu,
+    PetscBool mixingLength,double mixlenScale,PetscBool deviatoricStrain) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) {
+    if((PetscInt)A.inletRhs[d].size()!=A.nOwned) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"weak DG inlet RHS storage not enabled");
+    std::fill(A.inletRhs[d].begin(),A.inletRhs[d].end(),0.0);
+  }
+
+  const double uhat[3]={B.inletVelocity.x,B.inletVelocity.y,B.inletVelocity.z};
+  const auto& FQ=triangleDunavant12Degree6();
+  double localArea=0.0,localFlux=0.0;
+  double localCancel2=0.0,localCancelMax=0.0,localRhs2=0.0;
+  unsigned long long localFaces=0;
+  static PetscBool printed=PETSC_FALSE;
+
+  for(const auto& inf:P.inletFaces) {
+    const auto& cp=P.cells[(std::size_t)inf.cellIndex];
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(dynRefFree(cp.ref[m])) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]);
+      else {
+        const PetscInt e=dynFixedEntity(cp.ref[m]);
+        for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e);
+      }
+    }
+
+    int fv[3],kk=0;
+    for(int i=0;i<4;++i) if(i!=(int)inf.opp) fv[kk++]=i;
+    double G[8][8]={{0}},Rhs[3][8]={{0}};
+    const double bn=uhat[0]*inf.normal[0]+uhat[1]*inf.normal[1]+uhat[2]*inf.normal[2];
+    const double inflow=std::max(0.0,-bn);
+
+    for(const auto& q:FQ) {
+      std::array<double,4> lam{{0.0,0.0,0.0,0.0}};
+      for(int j=0;j<3;++j) lam[(std::size_t)fv[j]]=q.l[j];
+
+      double val[8],grr[8][3],gradBasis[8][3]={{0}};
+      basis(lam,val,grr);
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d)
+        for(int j=0;j<3;++j) gradBasis[a][d]+=grr[a][j]*cp.invJ[j][d];
+
+      const double nuT=mixingLength?dgInletNikuradseNuT(coeff,gradBasis,lam,cp.xy,pipe,mixlenScale,deviatoricStrain):0.0;
+      const double nuEff=nu+nuT;
+      const double w=q.w*inf.area;
+      double dn[8]={0};
+      for(int a=0;a<8;++a)
+        dn[a]=gradBasis[a][0]*inf.normal[0]+gradBasis[a][1]*inf.normal[1]+gradBasis[a][2]*inf.normal[2];
+
+      for(int a=0;a<8;++a) {
+        for(int b=0;b<8;++b)
+          G[a][b]+=w*(inflow*val[a]*val[b] + nuEff*(-val[a]*dn[b] + dn[a]*val[b]));
+        for(int d=0;d<3;++d)
+          Rhs[d][a]+=w*(inflow*val[a]*uhat[d] + nuEff*dn[a]*uhat[d]);
+      }
+    }
+
+    // Exact local consistency gate for the initialized plug:
+    // for U == Uhat, the weak inlet contribution must cancel elementwise,
+    //   G * Uhat - rhs == 0.
+    // This checks inflow + Nitsche signs, basis traces, normal derivatives,
+    // quadrature, and Uhat orientation independently of pressure/SIMPLE.
+    if(!printed) {
+      for(int d=0;d<3;++d) for(int a=0;a<8;++a) {
+        double rr=-Rhs[d][a];
+        for(int b=0;b<8;++b) rr+=G[a][b]*coeff[d][b];
+        localCancel2+=rr*rr;
+        localCancelMax=std::max(localCancelMax,std::abs(rr));
+        localRhs2+=Rhs[d][a]*Rhs[d][a];
+      }
+    }
+
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.ref[a];
+      for(int d=0;d<3;++d) A.inletRhs[d][(std::size_t)lr]+=Rhs[d][a];
+      for(int b=0;b<8;++b) {
+        if(dynRefFree(cp.ref[b])) {
+          const std::uint8_t slot=cp.rowSlot[a][b];
+          if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"weak DG inlet missing row slot");
+          A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=G[a][b];
+        } else {
+          const PetscInt e=dynFixedEntity(cp.ref[b]);
+          for(int d=0;d<3;++d) A.inletRhs[d][(std::size_t)lr]-=G[a][b]*entityDirValue(D,d,e);
+        }
+      }
+    }
+
+    if(inf.diagnosticOwner) {
+      localArea+=inf.area; localFlux+=bn*inf.area; ++localFaces;
+    }
+  }
+
+  if(!printed) {
+    double area=0.0,flux=0.0; unsigned long long faces=0;
+    double cancel2=0.0,cancelMax=0.0,rhs2=0.0;
+    PetscCallMPI(MPI_Allreduce(&localArea,&area,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&localFlux,&flux,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&localFaces,&faces,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&localCancel2,&cancel2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&localCancelMax,&cancelMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&localRhs2,&rhs2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    if(faces==0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"dg_numerical_trace global inlet-face audit found zero inlet faces");
+    const double cancelRel=std::sqrt(cancel2)/std::max(std::sqrt(rhs2),1.0e-300);
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DG_INLET_PLUG_MOMENTUM_CANCELLATION rel=%.12e maxAbs=%.12e rhsNorm=%.12e expected=roundoff status=%s\n",
+      cancelRel,cancelMax,std::sqrt(rhs2),cancelRel<=1.0e-11?"PASS":"FAIL"));
+    if(cancelRel>1.0e-11) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"DG weak inlet does not exactly preserve prescribed constant plug");
+    const double target=B.signedNormalSpeed*B.inletProjectedArea;
+    const double rel=std::abs(flux-target)/std::max(std::abs(target),1e-300);
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DG_INLET_TRACE mode=dg_numerical_trace faces=%llu area=%.12e projectedArea=%.12e Uhat=[%.12e,%.12e,%.12e] prescribedFlux=%.12e targetFlux=%.12e relFluxError=%.3e Btrace=P0_exact_P1_Aover3_BF3_9Aover20 momentum=inflow_plus_nonsymmetric_Nitsche inletQuad=Dunavant12_degree6_exact_BF3xBF3 nuEff=nu_plus_lagged_nuT status=%s\n",
+      faces,area,B.inletProjectedArea,uhat[0],uhat[1],uhat[2],flux,target,rel,rel<1e-12?"PASS":"CHECK"));
+    printed=PETSC_TRUE;
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleSupgCustom(const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A,double tauScale,double supgMagic,const std::string& form,PetscBool mixingLength,const PipeGeometry& pipe,double mixlenScale,PetscBool supgStrongMolecular,SupgStats& stats) {
+  PetscFunctionBeginUser;
+  const bool implicit=(form=="implicit"); if(!implicit && form!="explicit") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"SUPG form must be implicit or explicit");
+  for(auto& r:A.supgRhs) std::fill(r.begin(),r.end(),0.0); double localTauMin=1e300,localTauMax=0.0,localTauWeighted=0.0,localWeight=0.0;
+  for(std::size_t ic=0;ic<P.cells.size();++ic) {
+    const auto& cp=P.cells[ic]; double gradLambda[4][3]; dynGradLambdaFromInvJ(cp.invJ,gradLambda);
+    double coeff[3][8]={{0}}; for(int m=0;m<8;++m) { if(dynRefFree(cp.ref[m])) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.ref[m]); else { const PetscInt e=dynFixedEntity(cp.ref[m]); for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,e); } }
+    double Sl[8][8]={{0}},Vr[3][8]={{0}},gradLambdaDot[4][4]={{0}}; for(int i=0;i<4;++i) for(int j=i;j<4;++j){double v=0;for(int d=0;d<3;++d)v+=gradLambda[i][d]*gradLambda[j][d];gradLambdaDot[i][j]=gradLambdaDot[j][i]=v;}
+    for(PetscInt q=0;q<P.nQ;++q) {
+      const auto& rq=P.ref[(std::size_t)q]; const std::size_t iq=(ic*(std::size_t)P.nQ+(std::size_t)q)*3; double adv[3]={0,0,0}; for(int d=0;d<3;++d) for(int m=0;m<8;++m) adv[d]+=coeff[d][m]*rq.phi[m]; const double speed2=adv[0]*adv[0]+adv[1]*adv[1]+adv[2]*adv[2];
+      double gradBasis[8][3]={{0}},stream[8]={0},strongTrial[8]={0}; for(int a=0;a<4;++a) for(int d=0;d<3;++d) gradBasis[a][d]=gradLambda[a][d];
+      for(int i=0;i<4;++i){int js[3],kk=0;for(int j=0;j<4;++j)if(j!=i)js[kk++]=j;for(int d=0;d<3;++d)gradBasis[4+i][d]=27.0*(rq.lam[js[1]]*rq.lam[js[2]]*gradLambda[js[0]][d]+rq.lam[js[0]]*rq.lam[js[2]]*gradLambda[js[1]][d]+rq.lam[js[0]]*rq.lam[js[1]]*gradLambda[js[2]][d]);}
+      for(int a=0;a<8;++a)stream[a]=adv[0]*gradBasis[a][0]+adv[1]*gradBasis[a][1]+adv[2]*gradBasis[a][2]; for(int a=0;a<4;++a)strongTrial[a]=stream[a];
+      // Runtime A/B gate for the FIX4 SUPG strong-residual change.  The
+      // physical momentum diffusion remains nu+nu_t in both modes; only the
+      // viscous Laplacian inside the SUPG strong residual is switched.
+      const double nuTStrong=(!supgStrongMolecular && mixingLength)?supgNikuradseNuT(coeff,gradBasis,rq.lam,cp.xy,pipe,mixlenScale):0.0;
+      const double nuStrong=supgStrongMolecular?P.nu:(P.nu+nuTStrong);
+      for(int i=0;i<4;++i){int js[3],kk=0;for(int j=0;j<4;++j)if(j!=i)js[kk++]=j;const double lap=54.0*(rq.lam[js[2]]*gradLambdaDot[js[0]][js[1]]+rq.lam[js[1]]*gradLambdaDot[js[0]][js[2]]+rq.lam[js[0]]*gradLambdaDot[js[1]][js[2]]);strongTrial[4+i]=-nuStrong*lap+stream[4+i];}
+      const double diff=4.0*P.nu/cp.h2,den=std::max(4.0*speed2/cp.h2+supgMagic*diff*diff,1e-30),tau=tauScale/std::sqrt(den),w=tau*rq.w*cp.det,volumeW=rq.w*cp.det; localTauMin=std::min(localTauMin,tau);localTauMax=std::max(localTauMax,tau);localTauWeighted+=tau*volumeW;localWeight+=volumeW;
+      if(implicit){for(int a=0;a<8;++a){const double ta=w*stream[a];for(int b=0;b<8;++b)Sl[a][b]+=ta*strongTrial[b];if(!P.forcingZero)for(int d=0;d<3;++d)Vr[d][a]+=ta*P.forcing[iq+d];}}
+      else {double sr[3]={0,0,0};for(int d=0;d<3;++d){for(int b=0;b<8;++b)sr[d]+=coeff[d][b]*strongTrial[b];if(!P.forcingZero)sr[d]-=P.forcing[iq+d];}for(int a=0;a<8;++a){const double ta=-w*stream[a];for(int d=0;d<3;++d)Vr[d][a]+=ta*sr[d];}}
+    }
+    for(int ii=0;ii<(int)cp.nOwnedRows;++ii){const int a=(int)cp.ownedBasis[ii];const PetscInt lr=cp.ref[a];if(implicit){for(int b=0;b<8;++b){if(dynRefFree(cp.ref[b])){const std::uint8_t slot=cp.rowSlot[a][b];if(slot==255)SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact SUPG missing row slot");A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Sl[a][b];}else{const PetscInt e=dynFixedEntity(cp.ref[b]);for(int d=0;d<3;++d)A.supgRhs[d][(std::size_t)lr]-=Sl[a][b]*entityDirValue(D,d,e);}}}for(int d=0;d<3;++d)A.supgRhs[d][(std::size_t)lr]+=Vr[d][a];}
+  }
+  double globalMin=0,globalMax=0,globalTW=0,globalW=0; PetscCallMPI(MPI_Allreduce(&localTauMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localTauMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localTauWeighted,&globalTW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&localWeight,&globalW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));stats.tauMin=globalMin;stats.tauMax=globalMax;stats.tauMean=globalW?globalTW/globalW:0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustom(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
+  const auto& R=diffusionTensor();
+  for(const auto& cp:P.cells) {
+    double metric[3][3]={{0}};
+    for(int j=0;j<3;++j) for(int k=0;k<3;++k)
+      for(int d=0;d<3;++d) metric[j][k]+=cp.invJ[j][d]*cp.invJ[k][d];
+    double Kl[8][8]={{0}};
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
+      double v=0.0;
+      for(int j=0;j<3;++j) for(int k=0;k<3;++k) v+=R.t[a][b][j][k]*metric[j][k];
+      Kl[a][b]=scale*cp.det*v;
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii];
+      const PetscInt lr=cp.gid[a]-A.rstart;
+      for(int b=0;b<8;++b) if(cp.gid[b]>=0) {
+        const std::uint8_t slot=cp.rowSlot[a][b];
+        if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 static diffusion missing precomputed CSR slot");
+        A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Kl[a][b];
+      }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticDiffusionCustomLegacyQuadrature(const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,double scale) {
+  PetscFunctionBeginUser;
+  if(A.aRel.size()!=(std::size_t)A.rowPtr.back()) A.aRel.assign((std::size_t)A.rowPtr.back(),0.0);
+  else std::fill(A.aRel.begin(),A.aRel.end(),0.0);
+  const auto Q=tetDuffy5();
+  for(const auto& cp:P.cells) {
+    double Kl[8][8]={{0}};
+    for(const auto& q:Q) {
+      double val[8],grr[8][3],gr[8][3]; basis(q.lam,val,grr);
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d) {
+        gr[a][d]=0.0; for(int j=0;j<3;++j) gr[a][d]+=grr[a][j]*cp.invJ[j][d];
+      }
+      const double w=q.w*cp.det;
+      for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
+        double dot=0.0; for(int d=0;d<3;++d) dot+=gr[a][d]*gr[b][d];
+        Kl[a][b]+=dot*w;
+      }
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt lr=cp.gid[a]-A.rstart;
+      for(int b=0;b<8;++b) if(cp.gid[b]>=0) {
+        const std::uint8_t slot=cp.rowSlot[a][b];
+        if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M1M2 legacy static diffusion missing precomputed CSR slot");
+        A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=scale*Kl[a][b];
+      }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleStaticMomentumRhsNative(const Mesh& M,const Discrete& D,const ProblemConfig& problem,const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,std::array<std::vector<double>,3>& rhs) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) rhs[(std::size_t)d].assign((std::size_t)A.nOwned,0.0);
+  const auto Q=(problem.mode!=ProblemMode::MMS)?tetDuffy5():tetDuffy7();
+  for(const auto& cp:P.cells){
+    const auto t=M.tets[(std::size_t)cp.cell]; const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double Al[8][8]={{0}},fl[3][8]={{0}};
+    for(const auto& q:Q){ double val[8],grr[8][3],gr[8][3]; basis(q.lam,val,grr);
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d){gr[a][d]=0.0;for(int j=0;j<3;++j)gr[a][d]+=grr[a][j]*cp.invJ[j][d];}
+      double x=0,y=0,z=0;for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;} double ff[3];problemForcing(problem,x,y,z,ff);const double w=q.w*cp.det;
+      for(int a=0;a<8;++a){for(int d=0;d<3;++d)fl[d][a]+=ff[d]*val[a]*w;for(int b=0;b<8;++b){double dot=0;for(int d=0;d<3;++d)dot+=gr[a][d]*gr[b][d];Al[a][b]+=dot*w;}}}
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii){const int a=(int)cp.ownedBasis[(std::size_t)ii];const PetscInt lr=cp.gid[a]-A.rstart;
+      for(int d=0;d<3;++d) rhs[(std::size_t)d][(std::size_t)lr]+=fl[d][a];
+      for(int b=0;b<8;++b) if(cp.gid[b]<0) for(int d=0;d<3;++d){const double ud=entityDirValue(D,d,cp.entity[b]);if(ud!=0.0)rhs[(std::size_t)d][(std::size_t)lr]-=problem.nu*Al[a][b]*ud;}
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customMomentumAddEntry(CustomMomentumCSR& A,PetscInt rowGid,PetscInt colGid,double v) {
+  PetscFunctionBeginUser;
+  if(A.colGid.empty() && A.rowPtr.back()>0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M1 colGid released; use precomputed dynamic rowSlot for live assembly");
+  if(rowGid<A.rstart || rowGid>=A.rend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"M3A attempted non-owned row insertion");
+  const PetscInt i=rowGid-A.rstart,b=A.rowPtr[(std::size_t)i],e=A.rowPtr[(std::size_t)i+1];
+  auto it=std::lower_bound(A.colGid.begin()+b,A.colGid.begin()+e,colGid);
+  if(it==A.colGid.begin()+e || *it!=colGid) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A custom CSR missing element column");
+  A.aRel[(std::size_t)(it-A.colGid.begin())]+=v;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleCentralConvectionCustom(const Discrete& D,const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A) {
+  PetscFunctionBeginUser;
+  const auto& T=centralTensor();
+  for(auto& r:A.convRhs) std::fill(r.begin(),r.end(),0.0);
+  for(const auto& cp:P.cells) {
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(cp.gid[m]>=0) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.localIndex[m]);
+      else for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,cp.entity[m]);
+    }
+    double uref[8][3]={{0}};
+    for(int m=0;m<8;++m) for(int j=0;j<3;++j) for(int d=0;d<3;++d) uref[m][j]+=coeff[d][m]*cp.invJ[j][d];
+    double Cl[8][8]={{0}};
+    for(int a=0;a<8;++a) for(int b=0;b<8;++b) {
+      double v=0.0; for(int m=0;m<8;++m) for(int j=0;j<3;++j) v+=uref[m][j]*T.t[a][m][b][j]; Cl[a][b]=cp.det*v;
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt row=cp.gid[a],lr=row-A.rstart;
+      for(int b=0;b<8;++b) {
+        if(cp.gid[b]>=0) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A central missing precomputed slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Cl[a][b]; }
+        else for(int d=0;d<3;++d) A.convRhs[d][(std::size_t)lr]-=Cl[a][b]*entityDirValue(D,d,cp.entity[b]);
+      }
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleSupgCustom(const Discrete& D,const CustomDynamicAssemblyPlan& P,CustomMomentumCSR& A,
+  double tauScale,double supgMagic,const std::string& form,PetscBool mixingLength,const PipeGeometry& pipe,double mixlenScale,PetscBool supgStrongMolecular,SupgStats& stats) {
+  PetscFunctionBeginUser;
+  const bool implicit=(form=="implicit"); if(!implicit && form!="explicit") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"SUPG form must be implicit or explicit");
+  for(auto& r:A.supgRhs) std::fill(r.begin(),r.end(),0.0);
+  double localTauMin=1e300,localTauMax=0.0,localTauWeighted=0.0,localWeight=0.0;
+  for(std::size_t ic=0;ic<P.cells.size();++ic) {
+    const auto& cp=P.cells[ic];
+    double coeff[3][8]={{0}};
+    for(int m=0;m<8;++m) {
+      if(cp.gid[m]>=0) for(int d=0;d<3;++d) coeff[d][m]=customMomentumFieldValue(A,d,cp.localIndex[m]);
+      else for(int d=0;d<3;++d) coeff[d][m]=entityDirValue(D,d,cp.entity[m]);
+    }
+    double Sl[8][8]={{0}},Vr[3][8]={{0}},gradLambdaDot[4][4]={{0}};
+    for(int i=0;i<4;++i) for(int j=i;j<4;++j) { double v=0; for(int d=0;d<3;++d)v+=cp.gradLambda[i][d]*cp.gradLambda[j][d]; gradLambdaDot[i][j]=gradLambdaDot[j][i]=v; }
+    for(PetscInt q=0;q<P.nQ;++q) {
+      const auto& rq=P.ref[(std::size_t)q]; const std::size_t iq=(ic*(std::size_t)P.nQ+(std::size_t)q)*3;
+      double adv[3]={0,0,0}; for(int d=0;d<3;++d) for(int m=0;m<8;++m) adv[d]+=coeff[d][m]*rq.phi[m];
+      const double speed2=adv[0]*adv[0]+adv[1]*adv[1]+adv[2]*adv[2];
+      double gradBasis[8][3]={{0}},stream[8]={0},strongTrial[8]={0};
+      for(int a=0;a<4;++a) for(int d=0;d<3;++d) gradBasis[a][d]=cp.gradLambda[a][d];
+      for(int i=0;i<4;++i) { int js[3],kk=0; for(int j=0;j<4;++j) if(j!=i) js[kk++]=j; for(int d=0;d<3;++d)
+        gradBasis[4+i][d]=27.0*(rq.lam[js[1]]*rq.lam[js[2]]*cp.gradLambda[js[0]][d]+rq.lam[js[0]]*rq.lam[js[2]]*cp.gradLambda[js[1]][d]+rq.lam[js[0]]*rq.lam[js[1]]*cp.gradLambda[js[2]][d]); }
+      for(int a=0;a<8;++a) stream[a]=adv[0]*gradBasis[a][0]+adv[1]*gradBasis[a][1]+adv[2]*gradBasis[a][2];
+      for(int a=0;a<4;++a) strongTrial[a]=stream[a];
+      const double nuTStrong=(!supgStrongMolecular && mixingLength)?supgNikuradseNuT(coeff,gradBasis,rq.lam,cp.xy,pipe,mixlenScale):0.0;
+      const double nuStrong=supgStrongMolecular?P.nu:(P.nu+nuTStrong);
+      for(int i=0;i<4;++i) { int js[3],kk=0; for(int j=0;j<4;++j) if(j!=i) js[kk++]=j; const double lap=54.0*(rq.lam[js[2]]*gradLambdaDot[js[0]][js[1]]+rq.lam[js[1]]*gradLambdaDot[js[0]][js[2]]+rq.lam[js[0]]*gradLambdaDot[js[1]][js[2]]); strongTrial[4+i]=-nuStrong*lap+stream[4+i]; }
+      const double diff=4.0*P.nu/cp.h2,den=std::max(4.0*speed2/cp.h2+supgMagic*diff*diff,1e-30),tau=tauScale/std::sqrt(den),w=tau*rq.w*cp.det,volumeW=rq.w*cp.det;
+      localTauMin=std::min(localTauMin,tau); localTauMax=std::max(localTauMax,tau); localTauWeighted+=tau*volumeW; localWeight+=volumeW;
+      if(implicit) {
+        for(int a=0;a<8;++a) { const double ta=w*stream[a]; for(int b=0;b<8;++b) Sl[a][b]+=ta*strongTrial[b]; if(!P.forcingZero) for(int d=0;d<3;++d) Vr[d][a]+=ta*P.forcing[iq+d]; }
+      } else {
+        double sr[3]={0,0,0}; for(int d=0;d<3;++d){for(int b=0;b<8;++b)sr[d]+=coeff[d][b]*strongTrial[b];if(!P.forcingZero)sr[d]-=P.forcing[iq+d];}
+        for(int a=0;a<8;++a){const double ta=-w*stream[a];for(int d=0;d<3;++d)Vr[d][a]+=ta*sr[d];}
+      }
+    }
+    for(PetscInt ii=0;ii<cp.nOwnedRows;++ii) {
+      const int a=(int)cp.ownedBasis[ii]; const PetscInt row=cp.gid[a],lr=row-A.rstart;
+      if(implicit) {
+        for(int b=0;b<8;++b) {
+          if(cp.gid[b]>=0) { const std::uint8_t slot=cp.rowSlot[a][b]; if(slot==255) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A SUPG missing precomputed slot"); A.aRel[(std::size_t)(A.rowPtr[(std::size_t)lr]+slot)]+=Sl[a][b]; }
+          else for(int d=0;d<3;++d) A.supgRhs[d][(std::size_t)lr]-=Sl[a][b]*entityDirValue(D,d,cp.entity[b]);
+        }
+      }
+      for(int d=0;d<3;++d) A.supgRhs[d][(std::size_t)lr]+=Vr[d][a];
+    }
+  }
+  double globalMin=0,globalMax=0,globalTW=0,globalW=0;
+  PetscCallMPI(MPI_Allreduce(&localTauMin,&globalMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauMax,&globalMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localTauWeighted,&globalTW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWeight,&globalW,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  stats.tauMin=globalMin;stats.tauMax=globalMax;stats.tauMean=globalW?globalTW/globalW:0.0;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct SchurTerm {
+  PetscInt localRau=-1;
+  double coeff=0.0;
+};
+
+struct SchurColumnPlan {
+  PetscInt col=-1;
+  std::vector<SchurTerm> terms;
+};
+
+struct SchurRowPlan {
+  PetscInt row=-1;
+  std::vector<SchurColumnPlan> columns;
+};
+
+struct PressureAssemblyPlan {
+  Mat S=nullptr;
+  Mat Pcompact=nullptr; // compact face-neighbour GAMG surrogate
+  PetscInt globalSchurNnz=0; // structural NNZ of explicitly expanded B diag(rAU) B^T
+  std::vector<std::vector<PetscInt>> vertexCells;
+  std::vector<std::array<double,24>> Bcell; // [d*8+a]
+  // Geometry-only compact FV/LSQ data, indexed by cell/local tet face.
+  // fvLsqGeom is |S_f dot c_Kf| where c_Kf is the direct-neighbour
+  // coefficient in a one-ring weighted LSQ gradient.  fvTpfaGeom is a
+  // positive nonorthogonality-capped two-point fallback.
+  std::vector<std::array<double,4>> fvLsqGeom;
+  std::vector<std::array<double,4>> fvTpfaGeom;
+  std::vector<std::array<double,4>> fvNonorthCos;
+  // Pressure-cell diagonal exchange used by the FV/LSQ surrogate.  The
+  // velocity ghost plan contains the DOFs of owned elements only, so it is
+  // deliberately NOT used to inspect a neighbouring off-rank cell.  Instead
+  // each rank computes exact Schur diagonals for its owned pressure cells and
+  // ghosts only the face-neighbour cell diagonals needed by the compact Pmat.
+  Vec fvCellDiag=nullptr;
+  PetscInt fvCellDiagStart=0;
+  std::unordered_map<PetscInt,PetscInt> fvCellDiagLocal; // pressure gid -> local-form index
+  std::vector<SchurRowPlan> rows;
+  std::vector<PetscInt> flatRowGid,flatRowColOffset,flatColGid,flatColTermOffset,flatTermLocalRau;
+  std::vector<double> flatTermCoeff;
+};
+
+
+static unsigned long long u64bytes(std::size_t n) {
+  return (unsigned long long)n;
+}
+
+template<class T>
+static unsigned long long vectorUsefulBytes(const std::vector<T>& v) {
+  return u64bytes(v.size()) * u64bytes(sizeof(T));
+}
+
+template<class T>
+static unsigned long long vectorRetainedBytes(const std::vector<T>& v) {
+  return u64bytes(sizeof(v)) + u64bytes(v.capacity()) * u64bytes(sizeof(T));
+}
+
+template<class K,class V>
+static unsigned long long unorderedMapRetainedEstimateBytes(const std::unordered_map<K,V>& m) {
+  // Lower-bound-ish retained estimate: hash buckets plus one pair and two link/hash
+  // words per node.  The allocator's own metadata is intentionally not guessed.
+  return u64bytes(sizeof(m))
+       + u64bytes(m.bucket_count()) * u64bytes(sizeof(void*))
+       + u64bytes(m.size()) * (u64bytes(sizeof(std::pair<const K,V>)) + 2u*u64bytes(sizeof(void*)));
+}
+
+static PetscErrorCode printMemoryAuditBytes(const char *stage,const char *name,
+                                            unsigned long long localUseful,
+                                            unsigned long long localRetained,
+                                            PetscInt cells,const char *scope,
+                                            const char *note="") {
+  PetscFunctionBeginUser;
+  unsigned long long useful=0,retained=0,retMin=0,retMax=0;
+  PetscCallMPI(MPI_Allreduce(&localUseful,&useful,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRetained,&retained,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRetained,&retMin,1,MPI_UNSIGNED_LONG_LONG,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRetained,&retMax,1,MPI_UNSIGNED_LONG_LONG,MPI_MAX,PETSC_COMM_WORLD));
+  const double mib=retained/(1024.0*1024.0);
+  const double bpc=cells>0?(double)retained/(double)cells:0.0;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MEMORY_AUDIT_OBJECT stage=%s name=%s scope=%s usefulBytes=%llu retainedEstimateBytes=%llu retainedMiB=%.3f retainedBytesPerCell=%.3f minRankRetainedBytes=%llu maxRankRetainedBytes=%llu note=%s\n",
+    stage,name,scope,useful,retained,mib,bpc,retMin,retMax,note));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode printMemoryAuditMat(const char *stage,const char *name,Mat A,PetscInt cells) {
+  PetscFunctionBeginUser;
+  if(!A) PetscFunctionReturn(PETSC_SUCCESS);
+  MatInfo info;
+  PetscInt nr=0,nc=0;
+  PetscCall(MatGetSize(A,&nr,&nc));
+  PetscCall(MatGetInfo(A,MAT_GLOBAL_SUM,&info));
+  const double ratio=info.nz_used>0.0?info.nz_allocated/info.nz_used:0.0;
+  const double memMiB=info.memory/(1024.0*1024.0);
+  const double memBpc=cells>0?info.memory/(double)cells:0.0;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MEMORY_AUDIT_MAT stage=%s name=%s rows=%" PetscInt_FMT " cols=%" PetscInt_FMT
+    " nzUsed=%.0f nzAllocated=%.0f nzUnneeded=%.0f allocOverUsed=%.6f mallocs=%.0f memoryBytes=%.0f memoryMiB=%.3f memoryBytesPerCell=%.3f\n",
+    stage,name,nr,nc,info.nz_used,info.nz_allocated,info.nz_unneeded,ratio,info.mallocs,info.memory,memMiB,memBpc));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditMeshMemory(const Mesh& M,PetscInt cells,const char *scope="replicated_per_rank") {
+  PetscFunctionBeginUser;
+  unsigned long long useful=0,retained=0;
+  useful += vectorUsefulBytes(M.points); retained += vectorRetainedBytes(M.points);
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.points",vectorUsefulBytes(M.points),vectorRetainedBytes(M.points),cells,scope));
+  const unsigned long long fu=vectorUsefulBytes(M.faces),fr=vectorRetainedBytes(M.faces);
+  useful+=fu;retained+=fr;
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.faces_compact",fu,fr,cells,scope,"fixed_std_array_3_vertices_no_per_face_heap_allocation"));
+  auto addvec=[&](const char *name,const auto& v){
+    const auto u=vectorUsefulBytes(v),r=vectorRetainedBytes(v); useful+=u;retained+=r;
+    return printMemoryAuditBytes("after_mesh",name,u,r,cells,scope);
+  };
+  PetscCall(addvec("mesh.owner",M.owner));
+  PetscCall(addvec("mesh.neighbour",M.neighbour));
+  PetscCall(addvec("mesh.tets",M.tets));
+  PetscCall(addvec("mesh.oppFace",M.oppFace));
+  PetscCall(addvec("mesh.facePatch",M.facePatch));
+  unsigned long long pu=vectorUsefulBytes(M.patches),pr=u64bytes(sizeof(M.patches))+u64bytes(M.patches.capacity())*u64bytes(sizeof(Patch));
+  for(const auto& p:M.patches){pu+=u64bytes(p.name.size()+1);pr+=u64bytes(p.name.capacity()+1);}
+  useful+=pu;retained+=pr;
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.patches",pu,pr,cells,scope));
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.TOTAL_CPP",useful,retained,cells,scope,"excludes_allocator_metadata_and_temporary_parser_strings"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+static unsigned long long meshRetainedEstimateLocal(const Mesh& M) {
+  unsigned long long r=0;
+  r+=vectorRetainedBytes(M.points)+vectorRetainedBytes(M.faces)+vectorRetainedBytes(M.owner)+vectorRetainedBytes(M.neighbour)
+    +vectorRetainedBytes(M.tets)+vectorRetainedBytes(M.oppFace)+vectorRetainedBytes(M.facePatch);
+  r+=u64bytes(sizeof(M.patches))+u64bytes(M.patches.capacity())*u64bytes(sizeof(Patch));
+  for(const auto& p:M.patches) r+=u64bytes(p.name.capacity()+1);
+  return r;
+}
+static PetscErrorCode auditRootGlobalMeshMemory(const Mesh& Mroot,int rank,PetscInt cells) {
+  PetscFunctionBeginUser;
+  const unsigned long long b=(rank==0)?meshRetainedEstimateLocal(Mroot):0ull;
+  PetscCall(printMemoryAuditBytes("after_mesh","mesh.rootGlobal.TOTAL_CPP",b,b,cells,"root_only_single_global_copy","retained_only_on_rank0_for_postprocess_and_global_oracle"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode auditRootGlobalOwnershipMemory(const Discrete& Droot,int rank,PetscInt cells) {
+  PetscFunctionBeginUser; unsigned long long b=0;
+  if(rank==0) b=vectorRetainedBytes(Droot.g2free)+vectorRetainedBytes(Droot.pGid)+vectorRetainedBytes(Droot.cellOwner)+vectorRetainedBytes(Droot.velCount)+vectorRetainedBytes(Droot.cellCount)+vectorRetainedBytes(Droot.fixedEntity)+vectorRetainedBytes(Droot.fixedDirValue);
+  PetscCall(printMemoryAuditBytes("after_fe_assembly","discrete.rootGlobalOwnership",b,b,cells,"root_only_single_global_copy","global_gid_owner_maps_retained_on_rank0_for_final_diagnostics"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditDiscreteMemory(const Discrete& D,PetscInt cells,PetscBool distributed=PETSC_FALSE) {
+  PetscFunctionBeginUser;
+  int rank=0; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
+  unsigned long long useful=0,retained=0;
+  const char *mapScope=distributed?"distributed_rank_local_support":"replicated_per_rank";
+  auto emit=[&](const char *name,const auto& v,const char *scope=nullptr)->PetscErrorCode{
+    const auto u=vectorUsefulBytes(v),r=vectorRetainedBytes(v); useful+=u;retained+=r;
+    return printMemoryAuditBytes("after_fe_assembly",name,u,r,cells,scope?scope:mapScope);
+  };
+  PetscCall(emit("discrete.g2free",D.g2free));
+  PetscCall(emit("discrete.pGid",D.pGid));
+  PetscCall(emit("discrete.cellOwner",D.cellOwner));
+  PetscCall(emit("discrete.velCount",D.velCount,"small_rank_metadata"));
+  PetscCall(emit("discrete.cellCount",D.cellCount,"small_rank_metadata"));
+  PetscCall(emit("discrete.fixedEntity",D.fixedEntity));
+  PetscCall(emit("discrete.fixedDirValueCompact",D.fixedDirValue));
+  PetscCall(emit("discrete.volumesOwnedFP64",D.volumesOwnedFP64,"distributed_owned_pressure_rows"));
+  PetscCall(emit("discrete.fixedDivOwnedFP64",D.fixedDivOwnedFP64,"distributed_owned_pressure_rows"));
+  for(int d=0;d<3;++d){std::string n="discrete.rhsOwnedFP64_"+std::to_string(d);PetscCall(emit(n.c_str(),D.rhsOwnedFP64[(std::size_t)d],"distributed_owned_velocity_rows"));}
+  PetscCall(printMemoryAuditBytes("after_fe_assembly","discrete.TOTAL_CPP",useful,retained,cells,distributed?"mixed_distributed":"mixed",distributed?"local_entity_cell_maps_plus_distributed_owned_payloads":"most_large_arrays_are_global_and_replicated_per_rank"));
+  PetscCall(printMemoryAuditMat("after_fe_assembly","D.A_diffusion",D.A,cells));
+  for(int d=0;d<3;++d){std::string n="D.B"+std::to_string(d);PetscCall(printMemoryAuditMat("after_fe_assembly",n.c_str(),D.B[d],cells));}
+  unsigned long long rhsVecs=0;for(int d=0;d<3;++d)if(D.rhs[d])++rhsVecs;
+  const unsigned long long vecPayload=(rhsVecs*(unsigned long long)D.velCount[rank] + 2ull*(unsigned long long)D.cellCount[rank])*sizeof(PetscScalar);
+  PetscCall(printMemoryAuditBytes("after_fe_assembly","petsc.initial_vec_numeric_payload",vecPayload,vecPayload,cells,"distributed_owned_payload","M6B_pressure_layout_bridges_plus_optional_velocity_rhs_reference"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditPlanMemory(const GhostPlan& G,const PressureAssemblyPlan& P,
+                                      const CentralAssemblyPlan& C,const SupgAssemblyPlan& S,
+                                      PetscInt cells) {
+  PetscFunctionBeginUser;
+  // Velocity ghost plan
+  unsigned long long gu=vectorUsefulBytes(G.ghosts),gr=vectorRetainedBytes(G.ghosts);
+  gu += u64bytes(G.ghostLocal.size())*u64bytes(sizeof(std::pair<const PetscInt,PetscInt>));
+  gr += unorderedMapRetainedEstimateBytes(G.ghostLocal);
+  PetscCall(printMemoryAuditBytes("after_plans","ghost.velocity",gu,gr,cells,"distributed_owned_plus_halo","unordered_map_retained_is_lower_bound_estimate"));
+
+  // Pressure plan: break out the globally replicated and local pieces.
+  unsigned long long vu=u64bytes(sizeof(P.vertexCells))+u64bytes(P.vertexCells.size())*u64bytes(sizeof(std::vector<PetscInt>));
+  unsigned long long vr=u64bytes(sizeof(P.vertexCells))+u64bytes(P.vertexCells.capacity())*u64bytes(sizeof(std::vector<PetscInt>));
+  for(const auto& v:P.vertexCells){vu+=vectorUsefulBytes(v);vr+=u64bytes(v.capacity())*u64bytes(sizeof(PetscInt));}
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.vertexCells",vu,vr,cells,"replicated_per_rank","nested_support_vectors"));
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.Bcell",vectorUsefulBytes(P.Bcell),vectorRetainedBytes(P.Bcell),cells,"replicated_per_rank","24_doubles_per_global_cell_per_rank"));
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.fvLsqGeom",vectorUsefulBytes(P.fvLsqGeom),vectorRetainedBytes(P.fvLsqGeom),cells,"replicated_per_rank"));
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.fvTpfaGeom",vectorUsefulBytes(P.fvTpfaGeom),vectorRetainedBytes(P.fvTpfaGeom),cells,"replicated_per_rank"));
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.fvNonorthCos",vectorUsefulBytes(P.fvNonorthCos),vectorRetainedBytes(P.fvNonorthCos),cells,"replicated_per_rank"));
+
+  unsigned long long ru=u64bytes(sizeof(P.rows))+u64bytes(P.rows.size())*u64bytes(sizeof(SchurRowPlan));
+  unsigned long long rr=u64bytes(sizeof(P.rows))+u64bytes(P.rows.capacity())*u64bytes(sizeof(SchurRowPlan));
+  unsigned long long rows=0,cols=0,terms=0;
+  for(const auto& r:P.rows){
+    ++rows;
+    ru+=u64bytes(r.columns.size())*u64bytes(sizeof(SchurColumnPlan));
+    rr+=u64bytes(r.columns.capacity())*u64bytes(sizeof(SchurColumnPlan));
+    cols+=r.columns.size();
+    for(const auto& c:r.columns){
+      ru+=u64bytes(c.terms.size())*u64bytes(sizeof(SchurTerm));
+      rr+=u64bytes(c.terms.capacity())*u64bytes(sizeof(SchurTerm));
+      terms+=c.terms.size();
+    }
+  }
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.schurNestedRows",ru,rr,cells,"distributed_owned_rows","retained_includes_vector_objects_and_capacities_excludes_allocator_metadata"));
+  const unsigned long long fu=vectorUsefulBytes(P.flatRowGid)+vectorUsefulBytes(P.flatRowColOffset)+vectorUsefulBytes(P.flatColGid)+vectorUsefulBytes(P.flatColTermOffset)+vectorUsefulBytes(P.flatTermLocalRau)+vectorUsefulBytes(P.flatTermCoeff);
+  const unsigned long long fr=vectorRetainedBytes(P.flatRowGid)+vectorRetainedBytes(P.flatRowColOffset)+vectorRetainedBytes(P.flatColGid)+vectorRetainedBytes(P.flatColTermOffset)+vectorRetainedBytes(P.flatTermLocalRau)+vectorRetainedBytes(P.flatTermCoeff);
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.schurFlatPlan",fu,fr,cells,"distributed_owned_rows","flat_row_col_term_arrays_no_nested_vectors"));
+  unsigned long long mapu=u64bytes(P.fvCellDiagLocal.size())*u64bytes(sizeof(std::pair<const PetscInt,PetscInt>));
+  unsigned long long mapr=unorderedMapRetainedEstimateBytes(P.fvCellDiagLocal);
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.fvCellDiagLocal_map",mapu,mapr,cells,"distributed_owned_plus_halo","lower_bound_map_estimate"));
+  const unsigned long long fvDiagVecLocal=u64bytes(P.fvCellDiagLocal.size())*u64bytes(sizeof(PetscScalar));
+  PetscCall(printMemoryAuditBytes("after_plans","pressure.fvCellDiag_vec_numeric_payload",fvDiagVecLocal,fvDiagVecLocal,cells,"distributed_owned_plus_halo","PETSc_Vec_numeric_slots_only"));
+  PetscCall(printMemoryAuditMat("after_plans","pressure.S_explicit_snapshot",P.S,cells));
+  PetscCall(printMemoryAuditMat("after_plans","pressure.Pcompact",P.Pcompact,cells));
+  if(!P.flatRowGid.empty()){rows=P.flatRowGid.size();cols=P.flatColGid.size();terms=P.flatTermLocalRau.size();}
+  unsigned long long grow=rows,gcol=cols,gterm=terms;
+  PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE,&grow,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE,&gcol,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(MPI_IN_PLACE,&gterm,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MEMORY_AUDIT_SCHUR_COUNTS ownedRows=%llu uniqueColumns=%llu algebraicTerms=%llu avgColumnsPerRow=%.3f avgTermsPerColumn=%.3f sizeofRow=%zu sizeofColumn=%zu sizeofTerm=%zu\n",
+    grow,gcol,gterm,grow?(double)gcol/(double)grow:0.0,gcol?(double)gterm/(double)gcol:0.0,sizeof(SchurRowPlan),sizeof(SchurColumnPlan),sizeof(SchurTerm)));
+  if(!P.flatRowGid.empty()) PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M5A_FLAT_SCHUR rows=%llu columns=%llu terms=%llu BcellBytes=%zu nestedRows=%zu\n",grow,gcol,gterm,P.Bcell.size()*sizeof(std::array<double,24>),P.rows.size()));
+
+  // Central plan is owned-cell only.
+  PetscCall(printMemoryAuditBytes("after_plans","central.cells",vectorUsefulBytes(C.cells),vectorRetainedBytes(C.cells),cells,"distributed_owned_cells"));
+
+  // SUPG: reference table is replicated tiny data; cells/caches are owned-cell only.
+  PetscCall(printMemoryAuditBytes("after_plans","supg.reference",vectorUsefulBytes(S.ref),vectorRetainedBytes(S.ref),cells,"replicated_per_rank"));
+  PetscCall(printMemoryAuditBytes("after_plans","supg.cells",vectorUsefulBytes(S.cells),vectorRetainedBytes(S.cells),cells,"distributed_owned_cells"));
+  PetscCall(printMemoryAuditBytes("after_plans","supg.grad_physical_q_basis_xyz",0,0,cells,"eliminated","reconstructed_from_12_gradLambda_doubles_per_owned_cell"));
+  PetscCall(printMemoryAuditBytes("after_plans","supg.viscStrong_q_basis",0,0,cells,"eliminated","BF3_laplacian_reconstructed_from_gradLambda_dot_products"));
+  PetscCall(printMemoryAuditBytes("after_plans","supg.forcing",vectorUsefulBytes(S.forcing),vectorRetainedBytes(S.forcing),cells,"distributed_owned_cells","empty_for_pipe_and_generic_flow"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditCustomMomentumDetailedMemory(const CustomMomentumCSR& A,PetscInt cells) {
+  PetscFunctionBeginUser;
+  auto ints=[&](const char *name,const auto&... vecs)->PetscErrorCode {
+    unsigned long long u=0,r=0;
+    ((u+=vectorUsefulBytes(vecs),r+=vectorRetainedBytes(vecs)),...);
+    return printMemoryAuditBytes("after_state_objects",name,u,r,cells,"distributed_owned_velocity_rows_plus_halo");
+  };
+  auto doubles=[&](const char *name,const auto&... vecs)->PetscErrorCode {
+    unsigned long long u=0,r=0;
+    ((u+=vectorUsefulBytes(vecs),r+=vectorRetainedBytes(vecs)),...);
+    return printMemoryAuditBytes("after_state_objects",name,u,r,cells,"distributed_owned_velocity_rows_plus_halo");
+  };
+
+  // CSR/index topology retained by the current assembled-SGS predictor.
+  PetscCall(ints("momentum.csr.rowPtr",A.rowPtr));
+  PetscCall(ints("momentum.csr.colGid_RELEASED_M1",A.colGid));
+  PetscCall(ints("momentum.csr.colLocal",A.colLocal));
+  PetscCall(ints("momentum.csr.diagPos",A.diagPos));
+  PetscCall(ints("momentum.halo.gids_offsets",A.ghostGid,A.reqRecvGid,A.reqRecvLocalOffset));
+
+  unsigned long long iu=0,ir=0;
+  auto addInt=[&](const auto& v){iu+=vectorUsefulBytes(v);ir+=vectorRetainedBytes(v);};
+  addInt(A.reqSendCounts);addInt(A.reqSendDispls);addInt(A.reqRecvCounts);addInt(A.reqRecvDispls);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.halo.counts_displs",iu,ir,cells,"small_rank_peer_metadata"));
+  const unsigned long long requ=(unsigned long long)A.exchangeRequests.size()*sizeof(MPI_Request);
+  const unsigned long long reqr=(unsigned long long)sizeof(A.exchangeRequests)+(unsigned long long)A.exchangeRequests.capacity()*sizeof(MPI_Request);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.halo.mpi_requests",requ,reqr,cells,"small_rank_peer_metadata"));
+
+  // M1+M2 actual payload: kNu is intentionally empty; only active aRel remains.
+  PetscCall(doubles("momentum.matrix.kNu_ELIMINATED_M2",A.kNu));
+  PetscCall(doubles("momentum.matrix.aRel_FP64",A.aRel));
+
+  // Diagonal/coupling quantities. A matrix-free rewrite must KEEP or reproduce
+  // these because SIMPLE/SIMPLEC pressure coupling uses the resulting rAU.
+  PetscCall(doubles("momentum.diag.physDiag",A.physDiag));
+  PetscCall(doubles("momentum.diag.relaxDelta",A.relaxDelta));
+  PetscCall(doubles("momentum.diag.relaxedDiag",A.relaxedDiag));
+  PetscCall(doubles("momentum.diag.metric",A.metric));
+  PetscCall(doubles("momentum.diag.rAU",A.rAU));
+
+  // Current custom halo numeric buffers.
+  PetscCall(doubles("momentum.halo.exchange_numeric",A.exchangeSend,A.ghostValues));
+
+  unsigned long long fou=0,forr=0,fgu=0,fgr=0,cru=0,crr=0,sru=0,srr=0;
+  for(int d=0;d<3;++d){
+    fou+=vectorUsefulBytes(A.fieldOwned[d]);forr+=vectorRetainedBytes(A.fieldOwned[d]);
+    fgu+=vectorUsefulBytes(A.fieldGhost[d]);fgr+=vectorRetainedBytes(A.fieldGhost[d]);
+    cru+=vectorUsefulBytes(A.convRhs[d]);crr+=vectorRetainedBytes(A.convRhs[d]);
+    sru+=vectorUsefulBytes(A.supgRhs[d]);srr+=vectorRetainedBytes(A.supgRhs[d]);
+  }
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.fields.owned3_FP64",fou,forr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.fields.ghost3_FP64",fgu,fgr,cells,"distributed_velocity_halo"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.rhs.convection3_FP64",cru,crr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.rhs.supg3_FP64",sru,srr,cells,"distributed_owned_velocity_rows"));
+  PetscCall(doubles("momentum.work.sgs4_FP64",A.workB,A.workX,A.workY,A.workBeff));
+
+  // Legacy shadow arrays should remain empty in the accepted M2B/M3A path.
+  PetscCall(doubles("momentum.legacy.empty_shadows",A.convection,A.supg,A.aPhys));
+
+  // Category totals. Keep them non-overlapping so their slopes can be added.
+  unsigned long long topology=0,matrix=0,diag=0,halo=0,fields=0,rhs=0,work=0;
+  auto vr=[&](const auto& v){return vectorRetainedBytes(v);};
+  topology=vr(A.rowPtr)+vr(A.colGid)+vr(A.colLocal)+vr(A.diagPos);
+  matrix=vr(A.kNu)+vr(A.aRel);
+  diag=vr(A.physDiag)+vr(A.relaxDelta)+vr(A.relaxedDiag)+vr(A.metric)+vr(A.rAU);
+  halo=vr(A.ghostGid)+vr(A.reqRecvGid)+vr(A.reqRecvLocalOffset)+vr(A.reqSendCounts)+vr(A.reqSendDispls)+vr(A.reqRecvCounts)+vr(A.reqRecvDispls)+vr(A.exchangeSend)+vr(A.ghostValues)+reqr;
+  topology+=(unsigned long long)A.wallOwned.capacity()*sizeof(char);
+  for(int d=0;d<3;++d){fields+=vr(A.fieldOwned[d])+vr(A.fieldGhost[d]);rhs+=vr(A.convRhs[d])+vr(A.supgRhs[d])+vr(A.mixlenRhs[d])+vr(A.wallRhs[d])+vr(A.inletRhs[d]);}
+  work=vr(A.workB)+vr(A.workX)+vr(A.workY)+vr(A.workBeff);
+  const unsigned long long total=topology+matrix+diag+halo+fields+rhs+work+vr(A.convection)+vr(A.supg)+vr(A.aPhys);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_topology",topology,topology,cells,"distributed_nonoverlap_total","rowPtr_colLocal_diagPos_colGid_released"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_matrix_values",matrix,matrix,cells,"distributed_nonoverlap_total","aRel_only_kNu_eliminated"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_diag_coupling",diag,diag,cells,"distributed_nonoverlap_total","must_preserve_physDiag_relaxedDiag_metric_rAU_semantics"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_halo",halo,halo,cells,"distributed_nonoverlap_total","peer_metadata_plus_exchange_numeric"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_fields",fields,fields,cells,"distributed_nonoverlap_total","three_owned_plus_three_ghost_velocity_buffers"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_dynamic_rhs",rhs,rhs,cells,"distributed_nonoverlap_total","convection3_plus_supg3"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.CAT_work",work,work,cells,"distributed_nonoverlap_total","four_FP64_SGS_residual_work_vectors"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","custom.momentumCSR_DETAILED_TOTAL",total,total,cells,"distributed_nonoverlap_total","sum_of_detailed_custom_momentum_components"));
+
+  // M1+M2 are now actual allocations, not projections.  What remains removable
+  // by the later M3 matrix-free step is active aRel plus rowPtr/colLocal/diagPos.
+  const unsigned long long matfreeCore=diag+halo+fields+rhs+work;
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.ACTUAL_M1_colGid_released",vr(A.colGid),vr(A.colGid),cells,"actual_allocation","must_be_zero_after_setup"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.ACTUAL_M2_kNu_eliminated",vr(A.kNu),vr(A.kNu),cells,"actual_allocation","must_be_zero_persistent_static_diffusion_reintegrated"));
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.PROJECTION_M3_matfree_core_retained",matfreeCore,matfreeCore,cells,"accounting_projection_only","excludes_dynamicPlan; assumes_alternative_nonCSR_smoother"));
+  const unsigned long long removableMatfree=(topology+matrix);
+  PetscCall(printMemoryAuditBytes("after_state_objects","momentum.PROJECTION_M3_remaining_CSR_matrix_removable",removableMatfree,removableMatfree,cells,"accounting_projection_only","rowPtr_colLocal_diagPos_plus_aRel_after_M1M2"));
+
+  unsigned long long lnnz=(unsigned long long)A.colLocal.size(),gnnz=0,lnowned=(unsigned long long)A.nOwned,gnowned=0,lghost=(unsigned long long)A.ghostGid.size(),gghost=0;
+  PetscCallMPI(MPI_Allreduce(&lnnz,&gnnz,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lnowned,&gnowned,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&lghost,&gghost,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MOMENTUM_MEMORY_COUNTS globalOwnedVel=%llu globalCSRnnz=%llu avgNnzPerVelRow=%.6f aggregateGhostSlots=%llu sizeofPetscInt=%zu sizeofDouble=%zu sizeofMPIRequest=%zu\n",
+    gnowned,gnnz,gnowned?(double)gnnz/(double)gnowned:0.0,gghost,sizeof(PetscInt),sizeof(double),sizeof(MPI_Request)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+static PetscErrorCode auditStateObjects(Mat C,Mat Sg,Mat Knu,Mat Aphys,Mat Ar,
+                                        const Discrete& D,const GhostPlan& G,
+                                        PetscInt cells) {
+  PetscFunctionBeginUser;
+  int rank=0; PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
+  if(C) PetscCall(printMemoryAuditMat("after_state_objects","C_convection",C,cells));
+  if(Sg) PetscCall(printMemoryAuditMat("after_state_objects","Sg_supg",Sg,cells));
+  if(Knu) PetscCall(printMemoryAuditMat("after_state_objects","Knu_static_diffusion",Knu,cells));
+  if(Aphys) PetscCall(printMemoryAuditMat("after_state_objects","Aphys",Aphys,cells));
+  if(Ar) PetscCall(printMemoryAuditMat("after_state_objects","Ar_relaxed",Ar,cells));
+  const unsigned long long ghostLocal=(unsigned long long)G.ghosts.size();
+  // Velocity-sized state/work vectors existing at this point.
+  (void)ghostLocal;
+  const unsigned long long pressureCount=2ull; // M6B: pcIn/pcOut only
+  const unsigned long long localP=(unsigned long long)D.cellCount[rank];
+  const unsigned long long localPayload=pressureCount*localP*sizeof(PetscScalar);
+  PetscCall(printMemoryAuditBytes("after_state_objects","petsc.state_work_vec_numeric_payload",localPayload,localPayload,cells,"distributed_global_payload","M6B_pcIn_pcOut_only_excludes_PETSc_vec_headers"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode auditGAMGMemory(KSP pksp,PetscInt cells) {
+  PetscFunctionBeginUser;
+  if(!pksp) PetscFunctionReturn(PETSC_SUCCESS);
+  PC pc=nullptr; const char *pct=nullptr;
+  PetscCall(KSPGetPC(pksp,&pc)); PetscCall(PCGetType(pc,&pct));
+  // M8 diagnostic-only generalization: PCMGGetLevels() is valid for GAMG/MG
+  // but not for PCHYPRE/BoomerAMG.  Non-GAMG cases are still fully measured
+  // by the common RSS/HWM resource marks; skip only the PETSc-MG internals audit.
+  if(!pct || std::string(pct)!="gamg") {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_MEMORY_AUDIT_AMG_INTERNALS_SKIPPED pc=%s reason=non_GAMG use=RSS_HWM_resource_marks\n",pct?pct:"?"));
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+  PetscInt levels=0;
+  PetscCall(PCMGGetLevels(pc,&levels));
+  double totalMatrixMemory=0.0,totalNnz=0.0,totalAllocated=0.0;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MEMORY_AUDIT_GAMG_BEGIN pc=%s levels=%" PetscInt_FMT "\n",pct?pct:"?",levels));
+  for(PetscInt lev=0;lev<levels;++lev) {
+    KSP lksp=nullptr;
+    if(lev==0) PetscCall(PCMGGetCoarseSolve(pc,&lksp));
+    else PetscCall(PCMGGetSmoother(pc,lev,&lksp));
+    Mat A=nullptr,Pm=nullptr; PetscCall(KSPGetOperators(lksp,&A,&Pm)); if(!Pm) Pm=A;
+    if(Pm) {
+      MatInfo i; PetscInt nr=0,nc=0; PetscCall(MatGetSize(Pm,&nr,&nc)); PetscCall(MatGetInfo(Pm,MAT_GLOBAL_SUM,&i));
+      totalMatrixMemory+=i.memory; totalNnz+=i.nz_used; totalAllocated+=i.nz_allocated;
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MEMORY_AUDIT_GAMG_LEVEL level=%" PetscInt_FMT " rows=%" PetscInt_FMT " cols=%" PetscInt_FMT
+        " nzUsed=%.0f nzAllocated=%.0f allocOverUsed=%.6f memoryMiB=%.3f\n",
+        lev,nr,nc,i.nz_used,i.nz_allocated,i.nz_used?i.nz_allocated/i.nz_used:0.0,i.memory/(1024.0*1024.0)));
+    }
+    if(lev>0) {
+      Mat I=nullptr; PetscCall(PCMGGetInterpolation(pc,lev,&I));
+      if(I) {
+        MatInfo ii; PetscInt nr=0,nc=0; PetscCall(MatGetSize(I,&nr,&nc)); PetscCall(MatGetInfo(I,MAT_GLOBAL_SUM,&ii));
+        totalMatrixMemory+=ii.memory; totalNnz+=ii.nz_used; totalAllocated+=ii.nz_allocated;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_MEMORY_AUDIT_GAMG_TRANSFER fineLevel=%" PetscInt_FMT " rows=%" PetscInt_FMT " cols=%" PetscInt_FMT
+          " nzUsed=%.0f nzAllocated=%.0f allocOverUsed=%.6f memoryMiB=%.3f\n",
+          lev,nr,nc,ii.nz_used,ii.nz_allocated,ii.nz_used?ii.nz_allocated/ii.nz_used:0.0,ii.memory/(1024.0*1024.0)));
+      }
+    }
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_MEMORY_AUDIT_GAMG_TOTAL matrixAndTransferMemoryMiB=%.3f bytesPerCell=%.3f nzUsed=%.0f nzAllocated=%.0f allocOverUsed=%.6f note=excludes_KSP_PC_vectors_and_nonmatrix_metadata\n",
+    totalMatrixMemory/(1024.0*1024.0),cells?totalMatrixMemory/(double)cells:0.0,totalNnz,totalAllocated,totalNnz?totalAllocated/totalNnz:0.0));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static int localBasisForEntity(const Mesh& M,PetscInt cell,PetscInt entity) {
+  const PetscInt nv=(PetscInt)M.points.size();
+  if(entity<nv) {
+    for(int i=0;i<4;++i) if(M.tets[cell][i]==entity) return i;
+  } else {
+    const PetscInt f=entity-nv;
+    for(int i=0;i<4;++i) if(M.oppFace[cell][i]==f) return 4+i;
+  }
+  return -1;
+}
+
+static PetscErrorCode buildPressureAssemblyPlan(const Mesh& M,const Discrete& D,const ProblemConfig& Pcfg,int rank,const GhostPlan& G,const std::string& pPmatMode,PetscBool buildExpandedSchur,PressureAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  const PetscInt globalNc=distributedGlobalCellCount(D);
+  // Only full/legacy surrogate modes need the global vertex-star support.
+  // native_face is intentionally lean: its compact face graph is built directly
+  // from the custom live B geometry and never stores vertexCells or Bcell.
+  P.vertexCells.clear();
+  if(pPmatMode!="native_face") {
+    P.vertexCells.assign(nv,{});
+    for(PetscInt c=0;c<nc;++c) for(int i=0;i<4;++i) P.vertexCells[M.tets[c][i]].push_back(c);
+  }
+
+  // Production full Pmat reconstructs B analytically; legacy surrogate modes keep the old B cache.
+  P.Bcell.clear();
+  if(pPmatMode!="full" && pPmatMode!="native_face") {
+    P.Bcell.resize(nc);
+    const double glref[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};
+    for(PetscInt c=0;c<nc;++c) {
+      const auto t=M.tets[c];
+      const Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+      double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+                      {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+                      {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},invJ[3][3];
+      const double det=det3(J),vol=det/6.0; inv3(J,invJ); double gl[4][3]={{0}};
+      for(int i=0;i<4;++i) for(int d=0;d<3;++d) for(int j=0;j<3;++j) gl[i][d]+=glref[i][j]*invJ[j][d];
+      for(int i=0;i<4;++i) for(int d=0;d<3;++d) {
+        P.Bcell[c][d*8+i]=customPressureEffectiveBForCell(M,D,Pcfg,c,vol,gl,d,i);
+        P.Bcell[c][d*8+4+i]=customPressureEffectiveBForCell(M,D,Pcfg,c,vol,gl,d,4+i);
+      }
+    }
+  }
+
+  // Precompute a compact one-ring LSQ geometry for an FV-like pressure
+  // surrogate.  The LSQ normal coefficient is used only to define the
+  // face-neighbour PRECONDITIONING graph; the exact FE Schur remains the KSP
+  // operator.  Boundary faces enter the LSQ metric through reflected
+  // centroid pseudo-neighbours so wall/outlet cells retain a full-rank 3-D
+  // geometry metric without adding pressure unknowns.
+  if(pPmatMode=="fv_lsq") {
+    const auto fvCellC = cellCentroids(M);
+    P.fvLsqGeom.assign(nc,{});
+    P.fvTpfaGeom.assign(nc,{});
+    P.fvNonorthCos.assign(nc,{});
+    auto faceCentre = [&](PetscInt f)->Vec3 {
+      Vec3 q{}; const auto& F=M.faces[f];
+      for(PetscInt v:F.v) { const auto& x=M.points[v]; q.x+=x.x; q.y+=x.y; q.z+=x.z; }
+      const double z=1.0/(double)F.v.size(); return {q.x*z,q.y*z,q.z*z};
+    };
+    auto faceAreaVec = [&](PetscInt f)->Vec3 {
+      const auto& F=M.faces[f];
+      if(F.v.size()!=3) return {};
+      const Vec3& x0=M.points[F.v[0]]; const Vec3& x1=M.points[F.v[1]]; const Vec3& x2=M.points[F.v[2]];
+      const Vec3 cr=cross3(sub3(x1,x0),sub3(x2,x0)); return {0.5*cr.x,0.5*cr.y,0.5*cr.z};
+    };
+    for(PetscInt c=0;c<nc;++c) {
+      double H[3][3]={{0}};
+      std::array<Vec3,4> dFace{};
+      std::array<double,4> wFace{};
+      for(int i=0;i<4;++i) {
+        const PetscInt f=M.oppFace[c][i];
+        Vec3 d{};
+        if(f<ni) {
+          const PetscInt L=(M.owner[f]==c)?M.neighbour[f]:M.owner[f];
+          d=sub3(fvCellC[L],fvCellC[c]);
+        } else {
+          const Vec3 fc=faceCentre(f);
+          const Vec3 h=sub3(fc,fvCellC[c]); d={2.0*h.x,2.0*h.y,2.0*h.z};
+        }
+        const double d2=d.x*d.x+d.y*d.y+d.z*d.z;
+        const double w=1.0/std::max(d2,1e-30);
+        dFace[i]=d; wFace[i]=w;
+        const double a[3]={d.x,d.y,d.z};
+        for(int r=0;r<3;++r) for(int q=0;q<3;++q) H[r][q]+=w*a[r]*a[q];
+      }
+      const double tr=H[0][0]+H[1][1]+H[2][2];
+      const double reg=std::max(1e-12,1e-10*tr/3.0);
+      for(int d=0;d<3;++d) H[d][d]+=reg;
+      double HI[3][3]; inv3(H,HI);
+      for(int i=0;i<4;++i) {
+        const PetscInt f=M.oppFace[c][i];
+        if(f>=ni) { P.fvLsqGeom[c][i]=0.0; P.fvTpfaGeom[c][i]=0.0; P.fvNonorthCos[c][i]=0.0; continue; }
+        const Vec3 d=dFace[i]; const double w=wFace[i];
+        double cv[3]={0,0,0},a[3]={d.x,d.y,d.z};
+        for(int r=0;r<3;++r) for(int q=0;q<3;++q) cv[r]+=HI[r][q]*w*a[q];
+        const Vec3 S=faceAreaVec(f); const double A=norm3(S), dl=norm3(d);
+        const double Sdotc=S.x*cv[0]+S.y*cv[1]+S.z*cv[2];
+        const double Sdotd=std::abs(S.x*d.x+S.y*d.y+S.z*d.z);
+        const double coso=(A>0.0 && dl>0.0)?Sdotd/(A*dl):0.0;
+        P.fvNonorthCos[c][i]=coso;
+        P.fvLsqGeom[c][i]=std::abs(Sdotc);
+        // Positive TPFA fallback with a 0.1 cosine floor: it cannot blow up on
+        // nearly tangential centre-to-centre lines and is used only as a small
+        // floor under the LSQ coefficient.
+        const double denom=std::max(Sdotd,0.1*A*dl);
+        P.fvTpfaGeom[c][i]=(denom>0.0)?A*A/denom:0.0;
+      }
+    }
+
+  } else {
+    P.fvLsqGeom.clear(); P.fvTpfaGeom.clear(); P.fvNonorthCos.clear();
+  }
+
+  // M5A: flat full-Schur cache. No retained Bcell or nested vectors in production.
+  P.rows.clear(); P.flatRowGid.clear(); P.flatRowColOffset.clear(); P.flatColGid.clear();
+  P.flatColTermOffset.clear(); P.flatTermLocalRau.clear(); P.flatTermCoeff.clear();
+  size_t localColumns=0,localTerms=0;
+  if(buildExpandedSchur) {
+    if(pPmatMode=="full") {
+      P.flatRowGid.reserve((std::size_t)D.cellCount[rank]); P.flatRowColOffset.reserve((std::size_t)D.cellCount[rank]+1);
+      P.flatRowColOffset.push_back(0); P.flatColTermOffset.push_back(0);
+      for(PetscInt K=0;K<nc;++K) if(D.cellOwner[K]==rank) {
+        PetscInt entity[8]; for(int i=0;i<4;++i) entity[i]=M.tets[K][i]; for(int i=0;i<4;++i) entity[4+i]=nv+M.oppFace[K][i];
+        double kVol=0.0,kGrad[4][3]={{0}}; fillCustomPressureGeom(M,K,kVol,kGrad);
+        std::unordered_map<PetscInt,std::array<double,13>> geom; geom.reserve(96);
+        auto getGeom=[&](PetscInt C)->const std::array<double,13>& {
+          auto it=geom.find(C); if(it!=geom.end()) return it->second;
+          double v=0.0,g[4][3]={{0}}; fillCustomPressureGeom(M,C,v,g); std::array<double,13> q{}; q[0]=v; int z=1;
+          for(int i=0;i<4;++i) for(int d=0;d<3;++d) q[(std::size_t)z++]=g[i][d]; return geom.emplace(C,q).first->second;
+        };
+        std::map<PetscInt,std::vector<SchurTerm>> grouped;
+        for(int a=0;a<8;++a) {
+          const PetscInt gid=D.g2free[entity[a]]; if(gid<0) continue; const PetscInt li=velocityLocalIndex(G,gid);
+          double BK[3]; for(int d=0;d<3;++d) BK[d]=customPressureEffectiveBForCell(M,D,Pcfg,K,kVol,kGrad,d,a);
+          auto addSupport=[&](PetscInt L) {
+            const int b=localBasisForEntity(M,L,entity[a]); if(b<0) throw std::runtime_error("M5A support/local-basis mismatch");
+            const auto& q=getGeom(L); double lg[4][3]={{0}}; int z=1; for(int i=0;i<4;++i) for(int d=0;d<3;++d) lg[i][d]=q[(std::size_t)z++];
+            double dot=0.0;
+            for(int d=0;d<3;++d) dot+=BK[d]*customPressureEffectiveBForCell(M,D,Pcfg,L,q[0],lg,d,b);
+            grouped[D.pGid[L]].push_back({li,dot});
+          };
+          if(entity[a]<nv) for(PetscInt L:P.vertexCells[entity[a]]) addSupport(L);
+          else { const PetscInt f=entity[a]-nv; addSupport(M.owner[f]); if(f<ni) addSupport(M.neighbour[f]); }
+        }
+        P.flatRowGid.push_back(D.pGid[K]);
+        for(auto& kv:grouped) { P.flatColGid.push_back(kv.first); for(const auto& t:kv.second){P.flatTermLocalRau.push_back(t.localRau);P.flatTermCoeff.push_back(t.coeff);} P.flatColTermOffset.push_back((PetscInt)P.flatTermLocalRau.size()); }
+        P.flatRowColOffset.push_back((PetscInt)P.flatColGid.size());
+      }
+      localColumns=P.flatColGid.size(); localTerms=P.flatTermLocalRau.size();
+    } else {
+      P.rows.reserve(D.cellCount[rank]);
+      for(PetscInt K=0;K<nc;++K) if(D.cellOwner[K]==rank) {
+        PetscInt entity[8]; for(int i=0;i<4;++i) entity[i]=M.tets[K][i]; for(int i=0;i<4;++i) entity[4+i]=nv+M.oppFace[K][i];
+        std::map<PetscInt,std::vector<SchurTerm>> grouped;
+        for(int a=0;a<8;++a) { const PetscInt gid=D.g2free[entity[a]]; if(gid<0) continue; const PetscInt li=velocityLocalIndex(G,gid); double BK[3]; for(int d=0;d<3;++d) BK[d]=P.Bcell[K][d*8+a];
+          auto add=[&](PetscInt L){const int b=localBasisForEntity(M,L,entity[a]);double dot=0;for(int d=0;d<3;++d)dot+=BK[d]*P.Bcell[L][d*8+b];grouped[D.pGid[L]].push_back({li,dot});};
+          if(entity[a]<nv) for(PetscInt L:P.vertexCells[entity[a]]) add(L); else {const PetscInt f=entity[a]-nv;add(M.owner[f]);if(f<ni)add(M.neighbour[f]);}
+        }
+        SchurRowPlan rp; rp.row=D.pGid[K]; rp.columns.reserve(grouped.size()); for(auto& kv:grouped){SchurColumnPlan cp;cp.col=kv.first;cp.terms=std::move(kv.second);localTerms+=cp.terms.size();rp.columns.push_back(std::move(cp));} localColumns+=rp.columns.size();P.rows.push_back(std::move(rp));
+      }
+    }
+  }
+
+  // FULLFAST-FP64-HIST: vertexCells is setup-only for the full flat-Schur plan.
+  // Once flatRow/Col/Term arrays are complete, release the nested star map.
+  if(pPmatMode=="full") {
+    std::vector<std::vector<PetscInt>>().swap(P.vertexCells);
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_FULLFAST_PLAN_COMPACT vertexCells=RELEASED flatTermCoeffBytes=%zu coeffStorage=float64 exactPhysicalSchur=FP64_factored\n",
+      sizeof(double)));
+  }
+
+  const PetscInt nlp=D.cellCount[rank];
+
+  // Build FV pressure-side support only for the fv_lsq surrogate.  Production
+  // p_pmat=full does not need any FV geometry, face-neighbour diagonal ghosts,
+  // or compact Pmat storage.
+  P.fvCellDiagStart=0;
+  P.fvCellDiagLocal.clear();
+  if(pPmatMode=="fv_lsq") {
+    for(int r=0;r<rank;++r) P.fvCellDiagStart += D.cellCount[r];
+    std::vector<PetscInt> fvDiagGhosts;
+    for(PetscInt K=0;K<nc;++K) if(D.cellOwner[K]==rank) {
+      for(int i=0;i<4;++i) {
+        const PetscInt f=M.oppFace[K][i];
+        if(f>=ni) continue;
+        const PetscInt L=(M.owner[f]==K)?M.neighbour[f]:M.owner[f];
+        if(D.cellOwner[L]!=rank) fvDiagGhosts.push_back(D.pGid[L]);
+      }
+    }
+    std::sort(fvDiagGhosts.begin(),fvDiagGhosts.end());
+    fvDiagGhosts.erase(std::unique(fvDiagGhosts.begin(),fvDiagGhosts.end()),fvDiagGhosts.end());
+    PetscCall(VecCreateGhost(PETSC_COMM_WORLD,nlp,globalNc,(PetscInt)fvDiagGhosts.size(),
+                             fvDiagGhosts.empty()?nullptr:fvDiagGhosts.data(),&P.fvCellDiag));
+    for(PetscInt i=0;i<nlp;++i) P.fvCellDiagLocal[P.fvCellDiagStart+i]=i;
+    for(PetscInt j=0;j<(PetscInt)fvDiagGhosts.size();++j)
+      P.fvCellDiagLocal[fvDiagGhosts[j]]=nlp+j;
+  }
+
+  // Exact full-Schur preallocation from the already-built row topology.
+  // This replaces the legacy blanket 128/128 allocation that was 3.81x used NNZ.
+  if(buildExpandedSchur) {
+    PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[r];
+    const PetscInt pEnd=pStart+nlp;
+    std::vector<PetscInt> dnnz((size_t)nlp,0),onnz((size_t)nlp,0);
+    if(pPmatMode=="full") {
+      for(std::size_t r=0;r<P.flatRowGid.size();++r) { const PetscInt li=P.flatRowGid[r]-pStart; if(li<0 || li>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"flat Schur row ownership mismatch");
+        for(PetscInt j=P.flatRowColOffset[r];j<P.flatRowColOffset[r+1];++j){const PetscInt c=P.flatColGid[(std::size_t)j];if(c>=pStart&&c<pEnd)++dnnz[(size_t)li];else++onnz[(size_t)li];} }
+    } else {
+      for(const auto& rp:P.rows) { const PetscInt li=rp.row-pStart; if(li<0 || li>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Schur row ownership mismatch during exact preallocation"); for(const auto& cp:rp.columns){if(cp.col>=pStart&&cp.col<pEnd)++dnnz[(size_t)li];else++onnz[(size_t)li];} }
+    }
+    PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,0,dnnz.data(),0,onnz.data(),&P.S));
+    PetscCall(MatSetOption(P.S,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
+    PetscCall(MatSetOption(P.S,MAT_SYMMETRIC,PETSC_TRUE));
+    PetscInt ld=0,lo=0; for(PetscInt i=0;i<nlp;++i){ld+=dnnz[(size_t)i];lo+=onnz[(size_t)i];}
+    PetscInt gd=0,go=0; PetscCallMPI(MPI_Allreduce(&ld,&gd,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lo,&go,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M3B_PMAT_PREALLOC mode=exact_from_schur_topology diagNnz=%" PetscInt_FMT " offdiagNnz=%" PetscInt_FMT " totalNnz=%" PetscInt_FMT " allocationError=ON\n",gd,go,gd+go));
+  }
+  if(pPmatMode!="full") {
+    // Compact pressure preconditioning matrix.  native_face uses exact row
+    // preallocation for diagonal + physical face neighbours; legacy modes keep
+    // their historical 5/5 upper bound.
+    if(pPmatMode=="native_face") {
+      PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[r];
+      const PetscInt pEnd=pStart+nlp;
+      std::vector<PetscInt> dnnz((std::size_t)nlp,1),onnz((std::size_t)nlp,0);
+      for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+        const PetscInt lr=D.pGid[(std::size_t)K]-pStart;
+        for(int i=0;i<4;++i) {
+          const PetscInt f=M.oppFace[(std::size_t)K][i]; if(f>=ni) continue;
+          const PetscInt L=(M.owner[(std::size_t)f]==K)?M.neighbour[(std::size_t)f]:M.owner[(std::size_t)f];
+          const PetscInt pg=D.pGid[(std::size_t)L]; if(pg>=pStart && pg<pEnd) ++dnnz[(std::size_t)lr]; else ++onnz[(std::size_t)lr];
+        }
+      }
+      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,0,dnnz.data(),0,onnz.data(),&P.Pcompact));
+      PetscCall(MatSetOption(P.Pcompact,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
+      PetscCall(MatSetOption(P.Pcompact,MAT_SYMMETRIC,PETSC_TRUE));
+      PetscInt ld=0,lo=0; for(PetscInt i=0;i<nlp;++i){ld+=dnnz[(std::size_t)i];lo+=onnz[(std::size_t)i];}
+      PetscInt gd=0,go=0; PetscCallMPI(MPI_Allreduce(&ld,&gd,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lo,&go,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_B1_COMPACT_PREALLOC mode=native_face diagNnz=%" PetscInt_FMT " offdiagNnz=%" PetscInt_FMT " totalNnz=%" PetscInt_FMT " avgNnzPerRow=%.6f allocationError=ON graph=cell_plus_face_neighbours\n",
+        gd,go,gd+go,(double)(gd+go)/(double)globalNc));
+    } else {
+      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,globalNc,globalNc,5,nullptr,5,nullptr,&P.Pcompact));
+      PetscCall(MatSetOption(P.Pcompact,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_FALSE));
+      PetscCall(MatSetOption(P.Pcompact,MAT_SYMMETRIC,PETSC_TRUE));
+    }
+  }
+  if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_M5A_FULL_PMAT_STORAGE fvGeometry=ELIMINATED fvCellDiag=ELIMINATED Pcompact=ELIMINATED physicalBcell=ELIMINATED nestedSchur=ELIMINATED flatSchur=ACTIVE\n"));
+  if(buildExpandedSchur) {
+    unsigned long long lc=(unsigned long long)localColumns,lt=(unsigned long long)localTerms,gc=0,gt=0;
+    PetscCallMPI(MPI_Allreduce(&lc,&gc,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&lt,&gt,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+    P.globalSchurNnz=(PetscInt)gc;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_SCHUR_PLAN cachedTopology=1 storage=%s pressureRows=%" PetscInt_FMT " uniqueRowColumns=%llu algebraicTerms=%llu update=batched_row_MatSetValues\n",
+      pPmatMode=="full"?"flat_CSR_terms":"nested_legacy",globalNc,gc,gt));
+  } else {
+    P.globalSchurNnz=-1;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_SCHUR_PLAN cachedTopology=0 pressureRows=%" PetscInt_FMT " explicitExpandedSchur=NOT_MATERIALIZED operator=factored_B_rAU_Bt\n",globalNc));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode reindexFlatSchurRauToCustom(PressureAssemblyPlan& P,const GhostPlan& G,const CustomMomentumCSR& A) {
+  PetscFunctionBeginUser;
+  for(auto& li:P.flatTermLocalRau){PetscInt gid=-1;if(li<G.nOwned)gid=G.rstart+li;else{const PetscInt q=li-G.nOwned;if(q<0 || q>=(PetscInt)G.ghosts.size())SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6B flat Schur legacy rAU index out of range");gid=G.ghosts[(std::size_t)q];}const PetscInt cli=customMomentumLocalIndex(A,gid);if(cli<0)SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6B flat Schur rAU gid missing custom halo");li=cli;}
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode updatePressureSchurFullNative(CustomMomentumCSR& A,PetscBool assembleFullSchur,PressureAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  if(!assembleFullSchur) PetscFunctionReturn(PETSC_SUCCESS);
+  if(!P.S) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6B explicit full Schur requested without matrix");
+  PetscCall(customMomentumExchange(A,A.rAU)); PetscCall(MatZeroEntries(P.S)); std::vector<PetscScalar> vals;
+  auto rauAt=[&](PetscInt li)->double{return li<A.nOwned?A.rAU[(std::size_t)li]:A.ghostValues[(std::size_t)(li-A.nOwned)];};
+  for(std::size_t r=0;r<P.flatRowGid.size();++r){const PetscInt c0=P.flatRowColOffset[r],c1=P.flatRowColOffset[r+1],n=c1-c0;vals.resize((std::size_t)n);for(PetscInt jj=0;jj<n;++jj){const PetscInt cj=c0+jj,t0=P.flatColTermOffset[(std::size_t)cj],t1=P.flatColTermOffset[(std::size_t)cj+1];double v=0;for(PetscInt t=t0;t<t1;++t)v+=rauAt(P.flatTermLocalRau[(std::size_t)t])*P.flatTermCoeff[(std::size_t)t];vals[(std::size_t)jj]=(PetscScalar)v;}if(n)PetscCall(MatSetValues(P.S,1,&P.flatRowGid[r],n,P.flatColGid.data()+c0,vals.data(),INSERT_VALUES));}
+  PetscCall(MatAssemblyBegin(P.S,MAT_FINAL_ASSEMBLY));PetscCall(MatAssemblyEnd(P.S,MAT_FINAL_ASSEMBLY));PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// M11 B1+B2: lean compact FE-informed face-neighbour Pmat for PETSc GAMG.
+// The exact outer PCG operator remains custom FP64 B diag(rAU) B^T.
+// Pnative keeps the exact Schur diagonal, exact BF3 internal-face coupling,
+// and conservatively redistributes P1 vertex diagonal energy onto physical
+// face-neighbour edges.  No full Schur topology, Bcell cache, or vertexCells
+// cache is retained.
+static PetscErrorCode updatePressureCompactNative(const Mesh& M,const Discrete& D,int rank,
+                                                   CustomPressureBPlan& B,const CustomMomentumCSR& A,
+                                                   double p1Strength,PressureAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  if(!P.Pcompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 native compact Pmat requested without matrix");
+  if(p1Strength<0.0 || p1Strength>1.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"M11 native compact P1 strength must satisfy 0 <= strength <= 1");
+  PetscCall(customPeerExchange(B.velocityHalo,A.rAU,48331));
+  PetscCall(MatZeroEntries(P.Pcompact));
+  const PetscInt nv=(PetscInt)M.points.size(),ni=(PetscInt)M.neighbour.size(),nc=(PetscInt)M.tets.size();
+  PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[(std::size_t)r];
+  std::array<PetscInt,5> cols{}; std::array<PetscScalar,5> vals{};
+  double localDiag=0.0,localP1Diag=0.0,localRedistributed=0.0,localBF3Abs=0.0;
+
+  auto rAtLocal=[&](PetscInt li)->double {
+    if(li<0) return 0.0;
+    return customPeerValue(B.velocityHalo,A.rAU,li);
+  };
+  auto internalFaceDegreeAtVertex=[&](PetscInt C,int lv)->int {
+    int deg=0; for(int i=0;i<4;++i) if(i!=lv && M.oppFace[(std::size_t)C][i]<ni) ++deg; return deg;
+  };
+  auto vertexDiagWithR=[&](PetscInt C,int lv,double rauV)->double {
+    if(!(rauV>0.0)) return 0.0;
+    double vol=0.0,g[4][3]={{0}}; fillCustomPressureGeom(M,C,vol,g);
+    double b2=0.0; for(int d=0;d<3;++d){const double q=customPressureBCoeff(vol,g,d,lv);b2+=q*q;} return rauV*b2;
+  };
+
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt pl=D.pGid[(std::size_t)K]-pStart;
+    if(pl<0 || pl>=(PetscInt)B.forwardCells.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 pressure forward-cell indexing mismatch");
+    const auto& cp=B.forwardCells[(std::size_t)pl];
+    PetscInt ncol=1; cols[0]=D.pGid[(std::size_t)K]; vals[0]=0.0;
+    double p1DiagK=0.0;
+    // Exact full Schur diagonal from all local P1+BF3 basis functions.
+    for(int a=0;a<8;++a) if(cp.velLocal[a]>=0) {
+      double b2=0.0; for(int d=0;d<3;++d){const double q=customPressureBCoeff(cp.vol,cp.gradLambda,d,a);b2+=q*q;}
+      const double da=rAtLocal(cp.velLocal[a])*b2; vals[0]+=(PetscScalar)da; if(a<4) p1DiagK+=da;
+    }
+    localDiag += PetscRealPart(vals[0]); localP1Diag += p1DiagK;
+
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i]; if(f>=ni) continue;
+      const PetscInt L=(M.owner[(std::size_t)f]==K)?M.neighbour[(std::size_t)f]:M.owner[(std::size_t)f];
+      int j=-1; for(int q=0;q<4;++q) if(M.oppFace[(std::size_t)L][q]==f){j=q;break;}
+      if(j<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 neighbour local face not found");
+      const PetscInt liFace=cp.velLocal[4+i];
+      if(liFace<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 internal BF3 face unexpectedly constrained/missing from velocity halo");
+      const double rauF=rAtLocal(liFace);
+      double volL=0.0,gL[4][3]={{0}}; fillCustomPressureGeom(M,L,volL,gL);
+      double dot=0.0; for(int d=0;d<3;++d) dot += customPressureBCoeff(cp.vol,cp.gradLambda,d,4+i)*customPressureBCoeff(volL,gL,d,4+j);
+      const double bf3off=rauF*dot; localBF3Abs += std::abs(bf3off);
+
+      double qK=0.0,qL=0.0;
+      if(p1Strength>0.0) {
+        // Only the three vertices on this shared physical face participate.
+        for(int lvK=0;lvK<4;++lvK) if(lvK!=i) {
+          const PetscInt v=M.tets[(std::size_t)K][lvK];
+          const PetscInt lvL=localBasisForEntity(M,L,v);
+          if(lvL<0 || lvL>=4) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 shared face vertex missing in neighbour tet");
+          const PetscInt liV=cp.velLocal[lvK];
+          if(liV<0) continue; // constrained Dirichlet velocity vertex: zero pressure response
+          const double rauV=rAtLocal(liV);
+          const int degK=internalFaceDegreeAtVertex(K,lvK),degL=internalFaceDegreeAtVertex(L,lvL);
+          if(degK>0) qK += vertexDiagWithR(K,lvK,rauV)/(double)degK;
+          if(degL>0) qL += vertexDiagWithR(L,lvL,rauV)/(double)degL;
+        }
+      }
+      const double w=p1Strength*std::max(0.0,std::min(qK,qL));
+      localRedistributed += w;
+      cols[ncol]=D.pGid[(std::size_t)L]; vals[ncol]=(PetscScalar)(bf3off-w); ++ncol;
+    }
+    PetscCall(MatSetValues(P.Pcompact,1,&cols[0],ncol,cols.data(),vals.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(P.Pcompact,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(P.Pcompact,MAT_FINAL_ASSEMBLY));
+
+  double gDiag=0.0,gP1=0.0,gRed=0.0,gBF3=0.0;
+  PetscCallMPI(MPI_Allreduce(&localDiag,&gDiag,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localP1Diag,&gP1,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRedistributed,&gRed,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localBF3Abs,&gBF3,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  MatInfo mi; PetscCall(MatGetInfo(P.Pcompact,MAT_GLOBAL_SUM,&mi));
+  PetscBool sym=PETSC_FALSE; PetscCall(MatIsSymmetric(P.Pcompact,1e-12,&sym));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_B1_COMPACT_VALUES mode=native_face p1Strength=%.6g pmatNnz=%.0f pmatAllocated=%.0f avgNnzPerRow=%.6f exactDiagSum=%.12e p1DiagSum=%.12e redistributedDirectedDegree=%.12e redistributedFraction=%.6f bf3OffAbsRowSum=%.12e symmetric=%d exactOperator=custom_FP64_B_rAU_Bt compactRole=GAMG_preconditioner_only\n",
+    p1Strength,mi.nz_used,mi.nz_allocated,mi.nz_used/(double)distributedGlobalCellCount(D),gDiag,gP1,gRed,gP1>0.0?gRed/gP1:0.0,gBF3,(int)sym));
+  if(!sym) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 native compact pressure Pmat lost symmetry");
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+
+// Gate 9G: compact FE/SIMPLE-energy face Laplacian.
+// Keep exactly the native physical face-neighbour pressure graph, but choose
+// each internal edge conductance from the actual B diag(rAU) B^T energy of a
+// unit pressure jump across that face, restricted to velocity basis functions
+// shared by the two adjacent tetrahedra:
+//
+//   a_f = 1/4 sum_{j shared(P,N)} rAU_j || B_Pj - B_Nj ||_2^2 .
+//
+// For q=[+1,-1] on the two cells, q^T [[a,-a],[-a,a]] q = 4 a, so the factor
+// 1/4 matches the exact shared-DOF FE pressure-jump energy.  This is positive
+// by construction, symmetric, uses the live SIMPLE/SIMPLEC mobility, and keeps
+// only one owner-neighbour edge per physical face.  The outlet p=0 anchor is
+// built on the same FE scale from velocity basis functions with nonzero trace
+// on the outlet face.  Finally a single global trace match rescales the compact
+// matrix to the exact Schur diagonal sum; this preserves relative face weights
+// while removing a global scaling error that matters to Richardson/GAMG-only.
+struct Gate9gFeFaceAudit {
+  PetscReal coeffMin=PETSC_MAX_REAL,coeffMax=0.0,coeffMean=0.0;
+  PetscReal anchorMin=PETSC_MAX_REAL,anchorMax=0.0,anchorMean=0.0;
+  PetscReal exactDiagSum=0.0,compactDiagSumBeforeScale=0.0,traceScale=1.0;
+  PetscReal exactSharedOffAbs=0.0,energyEdgeSum=0.0;
+  PetscInt internalFaces=0,outletFaces=0,positiveExactPair=0,nonfinite=0;
+};
+
+static PetscErrorCode updatePressureCompactFeFaceEnergy(const Mesh& M,const Discrete& D,const ProblemConfig& Pcfg,
+                                                         int rank,CustomPressureBPlan& B,const CustomMomentumCSR& A,
+                                                         PressureAssemblyPlan& P,Gate9gFeFaceAudit& audit) {
+  PetscFunctionBeginUser;
+  if(!P.Pcompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G FE-face Kp requested without compact Pmat");
+  PetscCall(customPeerExchange(B.velocityHalo,A.rAU,59371));
+  PetscCall(MatZeroEntries(P.Pcompact));
+  PetscCall(MatSetOption(P.Pcompact,MAT_SYMMETRIC,PETSC_TRUE));
+  const PetscInt nv=(PetscInt)M.points.size(),ni=(PetscInt)M.neighbour.size(),nc=(PetscInt)M.tets.size();
+  PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[(std::size_t)r];
+  std::array<PetscInt,5> cols{}; std::array<PetscScalar,5> vals{};
+  double localCoeffMin=PETSC_MAX_REAL,localCoeffMax=0.0,localCoeffSum=0.0;
+  double localAnchorMin=PETSC_MAX_REAL,localAnchorMax=0.0,localAnchorSum=0.0;
+  double localExactDiag=0.0,localCompactDiag=0.0,localExactOffAbs=0.0,localEnergyEdge=0.0;
+  PetscInt localInternal=0,localOutlet=0,localPositivePair=0,localNonfinite=0;
+
+  auto rAtLocal=[&](PetscInt li)->double { return li<0?0.0:customPeerValue(B.velocityHalo,A.rAU,li); };
+  auto basisB2=[&](double vol,const double g[4][3],int a)->double {
+    double q=0.0; for(int d=0;d<3;++d){const double b=customPressureBCoeff(vol,g,d,a);q+=b*b;} return q;
+  };
+
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt pl=D.pGid[(std::size_t)K]-pStart;
+    if(pl<0 || pl>=(PetscInt)B.forwardCells.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G pressure forward-cell indexing mismatch");
+    const auto& cp=B.forwardCells[(std::size_t)pl];
+    PetscInt ncol=1; cols[0]=D.pGid[(std::size_t)K]; vals[0]=0.0;
+
+    // Exact full Schur diagonal trace contribution for scaling/audit.
+    double exactDiagK=0.0;
+    for(int a=0;a<8;++a) if(cp.velLocal[a]>=0) exactDiagK += rAtLocal(cp.velLocal[a])*basisB2(cp.vol,cp.gradLambda,a);
+    localExactDiag += exactDiagK;
+
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i];
+      if(f<ni) {
+        const PetscInt L=(M.owner[(std::size_t)f]==K)?M.neighbour[(std::size_t)f]:M.owner[(std::size_t)f];
+        int j=-1; for(int q=0;q<4;++q) if(M.oppFace[(std::size_t)L][q]==f){j=q;break;}
+        if(j<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G neighbour local face not found");
+        double volL=0.0,gL[4][3]={{0}}; fillCustomPressureGeom(M,L,volL,gL);
+        double jumpEnergy=0.0,exactPair=0.0;
+
+        // Three P1 vertices shared by the physical face.
+        for(int lvK=0;lvK<4;++lvK) if(lvK!=i) {
+          const PetscInt v=M.tets[(std::size_t)K][lvK];
+          const PetscInt lvL=localBasisForEntity(M,L,v);
+          if(lvL<0 || lvL>=4) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G shared face vertex missing in neighbour tet");
+          const PetscInt li=cp.velLocal[lvK];
+          if(li<0) continue; // constrained velocity trace has no pressure response
+          const double rr=rAtLocal(li);
+          double d2=0.0,dot=0.0;
+          for(int d=0;d<3;++d) {
+            const double bK=customPressureBCoeff(cp.vol,cp.gradLambda,d,lvK);
+            const double bL=customPressureBCoeff(volL,gL,d,lvL);
+            const double db=bK-bL; d2+=db*db; dot+=bK*bL;
+          }
+          jumpEnergy += rr*d2; exactPair += rr*dot;
+        }
+
+        // Shared BF3 face bubble.
+        const PetscInt liF=cp.velLocal[4+i];
+        if(liF>=0) {
+          const double rr=rAtLocal(liF); double d2=0.0,dot=0.0;
+          for(int d=0;d<3;++d) {
+            const double bK=customPressureBCoeff(cp.vol,cp.gradLambda,d,4+i);
+            const double bL=customPressureBCoeff(volL,gL,d,4+j);
+            const double db=bK-bL; d2+=db*db; dot+=bK*bL;
+          }
+          jumpEnergy += rr*d2; exactPair += rr*dot;
+        }
+        const double af=0.25*jumpEnergy;
+        if(!std::isfinite(af) || af<0.0) {++localNonfinite; continue;}
+        vals[0]+=(PetscScalar)af;
+        cols[ncol]=D.pGid[(std::size_t)L]; vals[ncol]=(PetscScalar)(-af); ++ncol;
+        localCoeffMin=std::min(localCoeffMin,af); localCoeffMax=std::max(localCoeffMax,af); localCoeffSum+=af;
+        localExactOffAbs+=std::abs(exactPair); localEnergyEdge+=af; ++localInternal;
+        if(exactPair>0.0) ++localPositivePair;
+      } else {
+        const int pi=M.facePatch[(std::size_t)f];
+        if(pi==Pcfg.boundary.outlet) {
+          // FE-scaled Dirichlet-to-zero edge.  Only P1 vertices on this face
+          // and its BF3 trace bubble participate in the pressure boundary jump.
+          double ab=0.0;
+          for(int lv=0;lv<4;++lv) if(lv!=i && cp.velLocal[lv]>=0)
+            ab += rAtLocal(cp.velLocal[lv])*basisB2(cp.vol,cp.gradLambda,lv);
+          if(cp.velLocal[4+i]>=0) ab += rAtLocal(cp.velLocal[4+i])*basisB2(cp.vol,cp.gradLambda,4+i);
+          if(!std::isfinite(ab) || ab<0.0) {++localNonfinite; ab=0.0;}
+          vals[0]+=(PetscScalar)ab;
+          localAnchorMin=std::min(localAnchorMin,ab); localAnchorMax=std::max(localAnchorMax,ab); localAnchorSum+=ab; ++localOutlet;
+        } else if(pi==Pcfg.boundary.inlet || isWallPatch(Pcfg.boundary,pi)) {
+          // homogeneous Neumann for the auxiliary pressure operator
+        } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G encountered unclassified pressure boundary face");
+      }
+    }
+    localCompactDiag += PetscRealPart(vals[0]);
+    PetscCall(MatSetValues(P.Pcompact,1,&cols[0],ncol,cols.data(),vals.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(P.Pcompact,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(P.Pcompact,MAT_FINAL_ASSEMBLY));
+
+  double gCoeffMin=0.0,gCoeffMax=0.0,gCoeffSum=0.0,gAnchorMin=0.0,gAnchorMax=0.0,gAnchorSum=0.0;
+  double gExactDiag=0.0,gCompactDiag=0.0,gExactOffAbs=0.0,gEnergyEdge=0.0;
+  PetscInt gInternal=0,gOutlet=0,gPositivePair=0,gNonfinite=0;
+  PetscCallMPI(MPI_Allreduce(&localCoeffMin,&gCoeffMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localCoeffMax,&gCoeffMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localCoeffSum,&gCoeffSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localAnchorMin,&gAnchorMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localAnchorMax,&gAnchorMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localAnchorSum,&gAnchorSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localExactDiag,&gExactDiag,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localCompactDiag,&gCompactDiag,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localExactOffAbs,&gExactOffAbs,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localEnergyEdge,&gEnergyEdge,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localInternal,&gInternal,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutlet,&gOutlet,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localPositivePair,&gPositivePair,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localNonfinite,&gNonfinite,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+
+  const double traceScale=(gCompactDiag>0.0)?gExactDiag/gCompactDiag:1.0;
+  if(!(traceScale>0.0) || !std::isfinite(traceScale)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9G invalid FE-face trace scale");
+  PetscCall(MatScale(P.Pcompact,traceScale));
+  MatInfo mi{}; PetscCall(MatGetInfo(P.Pcompact,MAT_GLOBAL_SUM,&mi));
+  PetscBool sym=PETSC_FALSE; PetscCall(MatIsSymmetric(P.Pcompact,1e-12,&sym));
+  if(!sym) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9G FE-face compact Kp lost symmetry");
+
+  audit.coeffMin=(PetscReal)(gInternal?gCoeffMin*traceScale:0.0);
+  audit.coeffMax=(PetscReal)(gCoeffMax*traceScale);
+  audit.coeffMean=(PetscReal)(gInternal?gCoeffSum*traceScale/(double)gInternal:0.0);
+  audit.anchorMin=(PetscReal)(gOutlet?gAnchorMin*traceScale:0.0);
+  audit.anchorMax=(PetscReal)(gAnchorMax*traceScale);
+  audit.anchorMean=(PetscReal)(gOutlet?gAnchorSum*traceScale/(double)gOutlet:0.0);
+  audit.exactDiagSum=(PetscReal)gExactDiag; audit.compactDiagSumBeforeScale=(PetscReal)gCompactDiag; audit.traceScale=(PetscReal)traceScale;
+  audit.exactSharedOffAbs=(PetscReal)gExactOffAbs; audit.energyEdgeSum=(PetscReal)(gEnergyEdge*traceScale);
+  audit.internalFaces=gInternal/2; audit.outletFaces=gOutlet; audit.positiveExactPair=gPositivePair/2; audit.nonfinite=gNonfinite;
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE9G_FE_FACE_KP_VALUES rows=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f internalFaces=%" PetscInt_FMT " outletFaces=%" PetscInt_FMT " coeffMin=%.12e coeffMean=%.12e coeffMax=%.12e anchorMin=%.12e anchorMean=%.12e anchorMax=%.12e exactDiagSum=%.12e compactDiagBeforeScale=%.12e traceScale=%.12e positiveExactSharedPair=%" PetscInt_FMT " exactSharedOffAbs=%.12e energyEdgeSumScaled=%.12e symmetric=%d nonfinite=%" PetscInt_FMT " formula=quarter_shared_FE_jump_energy graph=cell_plus_face_neighbours exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt\n",
+    distributedGlobalCellCount(D),mi.nz_used,mi.nz_used/(double)distributedGlobalCellCount(D),audit.internalFaces,gOutlet,(double)audit.coeffMin,(double)audit.coeffMean,(double)audit.coeffMax,
+    (double)audit.anchorMin,(double)audit.anchorMean,(double)audit.anchorMax,(double)audit.exactDiagSum,(double)audit.compactDiagSumBeforeScale,
+    (double)audit.traceScale,audit.positiveExactPair,(double)audit.exactSharedOffAbs,(double)audit.energyEdgeSum,(int)sym,audit.nonfinite));
+  if(gNonfinite) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9G FE-face Kp contained invalid conductances");
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode updatePressureSchurFast(const Mesh& M,const Discrete& D,int rank,const GhostPlan& G,Vec rAU,const std::string& pPmatMode,double feFvP1Strength,double fvLsqStrength,double fvLsqTpfaFloor,PetscBool assembleFullSchur,PressureAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  PetscCall(VecGhostUpdateBegin(rAU,INSERT_VALUES,SCATTER_FORWARD));
+  PetscCall(VecGhostUpdateEnd(rAU,INSERT_VALUES,SCATTER_FORWARD));
+  Vec rloc=nullptr;
+  const PetscScalar *ra=nullptr;
+  PetscCall(VecGhostGetLocalForm(rAU,&rloc));
+  PetscCall(VecGetArrayRead(rloc,&ra));
+
+  // For the FV/LSQ surrogate, compute the exact Schur diagonal on owned cells
+  // from the local FE rAU response, then exchange only face-neighbour pressure
+  // diagonals.  This fixes the previous bug where exactCellSchurDiag(L) tried
+  // to read all velocity DOFs of an off-rank neighbour L through G.
+  const PetscScalar *fvDiagLocalArray=nullptr;
+  Vec fvDiagLocalForm=nullptr;
+  if(pPmatMode=="fv_lsq") {
+    PetscScalar *da=nullptr;
+    PetscCall(VecSet(P.fvCellDiag,0.0));
+    PetscCall(VecGetArray(P.fvCellDiag,&da));
+    for(PetscInt K=0;K<(PetscInt)M.tets.size();++K) if(D.cellOwner[K]==rank) {
+      double diagK=0.0;
+      for(int a=0;a<8;++a) {
+        const PetscInt entity=(a<4)?M.tets[K][a]:((PetscInt)M.points.size()+M.oppFace[K][a-4]);
+        const PetscInt gid=D.g2free[entity]; if(gid<0) continue;
+        const PetscInt li=velocityLocalIndex(G,gid); // K is owned: guaranteed in G
+        double b2=0.0;
+        for(int d=0;d<3;++d) { const double b=P.Bcell[K][d*8+a]; b2+=b*b; }
+        diagK += PetscRealPart(ra[li])*b2;
+      }
+      const PetscInt liP=D.pGid[K]-P.fvCellDiagStart;
+      if(liP<0 || liP>=D.cellCount[rank])
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"owned pressure gid/layout mismatch in fv_lsq diagonal exchange");
+      da[liP]=(PetscScalar)diagK;
+    }
+    PetscCall(VecRestoreArray(P.fvCellDiag,&da));
+    PetscCall(VecGhostUpdateBegin(P.fvCellDiag,INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostUpdateEnd(P.fvCellDiag,INSERT_VALUES,SCATTER_FORWARD));
+    PetscCall(VecGhostGetLocalForm(P.fvCellDiag,&fvDiagLocalForm));
+    PetscCall(VecGetArrayRead(fvDiagLocalForm,&fvDiagLocalArray));
+  }
+
+  if(assembleFullSchur) {
+    if(!P.S) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"explicit Schur assembly requested but expanded structure was not built");
+    PetscCall(MatZeroEntries(P.S)); std::vector<PetscInt> cols; std::vector<PetscScalar> vals;
+    if(pPmatMode=="full") {
+      for(std::size_t r=0;r<P.flatRowGid.size();++r) { const PetscInt c0=P.flatRowColOffset[r],c1=P.flatRowColOffset[r+1],n=c1-c0; vals.resize((std::size_t)n);
+        for(PetscInt jj=0;jj<n;++jj){const PetscInt cj=c0+jj,t0=P.flatColTermOffset[(std::size_t)cj],t1=P.flatColTermOffset[(std::size_t)cj+1];double v=0;for(PetscInt t=t0;t<t1;++t)v+=PetscRealPart(ra[P.flatTermLocalRau[(std::size_t)t]])*P.flatTermCoeff[(std::size_t)t];vals[(std::size_t)jj]=(PetscScalar)v;}
+        if(n) PetscCall(MatSetValues(P.S,1,&P.flatRowGid[r],n,P.flatColGid.data()+c0,vals.data(),INSERT_VALUES)); }
+    } else {
+      for(const auto& rp:P.rows){const PetscInt n=(PetscInt)rp.columns.size();cols.resize(n);vals.resize(n);for(PetscInt j=0;j<n;++j){cols[j]=rp.columns[j].col;double v=0;for(const auto& term:rp.columns[j].terms)v+=PetscRealPart(ra[term.localRau])*term.coeff;vals[j]=(PetscScalar)v;}if(n)PetscCall(MatSetValues(P.S,1,&rp.row,n,cols.data(),vals.data(),INSERT_VALUES));}
+    }
+  }
+
+  // Full Pmat mode does not use Pcompact at all.  In the factored-operator +
+  // lagged-full-GAMG path this routine is called only on PC refresh steps, so
+  // avoid rebuilding an otherwise unused 5-point surrogate.
+  if(pPmatMode=="full") {
+    PetscCall(VecRestoreArrayRead(rloc,&ra));
+    PetscCall(VecGhostRestoreLocalForm(rAU,&rloc));
+    if(assembleFullSchur) {
+      PetscCall(MatAssemblyBegin(P.S,MAT_FINAL_ASSEMBLY));
+      PetscCall(MatAssemblyEnd(P.S,MAT_FINAL_ASSEMBLY));
+    }
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+
+  // Build a compact GAMG P-matrix from the same rAU values.
+  // compact_face: historical truncation: exact diagonal, BF3 face off-diagonal only.
+  // fe_fv_face: independently constructed FE-informed FV-like surrogate.  The
+  //   BF3 face contribution is retained exactly, while the P1 vertex diagonal
+  //   energy is conservatively redistributed onto physical internal faces.
+  //   For a cell K and one of its P1 vertices v,
+  //       d_Kv = rAU_v |B_Kv|^2 .
+  //   d_Kv is divided equally among K's internal faces that contain v.  On a
+  //   shared face f=K|L, the symmetric P1 graph weight is
+  //       w_f^P1 = strength * min(q_Kf,q_Lf) >= 0.
+  //   Since sum_f q_Kf <= sum_v d_Kv, the redistributed P1 graph Laplacian
+  //   cannot consume more than the exact P1 diagonal energy.  Any unmatched
+  //   energy remains on the exact Schur diagonal.  Thus this is a compact,
+  //   conservative SPD surrogate rather than a truncation of the dense P1
+  //   vertex-star clique.
+  PetscCall(MatZeroEntries(P.Pcompact));
+  const PetscInt nv=(PetscInt)M.points.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  std::array<PetscInt,5> ccols{};
+  std::array<PetscScalar,5> cvals{};
+  double localP1Diag=0.0, localP1Degree=0.0, localBF3OffAbs=0.0;
+  double localFvDiag=0.0,localFvDegree=0.0,localFvLsqGeom=0.0,localFvTpfaGeom=0.0,localFvCos=0.0;
+  PetscInt localFvFaces=0; double localFvMinCos=1.0;
+
+  auto vertexDiagContribution = [&](PetscInt C,int localVertex)->double {
+    const PetscInt entity=M.tets[C][localVertex];
+    const PetscInt gid=D.g2free[entity];
+    if(gid<0) return 0.0;
+    const PetscInt li=velocityLocalIndex(G,gid);
+    double b2=0.0;
+    for(int d=0;d<3;++d) { const double b=P.Bcell[C][d*8+localVertex]; b2+=b*b; }
+    return PetscRealPart(ra[li])*b2;
+  };
+  auto internalFaceDegreeAtVertex = [&](PetscInt C,int localVertex)->int {
+    int deg=0;
+    // Local face i is opposite local vertex i, so it contains localVertex iff i!=localVertex.
+    for(int i=0;i<4;++i) if(i!=localVertex && M.oppFace[C][i]<ni) ++deg;
+    return deg;
+  };
+  auto p1DirectedFaceShare = [&](PetscInt C,PetscInt face)->double {
+    int opp=-1;
+    for(int i=0;i<4;++i) if(M.oppFace[C][i]==face) { opp=i; break; }
+    if(opp<0) return 0.0;
+    double q=0.0;
+    for(int lv=0;lv<4;++lv) if(lv!=opp) {
+      const int deg=internalFaceDegreeAtVertex(C,lv);
+      if(deg>0) q += vertexDiagContribution(C,lv)/(double)deg;
+    }
+    return q;
+  };
+
+  auto exactCellSchurDiag = [&](PetscInt C)->double {
+    if(pPmatMode=="fv_lsq") {
+      const PetscInt pg=D.pGid[C];
+      const auto it=P.fvCellDiagLocal.find(pg);
+      if(it==P.fvCellDiagLocal.end())
+        throw std::runtime_error("fv_lsq pressure diagonal ghost missing face-neighbour cell");
+      return PetscRealPart(fvDiagLocalArray[it->second]);
+    }
+    double diagC=0.0;
+    for(int a=0;a<8;++a) {
+      const PetscInt entity=(a<4)?M.tets[C][a]:(nv+M.oppFace[C][a-4]);
+      const PetscInt gid=D.g2free[entity]; if(gid<0) continue;
+      const PetscInt li=velocityLocalIndex(G,gid);
+      double b2=0.0; for(int d=0;d<3;++d) { const double b=P.Bcell[C][d*8+a]; b2+=b*b; }
+      diagC += PetscRealPart(ra[li])*b2;
+    }
+    return diagC;
+  };
+  auto fvRawGeom = [&](PetscInt C,int lf)->double {
+    return std::max(P.fvLsqGeom[C][lf],fvLsqTpfaFloor*P.fvTpfaGeom[C][lf]);
+  };
+  auto fvGeomDegree = [&](PetscInt C)->double {
+    double z=0.0; for(int i=0;i<4;++i) if(M.oppFace[C][i]<ni) z+=fvRawGeom(C,i); return z;
+  };
+  auto fvFaceWeight = [&](PetscInt K,int i,PetscInt L,PetscInt f)->double {
+    int j=-1; for(int q=0;q<4;++q) if(M.oppFace[L][q]==f) {j=q;break;}
+    if(j<0) return 0.0;
+    const double dK=exactCellSchurDiag(K), dL=exactCellSchurDiag(L);
+    const double gK=fvGeomDegree(K), gL=fvGeomDegree(L);
+    if(!(dK>0.0 && dL>0.0 && gK>0.0 && gL>0.0)) return 0.0;
+    const double wK=fvLsqStrength*dK*fvRawGeom(K,i)/gK;
+    const double wL=fvLsqStrength*dL*fvRawGeom(L,j)/gL;
+    return std::max(0.0,std::min(wK,wL));
+  };
+
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[K]==rank) {
+    PetscInt ncol=1; ccols[0]=D.pGid[K]; cvals[0]=0.0;
+    double p1DiagK=0.0;
+    if(pPmatMode=="fv_lsq") {
+      cvals[0]=(PetscScalar)exactCellSchurDiag(K);
+      localFvDiag += PetscRealPart(cvals[0]);
+    } else {
+      // Exact full Schur diagonal: sum_a rAU_a |B_Ka|^2.
+      for(int a=0;a<8;++a) {
+        const PetscInt entity=(a<4)?M.tets[K][a]:(nv+M.oppFace[K][a-4]);
+        const PetscInt gid=D.g2free[entity];
+        if(gid<0) continue;
+        const PetscInt li=velocityLocalIndex(G,gid);
+        double b2=0.0; for(int d=0;d<3;++d) { const double b=P.Bcell[K][d*8+a]; b2+=b*b; }
+        const double da=PetscRealPart(ra[li])*b2;
+        cvals[0] += (PetscScalar)da;
+        if(a<4) p1DiagK += da;
+      }
+      localP1Diag += p1DiagK;
+    }
+
+    // Face-neighbour off-diagonals: exact BF3 contribution, plus optional
+    // conservative P1 vertex-energy redistribution for fe_fv_face.
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[K][i];
+      if(f>=ni) continue;
+      const PetscInt entity=nv+f;
+      const PetscInt gid=D.g2free[entity];
+      if(gid<0) continue;
+      const PetscInt L=(M.owner[f]==K)?M.neighbour[f]:M.owner[f];
+      const int b=localBasisForEntity(M,L,entity);
+      if(b<4) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact BF3 face/local-basis mismatch");
+      const PetscInt li=velocityLocalIndex(G,gid);
+      double dot=0.0;
+      for(int d=0;d<3;++d) dot += P.Bcell[K][d*8+4+i]*P.Bcell[L][d*8+b];
+      const double bf3off=PetscRealPart(ra[li])*dot;
+      double off=bf3off;
+      localBF3OffAbs += std::abs(bf3off);
+      if(pPmatMode=="fe_fv_face" && feFvP1Strength>0.0) {
+        const double qK=p1DirectedFaceShare(K,f);
+        const double qL=p1DirectedFaceShare(L,f);
+        const double w=feFvP1Strength*std::max(0.0,std::min(qK,qL));
+        off -= w;                    // graph-Laplacian face coupling
+        localP1Degree += w;          // row degree; each global face counts twice overall
+      } else if(pPmatMode=="fv_lsq") {
+        // A genuinely independent compact FV-like pressure operator: the
+        // exact FE/BF3 off-diagonal is NOT used.  One-ring LSQ geometry sets
+        // the relative face conductances; the FE rAU response enters through
+        // exact-cell-Schur-diagonal normalization.  min(one-sided weights)
+        // makes the assembled graph symmetric and guarantees row degree <=
+        // fvLsqStrength*exact diagonal for 0<=strength<=1.
+        const double w=fvFaceWeight(K,i,L,f);
+        off=-w;
+        localFvDegree+=w;
+        localFvLsqGeom+=P.fvLsqGeom[K][i];
+        localFvTpfaGeom+=P.fvTpfaGeom[K][i];
+        localFvCos+=P.fvNonorthCos[K][i];
+        localFvMinCos=std::min(localFvMinCos,P.fvNonorthCos[K][i]);
+        ++localFvFaces;
+      }
+      ccols[ncol]=D.pGid[L]; cvals[ncol]=(PetscScalar)off; ++ncol;
+    }
+    PetscCall(MatSetValues(P.Pcompact,1,&ccols[0],ncol,ccols.data(),cvals.data(),INSERT_VALUES));
+  }
+
+  if(pPmatMode=="fe_fv_face") {
+    static PetscInt reportCount=0;
+    if(reportCount<3) {
+      double gP1Diag=0.0,gP1Degree=0.0,gBF3OffAbs=0.0;
+      PetscCallMPI(MPI_Allreduce(&localP1Diag,&gP1Diag,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localP1Degree,&gP1Degree,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localBF3OffAbs,&gBF3OffAbs,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_FE_FV_PMAT strength=%.6g p1DiagSum=%.12e redistributedRowDegree=%.12e redistributedFraction=%.6f bf3OffAbsRowSum=%.12e graph=cell_plus_face_neighbours\n",
+        feFvP1Strength,gP1Diag,gP1Degree,gP1Diag>0.0?gP1Degree/gP1Diag:0.0,gBF3OffAbs));
+      ++reportCount;
+    }
+  }
+
+  if(pPmatMode=="fv_lsq") {
+    static PetscInt fvReportCount=0;
+    if(fvReportCount<3) {
+      double gDiag=0.0,gDegree=0.0,gLsq=0.0,gTpfa=0.0,gCos=0.0,gMinCos=0.0;
+      PetscInt gFaces=0;
+      PetscCallMPI(MPI_Allreduce(&localFvDiag,&gDiag,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvDegree,&gDegree,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvLsqGeom,&gLsq,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvTpfaGeom,&gTpfa,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvCos,&gCos,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvFaces,&gFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localFvMinCos,&gMinCos,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_LSQ_FV_PMAT strength=%.6g tpfaFloor=%.6g exactDiagSum=%.12e graphDegreeSum=%.12e degreeToDiag=%.6f directedFaces=%" PetscInt_FMT " meanLsqGeom=%.12e meanTpfaGeom=%.12e meanNonorthCos=%.6f minNonorthCos=%.6f graph=cell_plus_face_neighbours normalization=FE_exact_Schur_diag\n",
+        fvLsqStrength,fvLsqTpfaFloor,gDiag,gDegree,gDiag>0.0?gDegree/gDiag:0.0,gFaces,
+        gFaces?gLsq/(double)gFaces:0.0,gFaces?gTpfa/(double)gFaces:0.0,gFaces?gCos/(double)gFaces:0.0,gMinCos));
+      ++fvReportCount;
+    }
+  }
+
+  if(pPmatMode=="fv_lsq") {
+    PetscCall(VecRestoreArrayRead(fvDiagLocalForm,&fvDiagLocalArray));
+    PetscCall(VecGhostRestoreLocalForm(P.fvCellDiag,&fvDiagLocalForm));
+  }
+  PetscCall(VecRestoreArrayRead(rloc,&ra));
+  PetscCall(VecGhostRestoreLocalForm(rAU,&rloc));
+  if(assembleFullSchur) {
+    PetscCall(MatAssemblyBegin(P.S,MAT_FINAL_ASSEMBLY));
+    PetscCall(MatAssemblyEnd(P.S,MAT_FINAL_ASSEMBLY));
+  }
+  PetscCall(MatAssemblyBegin(P.Pcompact,MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(P.Pcompact,MAT_FINAL_ASSEMBLY));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode destroyPressureAssemblyPlan(PressureAssemblyPlan& P) {
+  PetscFunctionBeginUser;
+  PetscCall(MatDestroy(&P.S));
+  PetscCall(MatDestroy(&P.Pcompact));
+  PetscCall(VecDestroy(&P.fvCellDiag));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+static PetscErrorCode profileFillVector(Vec v);
+static PetscErrorCode profileMaxSeconds(PetscLogDouble local,double *globalMax);
+
+struct FactoredSchurContext {
+  Mat B[3]={nullptr,nullptr,nullptr};
+  Vec rAU=nullptr;
+  Vec velocityWork=nullptr;
+  Vec pressureWork=nullptr;
+};
+
+static PetscErrorCode factoredSchurMult(Mat A,Vec x,Vec y) {
+  PetscFunctionBeginUser;
+  FactoredSchurContext *C=nullptr;
+  PetscCall(MatShellGetContext(A,&C));
+  PetscCall(VecSet(y,0.0));
+  for(int d=0;d<3;++d) {
+    PetscCall(MatMultTranspose(C->B[d],x,C->velocityWork));
+    PetscCall(VecPointwiseMult(C->velocityWork,C->velocityWork,C->rAU));
+    PetscCall(MatMult(C->B[d],C->velocityWork,C->pressureWork));
+    PetscCall(VecAXPY(y,1.0,C->pressureWork));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode createFactoredSchur(const Discrete& D,Vec rAU,Vec pressureTemplate,FactoredSchurContext& C,Mat *A) {
+  PetscFunctionBeginUser;
+  for(int d=0;d<3;++d) C.B[d]=D.B[d];
+  C.rAU=rAU;
+  PetscCall(VecDuplicate(D.rhs[0],&C.velocityWork));
+  PetscCall(VecDuplicate(pressureTemplate,&C.pressureWork));
+  PetscInt plocal=0,pglobal=0;
+  PetscCall(VecGetLocalSize(pressureTemplate,&plocal));
+  PetscCall(VecGetSize(pressureTemplate,&pglobal));
+  PetscCall(MatCreateShell(PETSC_COMM_WORLD,plocal,plocal,pglobal,pglobal,&C,A));
+  PetscCall(MatShellSetOperation(*A,MATOP_MULT,(void(*)(void))factoredSchurMult));
+  PetscCall(MatSetOption(*A,MAT_SYMMETRIC,PETSC_TRUE));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode destroyFactoredSchurContext(FactoredSchurContext& C) {
+  PetscFunctionBeginUser;
+  PetscCall(VecDestroy(&C.velocityWork));
+  PetscCall(VecDestroy(&C.pressureWork));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profileOperatorMatMult(Mat A,Vec templateVec,PetscInt reps,double *secondsPerApply) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr;
+  PetscCall(VecDuplicate(templateVec,&x));
+  PetscCall(VecDuplicate(templateVec,&y));
+  PetscCall(profileFillVector(x));
+  for(int w=0;w<5;++w) PetscCall(MatMult(A,x,y));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  PetscLogDouble t0,t1; PetscCall(PetscTime(&t0));
+  for(PetscInt i=0;i<reps;++i) PetscCall(MatMult(A,x,y));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  PetscCall(PetscTime(&t1));
+  PetscCall(profileMaxSeconds((t1-t0)/(PetscLogDouble)reps,secondsPerApply));
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode benchmarkFactoredSchur(Mat explicitS,Mat factoredS,const Discrete& D,Vec pressureTemplate,PetscInt expandedNnz,PetscInt reps) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,ye=nullptr,yf=nullptr,diff=nullptr;
+  PetscCall(VecDuplicate(pressureTemplate,&x)); PetscCall(VecDuplicate(pressureTemplate,&ye));
+  PetscCall(VecDuplicate(pressureTemplate,&yf)); PetscCall(VecDuplicate(pressureTemplate,&diff));
+  PetscCall(profileFillVector(x));
+  PetscCall(MatMult(explicitS,x,ye)); PetscCall(MatMult(factoredS,x,yf));
+  PetscCall(VecWAXPY(diff,-1.0,ye,yf));
+  PetscReal en=0.0,dn=0.0,di=0.0;
+  PetscCall(VecNorm(ye,NORM_2,&en)); PetscCall(VecNorm(diff,NORM_2,&dn)); PetscCall(VecNorm(diff,NORM_INFINITY,&di));
+  double explicitSec=0.0,factoredSec=0.0;
+  PetscCall(profileOperatorMatMult(explicitS,pressureTemplate,reps,&explicitSec));
+  PetscCall(profileOperatorMatMult(factoredS,pressureTemplate,reps,&factoredSec));
+  double bNnz=0.0;
+  for(int d=0;d<3;++d) if(D.B[d]) { MatInfo bi; PetscCall(MatGetInfo(D.B[d],MAT_GLOBAL_SUM,&bi)); bNnz+=bi.nz_used; }
+  const double traversed=2.0*bNnz;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_FACTORED_SCHUR_CHECK relL2=%.12e absInf=%.12e explicitNorm=%.12e status=%s semantics=sum_d_Bd_rAU_BdT_no_extra_solve\n",
+    (double)(en>0?dn/en:dn),(double)di,(double)en,(en>0?dn/en:dn)<5e-12?"PASS":"FAIL"));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_FACTORED_SCHUR_PROFILE reps=%" PetscInt_FMT " explicitExpandedNnz=%" PetscInt_FMT " BxyzStoredNnz=%.0f factoredSparseEntriesTraversed=%.0f explicitMatMultMs=%.6f factoredMatMultMs=%.6f speedupExplicitOverFactored=%.6f factoredOverExplicit=%.6f\n",
+    reps,expandedNnz,bNnz,traversed,1e3*explicitSec,1e3*factoredSec,explicitSec/factoredSec,factoredSec/explicitSec));
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&ye)); PetscCall(VecDestroy(&yf)); PetscCall(VecDestroy(&diff));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profileFillVector(Vec v) {
+  PetscFunctionBeginUser;
+  PetscInt lo=0,hi=0;
+  PetscScalar *a=nullptr;
+  PetscCall(VecGetOwnershipRange(v,&lo,&hi));
+  PetscCall(VecGetArray(v,&a));
+  for(PetscInt i=lo;i<hi;++i) {
+    const double x=(double)(i+1);
+    a[i-lo]=(PetscScalar)(std::sin(0.013*x)+0.37*std::cos(0.007*x));
+  }
+  PetscCall(VecRestoreArray(v,&a));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profileMaxSeconds(PetscLogDouble local,double *globalMax) {
+  PetscFunctionBeginUser;
+  double x=(double)local,mx=0.0;
+  PetscCallMPI(MPI_Allreduce(&x,&mx,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  *globalMax=mx;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profileMatMult(Mat A,PetscInt reps,double *secondsPerApply) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr;
+  PetscCall(MatCreateVecs(A,&x,&y));
+  PetscCall(profileFillVector(x));
+  for(int w=0;w<3;++w) PetscCall(MatMult(A,x,y));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  PetscLogDouble t0,t1; PetscCall(PetscTime(&t0));
+  for(PetscInt i=0;i<reps;++i) { PetscCall(MatMult(A,x,y)); std::swap(x,y); }
+  PetscCall(PetscTime(&t1));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  double mx=0; PetscCall(profileMaxSeconds(t1-t0,&mx));
+  *secondsPerApply=(reps>0)?mx/(double)reps:0.0;
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profilePCApply(PC pc,Mat A,PetscInt reps,double *secondsPerApply) {
+  PetscFunctionBeginUser;
+  Vec x=nullptr,y=nullptr;
+  PetscCall(MatCreateVecs(A,&x,&y));
+  PetscCall(profileFillVector(x));
+  for(int w=0;w<3;++w) PetscCall(PCApply(pc,x,y));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  PetscLogDouble t0,t1; PetscCall(PetscTime(&t0));
+  for(PetscInt i=0;i<reps;++i) { PetscCall(PCApply(pc,x,y)); std::swap(x,y); }
+  PetscCall(PetscTime(&t1));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  double mx=0; PetscCall(profileMaxSeconds(t1-t0,&mx));
+  *secondsPerApply=(reps>0)?mx/(double)reps:0.0;
+  PetscCall(VecDestroy(&x)); PetscCall(VecDestroy(&y));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode profileKSPSolve(KSP ksp,Mat A,PetscInt reps,double *secondsPerSolve) {
+  PetscFunctionBeginUser;
+  Vec b=nullptr,x=nullptr;
+  PetscCall(MatCreateVecs(A,&x,&b));
+  PetscCall(profileFillVector(b));
+  for(int w=0;w<2;++w) { PetscCall(VecSet(x,0)); PetscCall(KSPSetInitialGuessNonzero(ksp,PETSC_FALSE)); PetscCall(KSPSolve(ksp,b,x)); }
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  PetscLogDouble t0,t1; PetscCall(PetscTime(&t0));
+  for(PetscInt i=0;i<reps;++i) { PetscCall(VecSet(x,0)); PetscCall(KSPSetInitialGuessNonzero(ksp,PETSC_FALSE)); PetscCall(KSPSolve(ksp,b,x)); }
+  PetscCall(PetscTime(&t1));
+  PetscCallMPI(MPI_Barrier(PETSC_COMM_WORLD));
+  double mx=0; PetscCall(profileMaxSeconds(t1-t0,&mx));
+  *secondsPerSolve=(reps>0)?mx/(double)reps:0.0;
+  PetscCall(VecDestroy(&b)); PetscCall(VecDestroy(&x));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode pressureAMGProfile(KSP pksp,Mat S,Mat PmatFine,PetscInt fvCompactNnz,
+                                          PetscInt fineReps,PetscInt pcReps,
+                                          PetscInt cgIters,PetscInt cgReps,
+                                          PetscInt levelMatReps,PetscInt levelSolveReps) {
+  PetscFunctionBeginUser;
+  PC pc=nullptr; const char *pct=nullptr,*kspt=nullptr;
+  PetscCall(KSPGetPC(pksp,&pc)); PetscCall(PCGetType(pc,&pct)); PetscCall(KSPGetType(pksp,&kspt));
+  PetscInt nFine=0,mFine=0,nlocFine=0; MatInfo finfo;
+  PetscCall(MatGetSize(S,&nFine,&mFine)); PetscCall(MatGetLocalSize(S,&nlocFine,nullptr));
+  PetscCall(MatGetInfo(S,MAT_GLOBAL_SUM,&finfo));
+  MatInfo pminfo; PetscCall(MatGetInfo(PmatFine,MAT_GLOBAL_SUM,&pminfo));
+  const double fineNnz=finfo.nz_used, pmatFineNnz=pminfo.nz_used;
+  const double fvNnz=(double)fvCompactNnz;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PROFILE_FINE ksp=%s pc=%s rows=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f fvCompactFaceNnz=%" PetscInt_FMT " pressureNnzRatioToCompactFV=%.6f\n",
+    kspt?kspt:"?",pct?pct:"?",nFine,fineNnz,nFine?fineNnz/(double)nFine:0.0,fvCompactNnz,fvNnz>0?fineNnz/fvNnz:0.0));
+
+  PetscInt levels=0; PetscReal gc=0,oc=0;
+  PetscCall(PCMGGetLevels(pc,&levels));
+  PetscCall(PCMGGetGridComplexity(pc,&gc,&oc));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PROFILE_COMPLEXITY levels=%" PetscInt_FMT " gridComplexity=%.8f operatorComplexity=%.8f hierarchyFinePmatNnz=%.0f hierarchyTotalNnz=%.0f\n",
+    levels,(double)gc,(double)oc,pmatFineNnz,(double)oc*pmatFineNnz));
+
+  double fineMatSec=0; PetscCall(profileMatMult(S,fineReps,&fineMatSec));
+  double pcSec=0; PetscCall(profilePCApply(pc,PmatFine,pcReps,&pcSec));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PROFILE_KERNEL fineMatMultReps=%" PetscInt_FMT " fineMatMultMs=%.6f fineMatMultNsPerNnz=%.6f pcApplyReps=%" PetscInt_FMT " gamgPcApplyMs=%.6f pcApplyOverFineMatMult=%.6f\n",
+    fineReps,1e3*fineMatSec,fineNnz>0?1e9*fineMatSec/fineNnz:0.0,pcReps,1e3*pcSec,fineMatSec>0?pcSec/fineMatSec:0.0));
+
+  double sumLevelNnz=0.0;
+  for(PetscInt lev=0;lev<levels;++lev) {
+    KSP lksp=nullptr;
+    if(lev==0) PetscCall(PCMGGetCoarseSolve(pc,&lksp));
+    else PetscCall(PCMGGetSmoother(pc,lev,&lksp));
+    Mat A=nullptr,Pmat=nullptr;
+    PetscCall(KSPGetOperators(lksp,&A,&Pmat));
+    if(!Pmat) Pmat=A;
+    PetscInt N=0,nloc=0,maxit=0; PetscReal rtol=0,atol=0,dtol=0; MatInfo info;
+    PetscCall(MatGetSize(Pmat,&N,nullptr)); PetscCall(MatGetLocalSize(Pmat,&nloc,nullptr));
+    PetscCall(MatGetInfo(Pmat,MAT_GLOBAL_SUM,&info)); sumLevelNnz += info.nz_used;
+    PetscInt nlocMin=0,nlocMax=0;
+    PetscCallMPI(MPI_Allreduce(&nloc,&nlocMin,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&nloc,&nlocMax,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+    const char *lkt=nullptr,*lpct=nullptr; PC lpc=nullptr;
+    PetscCall(KSPGetType(lksp,&lkt)); PetscCall(KSPGetPC(lksp,&lpc)); PetscCall(PCGetType(lpc,&lpct));
+    PetscCall(KSPGetTolerances(lksp,&rtol,&atol,&dtol,&maxit));
+    double mm=0,ss=0; PetscCall(profileMatMult(Pmat,levelMatReps,&mm));
+    PetscCall(profileKSPSolve(lksp,Pmat,levelSolveReps,&ss));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_PRESSURE_PROFILE_LEVEL level=%" PetscInt_FMT " role=%s rows=%" PetscInt_FMT " localRowsMin=%" PetscInt_FMT " localRowsMax=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f ksp=%s pc=%s smootherMaxIt=%" PetscInt_FMT " matMultMs=%.6f levelSolveMs=%.6f\n",
+      lev,lev==0?"coarse":"smooth",N,nlocMin,nlocMax,info.nz_used,N?info.nz_used/(double)N:0.0,lkt?lkt:"?",lpct?lpct:"?",maxit,1e3*mm,1e3*ss));
+    if(lev>0) {
+      Mat I=nullptr; PetscCall(PCMGGetInterpolation(pc,lev,&I));
+      if(I) { MatInfo ii; PetscInt ir=0,ic=0; PetscCall(MatGetInfo(I,MAT_GLOBAL_SUM,&ii)); PetscCall(MatGetSize(I,&ir,&ic));
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_PRESSURE_PROFILE_TRANSFER fineLevel=%" PetscInt_FMT " rows=%" PetscInt_FMT " cols=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f\n",
+          lev,ir,ic,ii.nz_used,ir?ii.nz_used/(double)ir:0.0)); }
+    }
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PROFILE_COMPLEXITY_CHECK summedLevelNnz=%.0f directOperatorComplexity=%.8f petscOperatorComplexity=%.8f\n",
+    sumLevelNnz,pmatFineNnz>0?sumLevelNnz/pmatFineNnz:0.0,(double)oc));
+
+  // Fixed-count CG using exactly the already-built/frozen GAMG PC.  This
+  // measures fine SpMV + vector reductions + one PCApply per Krylov step.
+  KSP probe=nullptr; PetscCall(KSPCreate(PETSC_COMM_WORLD,&probe));
+  PetscCall(KSPSetOperators(probe,S,PmatFine)); PetscCall(KSPSetType(probe,KSPCG));
+  PetscCall(KSPSetPC(probe,pc)); PetscCall(KSPSetReusePreconditioner(probe,PETSC_TRUE));
+  PetscCall(KSPSetNormType(probe,KSP_NORM_NONE));
+  PetscCall(KSPSetTolerances(probe,PETSC_CURRENT,PETSC_CURRENT,PETSC_CURRENT,cgIters));
+  PetscCall(KSPSetConvergenceTest(probe,KSPConvergedSkip,nullptr,nullptr));
+  PetscCall(KSPSetUp(probe));
+  double cgSec=0; PetscCall(profileKSPSolve(probe,S,cgReps,&cgSec));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRESSURE_PROFILE_CG fixedIts=%" PetscInt_FMT " reps=%" PetscInt_FMT " solveMs=%.6f msPerCgIteration=%.6f impliedPcPlusKrylovOverheadMs=%.6f\n",
+    cgIters,cgReps,1e3*cgSec,cgIters>0?1e3*cgSec/(double)cgIters:0.0,cgIters>0?1e3*cgSec/(double)cgIters-1e3*pcSec-1e3*fineMatSec:0.0));
+  PetscCall(KSPDestroy(&probe));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_PRESSURE_PROFILE_DONE status=PASS\n"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static std::vector<Vec3> cellCentroids(const Mesh& M) {
+  std::vector<Vec3> C(M.tets.size());
+  for(size_t c=0;c<M.tets.size();++c) {
+    Vec3 q{};
+    for(int i=0;i<4;++i) { const auto &x=M.points[M.tets[c][i]]; q.x+=x.x; q.y+=x.y; q.z+=x.z; }
+    C[c]={q.x*.25,q.y*.25,q.z*.25};
+  }
+  return C;
+}
+
+static std::vector<int> makeRCBCellOwners(const Mesh& M, int nranks) {
+  const PetscInt nc=(PetscInt)M.tets.size();
+  if(nranks<1 || nranks>nc) throw std::runtime_error("invalid MPI rank count for RCB partition");
+  auto C=cellCentroids(M);
+  std::vector<PetscInt> ids(nc); std::iota(ids.begin(),ids.end(),0);
+  std::vector<int> own(nc,-1);
+  std::function<void(PetscInt,PetscInt,int,int)> rec;
+  rec=[&](PetscInt b,PetscInt e,int r0,int r1) {
+    if(r1-r0==1) { for(PetscInt k=b;k<e;++k) own[ids[k]]=r0; return; }
+    double mn[3]={1e300,1e300,1e300}, mx[3]={-1e300,-1e300,-1e300};
+    for(PetscInt k=b;k<e;++k){const auto&q=C[ids[k]];double a[3]={q.x,q.y,q.z};for(int d=0;d<3;++d){mn[d]=std::min(mn[d],a[d]);mx[d]=std::max(mx[d],a[d]);}}
+    int axis=0; if(mx[1]-mn[1]>mx[axis]-mn[axis]) axis=1; if(mx[2]-mn[2]>mx[axis]-mn[axis]) axis=2;
+    int rm=(r0+r1)/2; int nRanks=r1-r0, leftRanks=rm-r0;
+    PetscInt n=e-b; PetscInt nLeft=(PetscInt)((long long)n*leftRanks/nRanks);
+    nLeft=std::max<PetscInt>(1,std::min<PetscInt>(n-1,nLeft));
+    auto coord=[&](PetscInt c){return axis==0?C[c].x:(axis==1?C[c].y:C[c].z);};
+    std::nth_element(ids.begin()+b,ids.begin()+b+nLeft,ids.begin()+e,[&](PetscInt a,PetscInt z){double ca=coord(a),cz=coord(z);return ca<cz || (ca==cz && a<z);});
+    rec(b,b+nLeft,r0,rm); rec(b+nLeft,e,rm,r1);
+  };
+  rec(0,nc,0,nranks);
+  return own;
+}
+
+static PetscErrorCode buildOwnership(const Mesh& M, int /*rank*/, int size,const ProblemConfig& P, Discrete& D) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(), nf=(PetscInt)M.faces.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  prepareBoundaryData(M,P,D);
+  D.cellOwner=makeRCBCellOwners(M,size);
+  D.cellCount.assign(size,0); for(PetscInt c=0;c<nc;++c) D.cellCount[D.cellOwner[c]]++;
+  std::vector<PetscInt> pOff(size+1,0); for(int r=0;r<size;++r) pOff[r+1]=pOff[r]+D.cellCount[r];
+  D.pGid.assign(nc,-1); std::vector<PetscInt> pn=pOff;
+  for(PetscInt c=0;c<nc;++c) D.pGid[c]=pn[D.cellOwner[c]]++;
+
+  std::vector<int> entOwner(nv+nf,-1);
+  for(PetscInt c=0;c<nc;++c) {
+    const int r=D.cellOwner[c];
+    for(int i=0;i<4;++i) {
+      const PetscInt v=M.tets[c][i];
+      if(!D.fixedEntity[v]) entOwner[v]=(entOwner[v]<0)?r:std::min(entOwner[v],r);
+    }
+  }
+  for(PetscInt f=0;f<nf;++f) if(!D.fixedEntity[nv+f]) {
+    if(f<ni) {
+      const int r0=D.cellOwner[M.owner[f]],r1=D.cellOwner[M.neighbour[f]];
+      entOwner[nv+f]=std::min(r0,r1);
+    } else entOwner[nv+f]=D.cellOwner[M.owner[f]];
+  }
+
+  D.velCount.assign(size,0);
+  if(D.g2free.size()!=(std::size_t)(nv+nf)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"compact Dirichlet gid map size mismatch");
+  D.freeVertices=D.fixedVertices=D.freeFaces=D.fixedFaces=0;
+  for(PetscInt v=0;v<nv;++v) {
+    if(D.fixedEntity[v]) {D.fixedVertices++;continue;}
+    if(entOwner[v]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"free vertex has no owner");
+    D.velCount[entOwner[v]]++;D.freeVertices++;
+  }
+  for(PetscInt f=0;f<nf;++f) {
+    if(D.fixedEntity[nv+f]) {D.fixedFaces++;continue;}
+    if(entOwner[nv+f]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"free face has no owner");
+    D.velCount[entOwner[nv+f]]++;D.freeFaces++;
+  }
+  std::vector<PetscInt> vOff(size+1,0); for(int r=0;r<size;++r) vOff[r+1]=vOff[r]+D.velCount[r];
+  D.ns=vOff[size]; std::vector<PetscInt> vn=vOff;
+  for(PetscInt v=0;v<nv;++v) if(!D.fixedEntity[v]) D.g2free[v]=vn[entOwner[v]]++;
+  for(PetscInt f=0;f<nf;++f) if(!D.fixedEntity[nv+f]) D.g2free[nv+f]=vn[entOwner[nv+f]]++;
+
+  PetscInt cmin=*std::min_element(D.cellCount.begin(),D.cellCount.end()), cmax=*std::max_element(D.cellCount.begin(),D.cellCount.end());
+  PetscInt vmin=*std::min_element(D.velCount.begin(),D.velCount.end()), vMax=*std::max_element(D.velCount.begin(),D.velCount.end());
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MPI_PARTITION type=geometric_rcb ranks=%d cellMin=%" PetscInt_FMT " cellMax=%" PetscInt_FMT " velDofMin=%" PetscInt_FMT " velDofMax=%" PetscInt_FMT " sharedEntityOwner=min_adjacent_rank\n",size,cmin,cmax,vmin,vMax));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_BC_DOF freeVertices=%" PetscInt_FMT " fixedVertices=%" PetscInt_FMT " freeFacesBF3=%" PetscInt_FMT " fixedFacesBF3=%" PetscInt_FMT "\n",D.freeVertices,D.fixedVertices,D.freeFaces,D.fixedFaces));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// NodalS-1.00a distributed-memory Gate 0.
+// This gate does NOT change the production solve path yet.  It constructs the
+// exact rank-local cell support required by the current algebra from the frozen
+// global indexing, packs compact local cell/face/point connectivity, and checks
+// global topology/DOF/boundary/inlet-flux parity.  The full mesh is deliberately
+// still replicated in Gate 0 so the distributed construction can be validated
+// before root-only load/scatter is enabled in a later gate.
+struct DistGate0LocalMesh {
+  std::vector<PetscInt> cellGlobal, faceGlobal, pointGlobal;
+  std::vector<std::array<int,4>> tets;
+  std::vector<Face> faces;
+  std::vector<std::array<int,4>> oppFace;
+  PetscInt ownedCells=0, haloCells=0, velocityStarCells=0, pressureNeighbourCells=0;
+};
+
+static PetscErrorCode buildDistGate0LocalMesh(const Mesh& M,const Discrete& D,int rank,DistGate0LocalMesh& L) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(), nf=(PetscInt)M.faces.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  PetscInt vStart=0; for(int r=0;r<rank;++r) vStart+=D.velCount[(std::size_t)r];
+  const PetscInt vEnd=vStart+D.velCount[(std::size_t)rank];
+  std::vector<unsigned char> support((std::size_t)nc,0), fromVel((std::size_t)nc,0), fromPnbr((std::size_t)nc,0);
+
+  // Pressure ownership support.
+  for(PetscInt c=0;c<nc;++c) if(D.cellOwner[(std::size_t)c]==rank) support[(std::size_t)c]=1;
+
+  // Momentum/B^T support: every cell touching an owned P1 or BF3 velocity DOF.
+  for(PetscInt c=0;c<nc;++c) {
+    bool touches=false;
+    const auto& t=M.tets[(std::size_t)c];
+    for(int i=0;i<4 && !touches;++i) {
+      const PetscInt g=D.g2free[(std::size_t)t[(std::size_t)i]];
+      if(g>=vStart && g<vEnd) touches=true;
+    }
+    for(int i=0;i<4 && !touches;++i) {
+      const PetscInt e=nv+M.oppFace[(std::size_t)c][(std::size_t)i];
+      const PetscInt g=D.g2free[(std::size_t)e];
+      if(g>=vStart && g<vEnd) touches=true;
+    }
+    if(touches) { support[(std::size_t)c]=1; fromVel[(std::size_t)c]=1; }
+  }
+
+  // Compact pressure face-neighbour support for owned pressure cells.
+  for(PetscInt c=0;c<nc;++c) if(D.cellOwner[(std::size_t)c]==rank) {
+    for(int lf=0;lf<4;++lf) {
+      const PetscInt f=M.oppFace[(std::size_t)c][(std::size_t)lf];
+      if(f>=ni) continue;
+      const PetscInt a=M.owner[(std::size_t)f], b=M.neighbour[(std::size_t)f];
+      const PetscInt other=(a==c)?b:a;
+      if(other>=0 && other<nc && D.cellOwner[(std::size_t)other]!=rank) {
+        support[(std::size_t)other]=1; fromPnbr[(std::size_t)other]=1;
+      }
+    }
+  }
+
+  for(PetscInt c=0;c<nc;++c) if(support[(std::size_t)c]) {
+    L.cellGlobal.push_back(c);
+    if(D.cellOwner[(std::size_t)c]==rank) ++L.ownedCells; else ++L.haloCells;
+    if(fromVel[(std::size_t)c]) ++L.velocityStarCells;
+    if(fromPnbr[(std::size_t)c]) ++L.pressureNeighbourCells;
+  }
+
+  std::vector<int> pLut((std::size_t)nv,-1), fLut((std::size_t)nf,-1);
+  std::vector<unsigned char> pMark((std::size_t)nv,0), fMark((std::size_t)nf,0);
+  for(PetscInt gc:L.cellGlobal) {
+    const auto& t=M.tets[(std::size_t)gc];
+    for(int i=0;i<4;++i) pMark[(std::size_t)t[(std::size_t)i]]=1;
+    for(int i=0;i<4;++i) fMark[(std::size_t)M.oppFace[(std::size_t)gc][(std::size_t)i]]=1;
+  }
+  for(PetscInt gp=0;gp<nv;++gp) if(pMark[(std::size_t)gp]) { pLut[(std::size_t)gp]=(int)L.pointGlobal.size(); L.pointGlobal.push_back(gp); }
+  for(PetscInt gf=0;gf<nf;++gf) if(fMark[(std::size_t)gf]) { fLut[(std::size_t)gf]=(int)L.faceGlobal.size(); L.faceGlobal.push_back(gf); }
+
+  L.tets.resize(L.cellGlobal.size()); L.oppFace.resize(L.cellGlobal.size());
+  for(std::size_t lc=0;lc<L.cellGlobal.size();++lc) {
+    const PetscInt gc=L.cellGlobal[lc];
+    for(int i=0;i<4;++i) {
+      const PetscInt gp=M.tets[(std::size_t)gc][(std::size_t)i];
+      const PetscInt gf=M.oppFace[(std::size_t)gc][(std::size_t)i];
+      if(pLut[(std::size_t)gp]<0 || fLut[(std::size_t)gf]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate0 local connectivity map incomplete");
+      L.tets[lc][(std::size_t)i]=pLut[(std::size_t)gp];
+      L.oppFace[lc][(std::size_t)i]=fLut[(std::size_t)gf];
+    }
+  }
+  L.faces.resize(L.faceGlobal.size());
+  for(std::size_t lf=0;lf<L.faceGlobal.size();++lf) {
+    const PetscInt gf=L.faceGlobal[lf];
+    for(int i=0;i<3;++i) {
+      const PetscInt gp=M.faces[(std::size_t)gf].v[(std::size_t)i];
+      if(pLut[(std::size_t)gp]<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate0 local face references point outside support");
+      L.faces[lf].v[(std::size_t)i]=pLut[(std::size_t)gp];
+    }
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode runDistributedMeshGate0(const Mesh& M,const ProblemConfig& P,int rank,int size) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(), nf=(PetscInt)M.faces.size(), ni=(PetscInt)M.neighbour.size(), nc=(PetscInt)M.tets.size();
+  Discrete D;
+  PetscCall(buildOwnership(M,rank,size,P,D));
+  DistGate0LocalMesh L;
+  PetscCall(buildDistGate0LocalMesh(M,D,rank,L));
+
+  // Storage ownership is independent of velocity Dirichlet status: each global
+  // point/face is assigned to the minimum adjacent cell partition so unique
+  // distributed coverage can be checked exactly.
+  std::vector<int> pointStorageOwner((std::size_t)nv,-1), faceStorageOwner((std::size_t)nf,-1);
+  for(PetscInt c=0;c<nc;++c) {
+    const int r=D.cellOwner[(std::size_t)c];
+    for(int i=0;i<4;++i) {
+      const PetscInt gp=M.tets[(std::size_t)c][(std::size_t)i];
+      int& o=pointStorageOwner[(std::size_t)gp]; o=(o<0)?r:std::min(o,r);
+    }
+  }
+  for(PetscInt f=0;f<nf;++f) {
+    const int r0=D.cellOwner[(std::size_t)M.owner[(std::size_t)f]];
+    faceStorageOwner[(std::size_t)f]=(f<ni)?std::min(r0,D.cellOwner[(std::size_t)M.neighbour[(std::size_t)f]]):r0;
+  }
+
+  PetscInt localOwnedPoints=0,localOwnedFaces=0;
+  for(PetscInt gp:L.pointGlobal) if(pointStorageOwner[(std::size_t)gp]==rank) ++localOwnedPoints;
+  for(PetscInt gf:L.faceGlobal) if(faceStorageOwner[(std::size_t)gf]==rank) ++localOwnedFaces;
+
+  PetscInt local[7]={L.ownedCells,localOwnedPoints,localOwnedFaces,(PetscInt)L.cellGlobal.size(),(PetscInt)L.pointGlobal.size(),(PetscInt)L.faceGlobal.size(),L.haloCells};
+  PetscInt global[7]={0,0,0,0,0,0,0};
+  PetscCallMPI(MPI_Allreduce(local,global,7,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscInt pressureDofs=0,velocityDofs=0;
+  PetscCallMPI(MPI_Allreduce(&D.cellCount[(std::size_t)rank],&pressureDofs,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&D.velCount[(std::size_t)rank],&velocityDofs,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+
+  // Connectivity parity of the compact local pack against the frozen global mesh.
+  PetscInt localMismatch=0;
+  for(std::size_t lc=0;lc<L.cellGlobal.size();++lc) {
+    const PetscInt gc=L.cellGlobal[lc];
+    for(int i=0;i<4;++i) {
+      const int lp=L.tets[lc][(std::size_t)i];
+      const int lf=L.oppFace[lc][(std::size_t)i];
+      if(lp<0 || lp>=(int)L.pointGlobal.size() || L.pointGlobal[(std::size_t)lp]!=M.tets[(std::size_t)gc][(std::size_t)i]) ++localMismatch;
+      if(lf<0 || lf>=(int)L.faceGlobal.size() || L.faceGlobal[(std::size_t)lf]!=M.oppFace[(std::size_t)gc][(std::size_t)i]) ++localMismatch;
+    }
+  }
+  for(std::size_t lf=0;lf<L.faceGlobal.size();++lf) {
+    const PetscInt gf=L.faceGlobal[lf];
+    for(int i=0;i<3;++i) {
+      const int lp=L.faces[lf].v[(std::size_t)i];
+      if(lp<0 || lp>=(int)L.pointGlobal.size() || L.pointGlobal[(std::size_t)lp]!=M.faces[(std::size_t)gf].v[(std::size_t)i]) ++localMismatch;
+    }
+  }
+  PetscInt globalMismatch=0; PetscCallMPI(MPI_Allreduce(&localMismatch,&globalMismatch,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+
+  PetscCall(PetscSynchronizedPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DIST_GATE0_RANK rank=%d ownedCells=%" PetscInt_FMT " supportCells=%zu haloCells=%" PetscInt_FMT " velocityStarCells=%" PetscInt_FMT " pressureNeighbourCells=%" PetscInt_FMT " localPoints=%zu localFaces=%zu storageOwnedPoints=%" PetscInt_FMT " storageOwnedFaces=%" PetscInt_FMT "\n",
+    rank,L.ownedCells,L.cellGlobal.size(),L.haloCells,L.velocityStarCells,L.pressureNeighbourCells,L.pointGlobal.size(),L.faceGlobal.size(),localOwnedPoints,localOwnedFaces));
+  PetscCall(PetscSynchronizedFlush(PETSC_COMM_WORLD,PETSC_STDOUT));
+
+  bool ok=true;
+  if(global[0]!=nc || global[1]!=nv || global[2]!=nf || pressureDofs!=nc || velocityDofs!=D.ns || globalMismatch!=0) ok=false;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DIST_GATE0_GLOBAL_PARITY cellsRef=%" PetscInt_FMT " cellsDistributedOwned=%" PetscInt_FMT " pointsRef=%" PetscInt_FMT " pointsDistributedStorageOwned=%" PetscInt_FMT " facesRef=%" PetscInt_FMT " facesDistributedStorageOwned=%" PetscInt_FMT " internalFaces=%" PetscInt_FMT " boundaryFaces=%" PetscInt_FMT " packedConnectivityMismatches=%" PetscInt_FMT " status=%s\n",
+    nc,global[0],nv,global[1],nf,global[2],ni,nf-ni,globalMismatch,ok?"PASS":"FAIL"));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DIST_GATE0_DOF_PARITY pressureDofs=%" PetscInt_FMT " expectedPressure=%" PetscInt_FMT " velocityDofs=%" PetscInt_FMT " expectedVelocity=%" PetscInt_FMT " freeVertices=%" PetscInt_FMT " freeFacesBF3=%" PetscInt_FMT " status=%s\n",
+    pressureDofs,nc,velocityDofs,D.ns,D.freeVertices,D.freeFaces,(pressureDofs==nc && velocityDofs==D.ns)?"PASS":"FAIL"));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DIST_GATE0_SUPPORT aggregateSupportCells=%" PetscInt_FMT " aggregateHaloCells=%" PetscInt_FMT " supportDuplication=%.6f aggregateLocalPoints=%" PetscInt_FMT " aggregateLocalFaces=%" PetscInt_FMT " architecture=owned_cells_plus_owned_velocity_star_plus_owned_pressure_face_neighbours\n",
+    global[3],global[6],nc?((double)global[3]/(double)nc):0.0,global[4],global[5]));
+
+  // Boundary parity using an exactly-once owner-cell assignment of boundary faces.
+  const int np=(int)M.patches.size();
+  std::vector<double> loc((std::size_t)np*4,0.0), sum((std::size_t)np*4,0.0);
+  std::vector<PetscInt> locFaces((std::size_t)np,0), sumFaces((std::size_t)np,0);
+  for(PetscInt f=ni;f<nf;++f) if(D.cellOwner[(std::size_t)M.owner[(std::size_t)f]]==rank) {
+    const int pi=M.facePatch[(std::size_t)f]; if(pi<0 || pi>=np) {ok=false; continue;}
+    const Vec3 sf=faceOutwardAreaVector(M,f);
+    loc[(std::size_t)4*pi+0]+=norm3(sf); loc[(std::size_t)4*pi+1]+=sf.x; loc[(std::size_t)4*pi+2]+=sf.y; loc[(std::size_t)4*pi+3]+=sf.z;
+    ++locFaces[(std::size_t)pi];
+  }
+  PetscCallMPI(MPI_Allreduce(loc.data(),sum.data(),(PetscMPIInt)sum.size(),MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(locFaces.data(),sumFaces.data(),np,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  for(int pi=0;pi<np;++pi) {
+    const PatchFrame ref=patchFrame(M,pi);
+    const Vec3 av{sum[(std::size_t)4*pi+1],sum[(std::size_t)4*pi+2],sum[(std::size_t)4*pi+3]};
+    const double proj=norm3(av); const Vec3 n=(proj>0)?scale3(av,1.0/proj):Vec3{};
+    const double areaErr=std::abs(sum[(std::size_t)4*pi]-ref.area)/std::max(1.0,std::abs(ref.area));
+    const double vecErr=norm3(sub3(av,ref.areaVector))/std::max(1.0,norm3(ref.areaVector));
+    const bool pok=(sumFaces[(std::size_t)pi]==M.patches[(std::size_t)pi].nFaces && areaErr<5e-12 && vecErr<5e-12);
+    ok=ok&&pok;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DIST_GATE0_PATCH name=%s facesRef=%" PetscInt_FMT " facesDistributed=%" PetscInt_FMT " areaRef=%.12e areaDistributed=%.12e areaVectorDistributed=[%.12e,%.12e,%.12e] normalDistributed=[%.12e,%.12e,%.12e] areaRelErr=%.3e vectorRelErr=%.3e status=%s\n",
+      M.patches[(std::size_t)pi].name.c_str(),M.patches[(std::size_t)pi].nFaces,sumFaces[(std::size_t)pi],ref.area,sum[(std::size_t)4*pi],av.x,av.y,av.z,n.x,n.y,n.z,areaErr,vecErr,pok?"PASS":"FAIL"));
+  }
+
+  if(P.mode==ProblemMode::Pipe && (P.inletBC==InletBCMode::PipeParabolic || P.inletBC==InletBCMode::PipeOneSeventh)) {
+    double localFlux[2]={0.0,0.0}, flux[2]={0.0,0.0};
+    const auto& pin=M.patches[(std::size_t)P.pipe.inlet];
+    for(PetscInt f=pin.startFace;f<pin.startFace+pin.nFaces;++f) if(D.cellOwner[(std::size_t)M.owner[(std::size_t)f]]==rank) {
+      const auto& F=M.faces[(std::size_t)f]; Vec3 X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};
+      const double A=triangleArea(X[0],X[1],X[2]), u=triangleAverageIdealPipeProfileUz(P.pipe,P.inletBC,X);
+      localFlux[0]+=A*u; localFlux[1]+=A*(P.pipe.profileScale*u);
+    }
+    PetscCallMPI(MPI_Allreduce(localFlux,flux,2,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    const double expected=P.pipe.bulkVelocity*P.pipe.inletArea;
+    const double rel=std::abs(flux[1]-expected)/std::max(1e-300,std::abs(expected));
+    const bool fok=rel<5e-12; ok=ok&&fok;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DIST_GATE0_INLET_FLUX profile=%s rawDistributed=%.12e profileScale=%.12e normalizedDistributed=%.12e expectedUbulkArea=%.12e relErr=%.3e status=%s\n",
+      P.inletBC==InletBCMode::PipeOneSeventh?"one_seventh":"parabolic",flux[0],P.pipe.profileScale,flux[1],expected,rel,fok?"PASS":"FAIL"));
+  } else if(P.mode!=ProblemMode::MMS) {
+    double localFlux=0.0,flux=0.0;
+    const auto& pin=M.patches[(std::size_t)P.boundary.inlet];
+    for(PetscInt f=pin.startFace;f<pin.startFace+pin.nFaces;++f) if(D.cellOwner[(std::size_t)M.owner[(std::size_t)f]]==rank) localFlux+=dot3(P.boundary.inletVelocity,faceOutwardAreaVector(M,f));
+    PetscCallMPI(MPI_Allreduce(&localFlux,&flux,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    const double expected=dot3(P.boundary.inletVelocity,P.boundary.inletAreaVector);
+    const double rel=std::abs(flux-expected)/std::max(1e-300,std::abs(expected));
+    const bool fok=rel<5e-12; ok=ok&&fok;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DIST_GATE0_INLET_FLUX profile=fixed_normal distributed=%.12e expected=%.12e relErr=%.3e status=%s\n",flux,expected,rel,fok?"PASS":"FAIL"));
+  }
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_DIST_GATE0_RESULT status=%s ranks=%d fullMeshStillReplicated=1 solvePathUnchanged=1 localPackConstructed=1 next=root_only_load_pack_scatter_free_global_on_nonroot\n",
+    ok?"PASS":"FAIL",size));
+  if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"distributed mesh Gate0 parity failed");
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// NodalS distributed production mesh (Gates 1-3)
+// -----------------------------------------------------------------------------
+// Rank 0 alone reads/retains the complete OpenFOAM mesh and global ownership
+// oracle.  It packs each rank's owned-cell + velocity-star + owned-pressure
+// face-neighbour support into a compact local Mesh/Discrete packet.  Production
+// element/pressure/momentum loops then operate on local indices while PETSc and
+// the custom peer halos retain the frozen global DOF numbering.
+
+template<class T> static void distAppendPod(std::vector<char>& b,const T& v) {
+  static_assert(std::is_trivially_copyable<T>::value,"POD required");
+  const std::size_t o=b.size(); b.resize(o+sizeof(T)); std::memcpy(b.data()+o,&v,sizeof(T));
+}
+template<class T> static T distReadPod(const std::vector<char>& b,std::size_t& o) {
+  static_assert(std::is_trivially_copyable<T>::value,"POD required");
+  if(o+sizeof(T)>b.size()) throw std::runtime_error("distributed packet truncated");
+  T v{}; std::memcpy(&v,b.data()+o,sizeof(T)); o+=sizeof(T); return v;
+}
+template<class T> static void distAppendVector(std::vector<char>& b,const std::vector<T>& v) {
+  static_assert(std::is_trivially_copyable<T>::value,"POD vector required");
+  const std::uint64_t n=(std::uint64_t)v.size(); distAppendPod(b,n);
+  if(n){const std::size_t o=b.size(),nb=(std::size_t)n*sizeof(T);b.resize(o+nb);std::memcpy(b.data()+o,v.data(),nb);}
+}
+template<class T> static std::vector<T> distReadVector(const std::vector<char>& b,std::size_t& o) {
+  static_assert(std::is_trivially_copyable<T>::value,"POD vector required");
+  const std::uint64_t n=distReadPod<std::uint64_t>(b,o); const std::size_t nb=(std::size_t)n*sizeof(T);
+  if(o+nb>b.size()) throw std::runtime_error("distributed vector truncated");
+  std::vector<T> v((std::size_t)n); if(nb)std::memcpy(v.data(),b.data()+o,nb);o+=nb;return v;
+}
+static void distAppendString(std::vector<char>& b,const std::string& x){const std::uint64_t n=(std::uint64_t)x.size();distAppendPod(b,n);const std::size_t o=b.size();b.resize(o+(std::size_t)n);if(n)std::memcpy(b.data()+o,x.data(),(std::size_t)n);}
+static std::string distReadString(const std::vector<char>& b,std::size_t& o){const std::uint64_t n=distReadPod<std::uint64_t>(b,o);if(o+(std::size_t)n>b.size())throw std::runtime_error("distributed string truncated");std::string x(b.data()+o,b.data()+o+(std::size_t)n);o+=(std::size_t)n;return x;}
+
+static std::vector<char> packProblemConfigPipe(const ProblemConfig& P) {
+  std::vector<char> b; const int mode=(int)P.mode,ibc=(int)P.inletBC,cc=P.centralConvection?1:0,ww=P.weakWallFunction?1:0;
+  distAppendPod(b,mode);distAppendPod(b,ibc);distAppendPod(b,cc);distAppendPod(b,ww);distAppendPod(b,P.re);distAppendPod(b,P.nu);
+  distAppendString(b,P.pipe.wallPatch);distAppendString(b,P.pipe.inletPatch);distAppendString(b,P.pipe.outletPatch);
+  distAppendPod(b,P.pipe.wall);distAppendPod(b,P.pipe.inlet);distAppendPod(b,P.pipe.outlet);
+  const double pd[]={P.pipe.cx,P.pipe.cy,P.pipe.zIn,P.pipe.zOut,P.pipe.R,P.pipe.D,P.pipe.L,P.pipe.inletArea,P.pipe.outletArea,P.pipe.circleArea,P.pipe.areaRatio,P.pipe.bulkVelocity,P.pipe.profileScale,P.pipe.nu,P.pipe.re,P.pipe.hpDrop,P.pipe.hpGradient};
+  for(double x:pd)distAppendPod(b,x);
+  const auto& B=P.boundary; const std::uint64_t nw=(std::uint64_t)B.wallPatches.size();distAppendPod(b,nw);for(const auto& x:B.wallPatches)distAppendString(b,x);distAppendVector(b,B.walls);
+  distAppendString(b,B.inletPatch);distAppendString(b,B.outletPatch);distAppendPod(b,B.inlet);distAppendPod(b,B.outlet);
+  const double bd[]={B.inletArea,B.outletArea,B.inletProjectedArea,B.outletProjectedArea,B.inletAreaVector.x,B.inletAreaVector.y,B.inletAreaVector.z,B.outletAreaVector.x,B.outletAreaVector.y,B.outletAreaVector.z,B.inletReferenceNormal.x,B.inletReferenceNormal.y,B.inletReferenceNormal.z,B.outletReferenceNormal.x,B.outletReferenceNormal.y,B.outletReferenceNormal.z,B.signedNormalSpeed,B.inletVelocity.x,B.inletVelocity.y,B.inletVelocity.z};
+  for(double x:bd)distAppendPod(b,x); return b;
+}
+static ProblemConfig unpackProblemConfigPipe(const std::vector<char>& b) {
+  std::size_t o=0; ProblemConfig P;P.mode=(ProblemMode)distReadPod<int>(b,o);P.inletBC=(InletBCMode)distReadPod<int>(b,o);P.centralConvection=distReadPod<int>(b,o)!=0;P.weakWallFunction=distReadPod<int>(b,o)!=0;P.re=distReadPod<double>(b,o);P.nu=distReadPod<double>(b,o);
+  P.pipe.wallPatch=distReadString(b,o);P.pipe.inletPatch=distReadString(b,o);P.pipe.outletPatch=distReadString(b,o);P.pipe.wall=distReadPod<int>(b,o);P.pipe.inlet=distReadPod<int>(b,o);P.pipe.outlet=distReadPod<int>(b,o);
+  double *pd[]={&P.pipe.cx,&P.pipe.cy,&P.pipe.zIn,&P.pipe.zOut,&P.pipe.R,&P.pipe.D,&P.pipe.L,&P.pipe.inletArea,&P.pipe.outletArea,&P.pipe.circleArea,&P.pipe.areaRatio,&P.pipe.bulkVelocity,&P.pipe.profileScale,&P.pipe.nu,&P.pipe.re,&P.pipe.hpDrop,&P.pipe.hpGradient};for(double* x:pd)*x=distReadPod<double>(b,o);
+  auto& B=P.boundary;const std::uint64_t nw=distReadPod<std::uint64_t>(b,o);B.wallPatches.resize((std::size_t)nw);for(auto& x:B.wallPatches)x=distReadString(b,o);B.walls=distReadVector<int>(b,o);B.inletPatch=distReadString(b,o);B.outletPatch=distReadString(b,o);B.inlet=distReadPod<int>(b,o);B.outlet=distReadPod<int>(b,o);
+  double *bd[]={&B.inletArea,&B.outletArea,&B.inletProjectedArea,&B.outletProjectedArea,&B.inletAreaVector.x,&B.inletAreaVector.y,&B.inletAreaVector.z,&B.outletAreaVector.x,&B.outletAreaVector.y,&B.outletAreaVector.z,&B.inletReferenceNormal.x,&B.inletReferenceNormal.y,&B.inletReferenceNormal.z,&B.outletReferenceNormal.x,&B.outletReferenceNormal.y,&B.outletReferenceNormal.z,&B.signedNormalSpeed,&B.inletVelocity.x,&B.inletVelocity.y,&B.inletVelocity.z};for(double* x:bd)*x=distReadPod<double>(b,o);
+  if(o!=b.size())throw std::runtime_error("ProblemConfig packet trailing bytes");return P;
+}
+
+static PetscErrorCode distBcastBytes(std::vector<char>& b,int root=0) {
+  PetscFunctionBeginUser; int rank=0;PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));
+  unsigned long long n=(unsigned long long)b.size();PetscCallMPI(MPI_Bcast(&n,1,MPI_UNSIGNED_LONG_LONG,root,PETSC_COMM_WORLD));if(rank!=root)b.resize((std::size_t)n);
+  std::size_t off=0;while(off<(std::size_t)n){const int chunk=(int)std::min<std::size_t>((std::size_t)INT_MAX/2,(std::size_t)n-off);PetscCallMPI(MPI_Bcast(b.data()+off,chunk,MPI_BYTE,root,PETSC_COMM_WORLD));off+=(std::size_t)chunk;}PetscFunctionReturn(PETSC_SUCCESS);
+}
+static PetscErrorCode distSendBytes(const std::vector<char>& b,int dst,int tag) {PetscFunctionBeginUser;unsigned long long n=(unsigned long long)b.size();PetscCallMPI(MPI_Send(&n,1,MPI_UNSIGNED_LONG_LONG,dst,tag,PETSC_COMM_WORLD));std::size_t o=0;while(o<b.size()){const int c=(int)std::min<std::size_t>((std::size_t)INT_MAX/2,b.size()-o);PetscCallMPI(MPI_Send((void*)(b.data()+o),c,MPI_BYTE,dst,tag+1,PETSC_COMM_WORLD));o+=(std::size_t)c;}PetscFunctionReturn(PETSC_SUCCESS);}
+static PetscErrorCode distRecvBytes(std::vector<char>& b,int src,int tag) {PetscFunctionBeginUser;unsigned long long n=0;MPI_Status st;PetscCallMPI(MPI_Recv(&n,1,MPI_UNSIGNED_LONG_LONG,src,tag,PETSC_COMM_WORLD,&st));b.resize((std::size_t)n);std::size_t o=0;while(o<b.size()){const int c=(int)std::min<std::size_t>((std::size_t)INT_MAX/2,b.size()-o);PetscCallMPI(MPI_Recv(b.data()+o,c,MPI_BYTE,src,tag+1,PETSC_COMM_WORLD,&st));o+=(std::size_t)c;}PetscFunctionReturn(PETSC_SUCCESS);}
+
+struct DistProductionPacket { Mesh M; Discrete D; PetscInt globalCells=0,globalPoints=0,globalFaces=0,globalInternalFaces=0; };
+
+static DistProductionPacket buildDistProductionPacket(const Mesh& G,const Discrete& GD,int rank,PetscBool pressureVertexStarSupport=PETSC_FALSE) {
+  DistProductionPacket X; X.globalCells=(PetscInt)G.tets.size();X.globalPoints=(PetscInt)G.points.size();X.globalFaces=(PetscInt)G.faces.size();X.globalInternalFaces=(PetscInt)G.neighbour.size();
+  const PetscInt gnv=(PetscInt)G.points.size(),gnf=(PetscInt)G.faces.size(),gni=(PetscInt)G.neighbour.size(),gnc=(PetscInt)G.tets.size();
+  PetscInt vStart=0;for(int r=0;r<rank;++r)vStart+=GD.velCount[(std::size_t)r];const PetscInt vEnd=vStart+GD.velCount[(std::size_t)rank];
+  std::vector<unsigned char> support((std::size_t)gnc,0);
+  for(PetscInt c=0;c<gnc;++c)if(GD.cellOwner[(std::size_t)c]==rank)support[(std::size_t)c]=1;
+  for(PetscInt c=0;c<gnc;++c){bool hit=false;for(int i=0;i<4&&!hit;++i){const PetscInt q=GD.g2free[(std::size_t)G.tets[(std::size_t)c][i]];if(q>=vStart&&q<vEnd)hit=true;}for(int i=0;i<4&&!hit;++i){const PetscInt q=GD.g2free[(std::size_t)(gnv+G.oppFace[(std::size_t)c][i])];if(q>=vStart&&q<vEnd)hit=true;}if(hit)support[(std::size_t)c]=1;}
+  for(PetscInt c=0;c<gnc;++c)if(GD.cellOwner[(std::size_t)c]==rank)for(int i=0;i<4;++i){const PetscInt f=G.oppFace[(std::size_t)c][i];if(f<gni){support[(std::size_t)G.owner[(std::size_t)f]]=1;support[(std::size_t)G.neighbour[(std::size_t)f]]=1;}}
+  // FULLFAST-B0: a full Schur row couples pressure cells through every free P1
+  // vertex shared by the owned pressure cell.  The compact production packet
+  // previously carried only owned-velocity stars + pressure face neighbours.
+  // For p_pmat=full, mark the complete vertex stars of OWNED PRESSURE rows as
+  // additional support.  This is still rank-local support, not a replicated mesh.
+  if(pressureVertexStarSupport) {
+    std::vector<unsigned char> ownedPressureVertex((std::size_t)gnv,0);
+    for(PetscInt c=0;c<gnc;++c) if(GD.cellOwner[(std::size_t)c]==rank)
+      for(int i=0;i<4;++i) ownedPressureVertex[(std::size_t)G.tets[(std::size_t)c][i]]=1;
+    for(PetscInt c=0;c<gnc;++c) {
+      bool hit=false;
+      for(int i=0;i<4 && !hit;++i) hit = ownedPressureVertex[(std::size_t)G.tets[(std::size_t)c][i]]!=0;
+      if(hit) support[(std::size_t)c]=1;
+    }
+  }
+  std::vector<PetscInt> cells;cells.reserve((std::size_t)GD.cellCount[(std::size_t)rank]*2);for(PetscInt c=0;c<gnc;++c)if(support[(std::size_t)c])cells.push_back(c);
+  std::vector<int> cLut((std::size_t)gnc,-1);for(std::size_t i=0;i<cells.size();++i)cLut[(std::size_t)cells[i]]=(int)i;
+  std::vector<unsigned char> pMark((std::size_t)gnv,0),fMark((std::size_t)gnf,0);for(PetscInt c:cells){for(int i=0;i<4;++i)pMark[(std::size_t)G.tets[(std::size_t)c][i]]=1;for(int i=0;i<4;++i)fMark[(std::size_t)G.oppFace[(std::size_t)c][i]]=1;}
+  std::vector<PetscInt> points;for(PetscInt p=0;p<gnv;++p)if(pMark[(std::size_t)p])points.push_back(p);std::vector<int>pLut((std::size_t)gnv,-1);for(std::size_t i=0;i<points.size();++i)pLut[(std::size_t)points[i]]=(int)i;
+  // Face ordering: complete internal faces first (preserves f<neighbour.size()),
+  // then incomplete internal support faces, then true boundary faces grouped by patch.
+  std::vector<PetscInt> fint,fincomplete,fbnd;for(PetscInt f=0;f<gnf;++f)if(fMark[(std::size_t)f]){if(f<gni){if(cLut[(std::size_t)G.owner[(std::size_t)f]]>=0&&cLut[(std::size_t)G.neighbour[(std::size_t)f]]>=0)fint.push_back(f);else fincomplete.push_back(f);}else fbnd.push_back(f);}
+  std::vector<PetscInt> faces=fint;faces.insert(faces.end(),fincomplete.begin(),fincomplete.end());
+  std::vector<Patch> patches;patches.reserve(G.patches.size());
+  for(std::size_t pi=0;pi<G.patches.size();++pi){Patch q;q.name=G.patches[pi].name;q.startFace=(PetscInt)faces.size();for(PetscInt f:fbnd){if(G.facePatch[(std::size_t)f]==(int)pi){faces.push_back(f);++q.nFaces;}}patches.push_back(q);}
+  std::vector<int> fLut((std::size_t)gnf,-1);for(std::size_t i=0;i<faces.size();++i)fLut[(std::size_t)faces[i]]=(int)i;
+  Mesh& M=X.M;M.points.reserve(points.size());for(PetscInt gp:points)M.points.push_back(G.points[(std::size_t)gp]);M.faces.resize(faces.size());M.owner.resize(faces.size(),-1);M.facePatch.resize(faces.size(),-1);M.neighbour.resize(fint.size(),-1);M.patches=patches;
+  for(std::size_t lf=0;lf<faces.size();++lf){const PetscInt gf=faces[lf];for(int j=0;j<3;++j)M.faces[lf].v[(std::size_t)j]=pLut[(std::size_t)G.faces[(std::size_t)gf].v[(std::size_t)j]];const int go=G.owner[(std::size_t)gf];int lo=(go>=0&&go<gnc)?cLut[(std::size_t)go]:-1;if(lo<0&&gf<gni)lo=cLut[(std::size_t)G.neighbour[(std::size_t)gf]];M.owner[lf]=lo;if(lf<fint.size())M.neighbour[lf]=cLut[(std::size_t)G.neighbour[(std::size_t)gf]];if(gf>=gni)M.facePatch[lf]=G.facePatch[(std::size_t)gf];}
+  M.tets.resize(cells.size());M.oppFace.resize(cells.size());for(std::size_t lc=0;lc<cells.size();++lc){const PetscInt gc=cells[lc];for(int i=0;i<4;++i){M.tets[lc][(std::size_t)i]=pLut[(std::size_t)G.tets[(std::size_t)gc][i]];M.oppFace[lc][(std::size_t)i]=fLut[(std::size_t)G.oppFace[(std::size_t)gc][i]];}}
+  Discrete& D=X.D;D.cellCount=GD.cellCount;D.velCount=GD.velCount;D.ns=GD.ns;D.freeVertices=GD.freeVertices;D.fixedVertices=GD.fixedVertices;D.freeFaces=GD.freeFaces;D.fixedFaces=GD.fixedFaces;D.cellOwner.resize(cells.size());D.pGid.resize(cells.size());for(std::size_t lc=0;lc<cells.size();++lc){D.cellOwner[lc]=GD.cellOwner[(std::size_t)cells[lc]];D.pGid[lc]=GD.pGid[(std::size_t)cells[lc]];}
+  const std::size_t nent=M.points.size()+M.faces.size();D.fixedEntity.assign(nent,0);if(!GD.wallEntity.empty())D.wallEntity.assign(nent,0);else std::vector<char>().swap(D.wallEntity);D.g2free.assign(nent,-1);D.fixedDirValue.clear();D.fixedDirValue.reserve(nent/8+1);
+  auto copyEntity=[&](std::size_t le,PetscInt ge){
+    D.fixedEntity[le]=GD.fixedEntity[(std::size_t)ge];
+    if(!D.wallEntity.empty()) D.wallEntity[le]=GD.wallEntity[(std::size_t)ge];
+    const PetscInt gg=GD.g2free[(std::size_t)ge];
+    if(gg>=0){D.g2free[le]=gg;}
+    else{const PetscInt gs=fixedDirSlotFromEncodedGid(gg);const PetscInt ls=(PetscInt)D.fixedDirValue.size();D.fixedDirValue.push_back(GD.fixedDirValue[(std::size_t)gs]);D.g2free[le]=-(ls+2);}
+  };
+  for(std::size_t lp=0;lp<points.size();++lp)copyEntity(lp,points[lp]);for(std::size_t lf=0;lf<faces.size();++lf)copyEntity(M.points.size()+lf,gnv+faces[lf]);
+  return X;
+}
+
+static std::vector<char> packDistProductionPacket(const DistProductionPacket& X) {
+  std::vector<char>b;distAppendPod(b,X.globalCells);distAppendPod(b,X.globalPoints);distAppendPod(b,X.globalFaces);distAppendPod(b,X.globalInternalFaces);
+  distAppendVector(b,X.M.points);distAppendVector(b,X.M.faces);distAppendVector(b,X.M.owner);distAppendVector(b,X.M.neighbour);distAppendVector(b,X.M.tets);distAppendVector(b,X.M.oppFace);distAppendVector(b,X.M.facePatch);const std::uint64_t np=(std::uint64_t)X.M.patches.size();distAppendPod(b,np);for(const auto&q:X.M.patches){distAppendString(b,q.name);distAppendPod(b,q.startFace);distAppendPod(b,q.nFaces);}
+  distAppendVector(b,X.D.g2free);distAppendVector(b,X.D.pGid);distAppendVector(b,X.D.cellOwner);distAppendVector(b,X.D.velCount);distAppendVector(b,X.D.cellCount);distAppendVector(b,X.D.fixedEntity);distAppendVector(b,X.D.wallEntity);distAppendVector(b,X.D.fixedDirValue);distAppendPod(b,X.D.ns);distAppendPod(b,X.D.freeVertices);distAppendPod(b,X.D.freeFaces);distAppendPod(b,X.D.fixedVertices);distAppendPod(b,X.D.fixedFaces);return b;
+}
+static DistProductionPacket unpackDistProductionPacket(const std::vector<char>&b){std::size_t o=0;DistProductionPacket X;X.globalCells=distReadPod<PetscInt>(b,o);X.globalPoints=distReadPod<PetscInt>(b,o);X.globalFaces=distReadPod<PetscInt>(b,o);X.globalInternalFaces=distReadPod<PetscInt>(b,o);X.M.points=distReadVector<Vec3>(b,o);X.M.faces=distReadVector<Face>(b,o);X.M.owner=distReadVector<int>(b,o);X.M.neighbour=distReadVector<int>(b,o);X.M.tets=distReadVector<std::array<int,4>>(b,o);X.M.oppFace=distReadVector<std::array<int,4>>(b,o);X.M.facePatch=distReadVector<int>(b,o);const std::uint64_t np=distReadPod<std::uint64_t>(b,o);X.M.patches.resize((std::size_t)np);for(auto&q:X.M.patches){q.name=distReadString(b,o);q.startFace=distReadPod<PetscInt>(b,o);q.nFaces=distReadPod<PetscInt>(b,o);}X.D.g2free=distReadVector<PetscInt>(b,o);X.D.pGid=distReadVector<PetscInt>(b,o);X.D.cellOwner=distReadVector<int>(b,o);X.D.velCount=distReadVector<PetscInt>(b,o);X.D.cellCount=distReadVector<PetscInt>(b,o);X.D.fixedEntity=distReadVector<char>(b,o);X.D.wallEntity=distReadVector<char>(b,o);X.D.fixedDirValue=distReadVector<std::array<double,3>>(b,o);X.D.ns=distReadPod<PetscInt>(b,o);X.D.freeVertices=distReadPod<PetscInt>(b,o);X.D.freeFaces=distReadPod<PetscInt>(b,o);X.D.fixedVertices=distReadPod<PetscInt>(b,o);X.D.fixedFaces=distReadPod<PetscInt>(b,o);if(o!=b.size())throw std::runtime_error("local mesh packet trailing bytes");return X;}
+
+static PetscErrorCode distributeProductionMeshRoot(const Mesh& G,const Discrete& GD,int rank,int size,DistProductionPacket& local,PetscBool pressureVertexStarSupport=PETSC_FALSE) {
+  PetscFunctionBeginUser;
+  if(rank==0){for(int r=0;r<size;++r){DistProductionPacket X=buildDistProductionPacket(G,GD,r,pressureVertexStarSupport);std::vector<char>b=packDistProductionPacket(X);if(r==0)local=std::move(X);else PetscCall(distSendBytes(b,r,17000+2*r));}}
+  else{std::vector<char>b;PetscCall(distRecvBytes(b,0,17000+2*rank));local=unpackDistProductionPacket(b);}PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode assembleMPI(const Mesh& M, int rank, int size,const ProblemConfig& P, Discrete& D,
+  PetscBool buildDiffusionReference=PETSC_FALSE,PetscBool buildBReference=PETSC_FALSE,PetscBool buildMomentumRhsReference=PETSC_FALSE) {
+  PetscFunctionBeginUser;
+  const PetscInt nv=(PetscInt)M.points.size(), nc=(PetscInt)M.tets.size();
+  if(D.cellOwner.empty()) PetscCall(buildOwnership(M,rank,size,P,D));
+  const PetscInt globalNc=distributedGlobalCellCount(D);
+  PetscInt nlv=D.velCount[rank], nlp=D.cellCount[rank];
+  // M3A production path does not create a PETSc scalar momentum matrix at all.
+  // A temporary D.A may be requested only by the 40k reference gate so the
+  // direct custom static diffusion action can be compared against the frozen
+  // PETSc assembly before D.A is destroyed.
+  if(buildDiffusionReference) {
+    PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlv,nlv,D.ns,D.ns,72,nullptr,72,nullptr,&D.A));
+    PetscCall(MatSetOption(D.A,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_FALSE));
+    PetscCall(MatSetOption(D.A,MAT_SYMMETRIC,PETSC_TRUE));
+  }
+  // M4B: PETSc B matrices are reference-only.  Production pressure physics
+  // uses the custom FP64 MPI B/B^T plan, so no sparse B storage is created.
+  // The element B coefficients are still integrated below because fixedDiv is
+  // a physical Dirichlet contribution and must remain exactly unchanged.
+  PetscInt vStart=0,pStart=0;
+  for(int r=0;r<rank;++r){vStart+=D.velCount[r];pStart+=D.cellCount[r];}
+  const PetscInt vEnd=vStart+nlv;
+  std::vector<PetscInt> bDnnz,bOnnz;
+  PetscInt gbD=0,gbO=0;
+  if(buildBReference) {
+    bDnnz.assign((size_t)nlp,0); bOnnz.assign((size_t)nlp,0);
+    for(PetscInt c=0;c<nc;++c) if(D.cellOwner[c]==rank) {
+      const PetscInt li=D.pGid[c]-pStart;
+      if(li<0 || li>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"pressure row ownership mismatch during B reference preallocation");
+      PetscInt entity[8]; for(int i=0;i<4;++i)entity[i]=M.tets[c][i]; for(int i=0;i<4;++i)entity[4+i]=nv+M.oppFace[c][i];
+      for(int a=0;a<8;++a) {
+        const PetscInt gid=D.g2free[entity[a]]; if(gid<0) continue;
+        if(gid>=vStart && gid<vEnd) ++bDnnz[(size_t)li]; else ++bOnnz[(size_t)li];
+      }
+    }
+    PetscInt lbD=0,lbO=0; for(PetscInt i=0;i<nlp;++i){lbD+=bDnnz[(size_t)i];lbO+=bOnnz[(size_t)i];}
+    PetscCallMPI(MPI_Allreduce(&lbD,&gbD,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCallMPI(MPI_Allreduce(&lbO,&gbO,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  }
+  for(int d=0;d<3;++d) {
+    if(buildBReference) {
+      PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlv,globalNc,D.ns,0,bDnnz.data(),0,bOnnz.data(),&D.B[d]));
+      PetscCall(MatSetOption(D.B[d],MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
+    }
+    if(buildMomentumRhsReference){PetscCall(VecCreateMPI(PETSC_COMM_WORLD,nlv,D.ns,&D.rhs[d])); PetscCall(VecSet(D.rhs[d],0));}
+  }
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_M4B_B_STORAGE PETScB=%s physicalB=custom_FP64_MPI referenceDiagNnz=%" PetscInt_FMT " referenceOffdiagNnz=%" PetscInt_FMT "\n",
+    buildBReference?"temporary_reference":"never_created_in_production",gbD,gbO));
+  PetscCall(VecCreateMPI(PETSC_COMM_WORLD,nlp,globalNc,&D.volumes)); PetscCall(VecSet(D.volumes,0));
+  PetscCall(VecDuplicate(D.volumes,&D.fixedDiv)); PetscCall(VecSet(D.fixedDiv,0));
+  D.volumesOwnedFP64.assign((std::size_t)nlp,0.0);
+  D.fixedDivOwnedFP64.assign((std::size_t)nlp,0.0);
+
+  // On affine P1+BF3 tets, diffusion integrands have degree <=4 and B degree <=2.
+  // For the pipe forcing is zero, so the degree-8 exact 5^3 collapsed rule is ample
+  // and avoids the older 7^3 startup quadrature.  MMS retains the 7^3 rule below.
+  auto Q=(P.mode!=ProblemMode::MMS)?tetDuffy5():tetDuffy7();
+  double lmin=1e300,lmax=0,lsum=0;
+  for(PetscInt c=0;c<nc;++c) if(D.cellOwner[c]==rank) {
+    auto t=M.tets[c]; Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}}, invJ[3][3];
+    double det=det3(J); if(det<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_WRONG,"non-positive tet orientation at cell %" PetscInt_FMT,c); inv3(J,invJ);
+    double Al[8][8]={{0}}, Bl[3][8]={{0}}, fl[3][8]={{0}};
+    for(const auto& q:Q) {
+      double val[8],grr[8][3],gr[8][3]; basis(q.lam,val,grr);
+      for(int a=0;a<8;++a) for(int d=0;d<3;++d){gr[a][d]=0;for(int j=0;j<3;++j)gr[a][d]+=grr[a][j]*invJ[j][d];}
+      double x=0,y=0,z=0; for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;} double ff[3]; problemForcing(P,x,y,z,ff); double w=q.w*det;
+      for(int a=0;a<8;++a){for(int d=0;d<3;++d){Bl[d][a]+=gr[a][d]*w;fl[d][a]+=ff[d]*val[a]*w;} for(int b=0;b<8;++b){double dot=0;for(int d=0;d<3;++d)dot+=gr[a][d]*gr[b][d];Al[a][b]+=dot*w;}}
+    }
+    PetscInt lg[8]; for(int i=0;i<4;++i)lg[i]=t[i]; for(int i=0;i<4;++i)lg[4+i]=nv+M.oppFace[c][i];
+    PetscInt pr=D.pGid[c]; double fixedDiv=0.0;
+    if(dgNumericalTraceInlet(P)) {
+      int inletOpp=-1; Vec3 sf{};
+      if(dgNumericalTraceFaceGeom(M,P,c,inletOpp,sf)) {
+        const double sd[3]={sf.x,sf.y,sf.z};
+        for(int d=0;d<3;++d) {
+          for(int a=0;a<4;++a) if(a!=inletOpp) Bl[d][a]-=sd[d]/3.0;
+          Bl[d][4+inletOpp]-=(9.0/20.0)*sd[d];
+        }
+        fixedDiv += dot3(P.boundary.inletVelocity,sf);
+      }
+    }
+    for(int a=0;a<8;++a) {
+      PetscInt ia=D.g2free[lg[a]];
+      if(ia>=0) {
+        for(int d=0;d<3;++d) {
+          if(buildMomentumRhsReference) PetscCall(VecSetValue(D.rhs[d],ia,fl[d][a],ADD_VALUES));
+          if(buildBReference && !(P.weakWallFunction && d<2 && !D.wallEntity.empty() && D.wallEntity[(std::size_t)lg[a]]))
+            PetscCall(MatSetValue(D.B[d],pr,ia,Bl[d][a],ADD_VALUES));
+        }
+        for(int b=0;b<8;++b) {
+          PetscInt ib=D.g2free[lg[b]];
+          if(ib>=0) { if(buildDiffusionReference) PetscCall(MatSetValue(D.A,ia,ib,Al[a][b],ADD_VALUES)); }
+          else for(int d=0;d<3;++d) {
+            const double ud=entityDirValue(D,d,lg[b]);
+            if(ud!=0.0 && buildMomentumRhsReference) PetscCall(VecSetValue(D.rhs[d],ia,-P.nu*Al[a][b]*ud,ADD_VALUES));
+          }
+        }
+      } else {
+        for(int d=0;d<3;++d) fixedDiv += Bl[d][a]*entityDirValue(D,d,lg[a]);
+      }
+    }
+    const PetscInt pLocal=pr-pStart;
+    if(pLocal<0 || pLocal>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6A owned pressure row mismatch during native FP64 scalar assembly");
+    D.fixedDivOwnedFP64[(std::size_t)pLocal]+=fixedDiv;
+    if(fixedDiv!=0.0) PetscCall(VecSetValue(D.fixedDiv,pr,fixedDiv,ADD_VALUES));
+    double vol=det/6.0; D.volumesOwnedFP64[(std::size_t)pLocal]=vol; PetscCall(VecSetValue(D.volumes,pr,vol,INSERT_VALUES)); lmin=std::min(lmin,vol); lmax=std::max(lmax,vol); lsum+=vol;
+  }
+  if(buildDiffusionReference) { PetscCall(MatAssemblyBegin(D.A,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(D.A,MAT_FINAL_ASSEMBLY)); }
+  for(int d=0;d<3;++d){
+    if(buildBReference){PetscCall(MatAssemblyBegin(D.B[d],MAT_FINAL_ASSEMBLY));PetscCall(MatAssemblyEnd(D.B[d],MAT_FINAL_ASSEMBLY));}
+    if(buildMomentumRhsReference){PetscCall(VecAssemblyBegin(D.rhs[d]));PetscCall(VecAssemblyEnd(D.rhs[d]));}
+  }
+  if(buildBReference) {
+    MatInfo bi; PetscCall(MatGetInfo(D.B[0],MAT_GLOBAL_SUM,&bi)); PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M4B_B_REFERENCE_ALLOCATION used=%.0f allocated=%.0f allocOverUsed=%.12f status=%s\n",
+      bi.nz_used,bi.nz_allocated,bi.nz_used?bi.nz_allocated/bi.nz_used:0.0,(bi.nz_used>0.0 && std::abs(bi.nz_allocated-bi.nz_used)<0.5)?"PASS":"CHECK"));
+  }
+  PetscCall(VecAssemblyBegin(D.volumes)); PetscCall(VecAssemblyEnd(D.volumes));
+  PetscCall(VecAssemblyBegin(D.fixedDiv)); PetscCall(VecAssemblyEnd(D.fixedDiv));
+  double gmin,gmax,gsum; PetscCallMPI(MPI_Allreduce(&lmin,&gmin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lmax,&gmax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&lsum,&gsum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_FE cells=%" PetscInt_FMT " localSupportCells=%" PetscInt_FMT " scalarVelDofs=%" PetscInt_FMT " velocityDofs=%" PetscInt_FMT " pressureDofs=%" PetscInt_FMT " freeVertices=%" PetscInt_FMT " freeBF3Faces=%" PetscInt_FMT " totalVolume=%.16e minVol=%.6e maxVol=%.6e hEff=%.12e assembly=%s\n",globalNc,nc,D.ns,3*D.ns,globalNc,D.freeVertices,D.freeFaces,gsum,gmin,gmax,std::cbrt(gsum/globalNc),buildDiffusionReference?(buildBReference?"temporary_DA_plus_B_reference":"temporary_DA_reference_no_B"):(buildBReference?"temporary_B_reference_no_DA":"custom_pressure_B_no_PETSc_B_or_DA")));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode smoothSolveMPI(Mat A, Vec b, Vec x, PetscReal rtol, PetscReal relDrop, PetscInt maxIts, PetscInt checkEvery, PetscReal omega, PetscInt localSweeps, PetscInt *parallelIts, PetscReal *relres) {
+  PetscFunctionBeginUser;
+  Vec r; PetscReal bn=0,rn=0,rnInitial=-1.0; PetscCall(VecDuplicate(b,&r)); PetscCall(VecNorm(b,NORM_2,&bn));
+  if(PetscIsInfOrNanReal(bn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"momentum RHS norm is NaN/Inf before local SGS");
+  if(bn==0) bn=1;
+  // Optional OpenFOAM-like inner relative stopping: reduce the residual from
+  // the current warm-start value by relDrop (e.g. 0.1).  Disabled at 0 so the
+  // historical tight ||r||/||b|| criterion is unchanged by default.
+  if(relDrop>0.0) {
+    PetscCall(MatMult(A,x,r)); PetscCall(VecAYPX(r,-1.0,b)); PetscCall(VecNorm(r,NORM_2,&rnInitial));
+    if(PetscIsInfOrNanReal(rnInitial)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"momentum initial residual is NaN/Inf");
+    if(rnInitial/bn<rtol) { *parallelIts=0; *relres=rnInitial/bn; PetscCall(VecDestroy(&r)); PetscFunctionReturn(PETSC_SUCCESS); }
+  }
+  PetscInt it=0;
+  while(it<maxIts) {
+    PetscInt chunk=PetscMin(checkEvery,maxIts-it);
+    PetscCall(MatSOR(A,b,omega,SOR_LOCAL_SYMMETRIC_SWEEP,0.0,chunk,localSweeps,x)); it+=chunk;
+    PetscCall(MatMult(A,x,r)); PetscCall(VecAYPX(r,-1.0,b)); PetscCall(VecNorm(r,NORM_2,&rn));
+    if(PetscIsInfOrNanReal(rn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"momentum local SGS generated NaN/Inf after %" PetscInt_FMT " sweeps",it);
+    if(rn/bn<rtol) break;
+    if(relDrop>0.0 && rnInitial>0.0 && rn<=relDrop*rnInitial) break;
+  }
+  *parallelIts=it; *relres=rn/bn; PetscCall(VecDestroy(&r)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gatherToZero(Vec x, Vec *x0) {
+  PetscFunctionBeginUser; VecScatter sc; PetscCall(VecScatterCreateToZero(x,&sc,x0)); PetscCall(VecScatterBegin(sc,x,*x0,INSERT_VALUES,SCATTER_FORWARD)); PetscCall(VecScatterEnd(sc,x,*x0,INSERT_VALUES,SCATTER_FORWARD)); PetscCall(VecScatterDestroy(&sc)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode customGatherOwnedVelocityToZero(const std::array<std::vector<double>,3>& U,const std::vector<PetscInt>& counts,std::array<std::vector<double>,3>& global) {
+  PetscFunctionBeginUser; int rank=0,size=1;PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD,&rank));PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD,&size));std::vector<int> c((std::size_t)size),d((std::size_t)size);int off=0;for(int r=0;r<size;++r){c[(std::size_t)r]=(int)counts[(std::size_t)r];d[(std::size_t)r]=off;off+=c[(std::size_t)r];}
+  for(int q=0;q<3;++q){if(rank==0)global[(std::size_t)q].resize((std::size_t)off);PetscCallMPI(MPI_Gatherv(U[(std::size_t)q].data(),(int)U[(std::size_t)q].size(),MPI_DOUBLE,rank==0?global[(std::size_t)q].data():nullptr,c.data(),d.data(),MPI_DOUBLE,0,PETSC_COMM_WORLD));}PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode computeErrorsRoot(const Mesh& M,const Discrete& D,const std::array<std::vector<double>,3>& U,const std::vector<double>& p) {
+  PetscFunctionBeginUser;
+  const std::vector<double>* ua[3]; for(int d=0;d<3;++d) ua[d]=&U[(std::size_t)d]; auto Q=tetDuffy7(); PetscInt nv=M.points.size();
+  double total=0,intdiff=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c){auto t=M.tets[c];Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};double det=det3(J);for(auto&q:Q){double x=0,y=0,z=0;for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;}double w=q.w*det;total+=w;intdiff+=(p[(std::size_t)D.pGid[c]]-exactP(x,y,z))*w;}}
+  double shift=intdiff/total, ue2=0,un2=0,pe2=0,pn2=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c){auto t=M.tets[c];Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};double det=det3(J);PetscInt lg[8];for(int i=0;i<4;++i)lg[i]=t[i];for(int i=0;i<4;++i)lg[4+i]=nv+M.oppFace[c][i];double coeff[3][8]={{0}};for(int a=0;a<8;++a){PetscInt ia=D.g2free[lg[a]];if(ia>=0)for(int d=0;d<3;++d)coeff[d][a]=(*ua[d])[(std::size_t)ia];}
+    for(auto&q:Q){double val[8],gr[8][3];basis(q.lam,val,gr);double x=0,y=0,z=0;for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;}double uh[3]={0},ue[3];for(int d=0;d<3;++d)for(int a=0;a<8;++a)uh[d]+=coeff[d][a]*val[a];exactU(x,y,z,ue);double pp=exactP(x,y,z),w=q.w*det;for(int d=0;d<3;++d){ue2+=(uh[d]-ue[d])*(uh[d]-ue[d])*w;un2+=ue[d]*ue[d]*w;}double de=p[(std::size_t)D.pGid[c]]-shift-pp;pe2+=de*de*w;pn2+=pp*pp*w;}}
+PetscCall(PetscPrintf(PETSC_COMM_SELF,"P1BF3_MMS U_L2=%.12e U_relL2=%.12e P_shifted_L2=%.12e P_shifted_relL2=%.12e pressureShift=%.12e\n",std::sqrt(ue2),std::sqrt(ue2/un2),std::sqrt(pe2),std::sqrt(pe2/pn2),shift)); PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static double gatheredEntityValue(const Discrete& D,const std::vector<double>& ua,int d,PetscInt entity) {
+  const PetscInt gid=D.g2free[entity]; return gid>=0?ua[(std::size_t)gid]:entityDirValue(D,d,entity);
+}
+
+static void fixedFaceMean(const Mesh& M,const Discrete& D,PetscInt f,double avg[3]) {
+  const PetscInt nv=(PetscInt)M.points.size(); const auto& F=M.faces[f];
+  for(int d=0;d<3;++d) {
+    avg[d]=(entityDirValue(D,d,F.v[0])+entityDirValue(D,d,F.v[1])+entityDirValue(D,d,F.v[2]))/3.0;
+    avg[d]+=(9.0/20.0)*entityDirValue(D,d,nv+f);
+  }
+}
+
+static PetscErrorCode auditFixedNormalInletRoot(const Mesh& M,const Discrete& D,const ProblemConfig& P) {
+  PetscFunctionBeginUser;
+  if(P.inletBC!=InletBCMode::FixedNormalSpeed) PetscFunctionReturn(PETSC_SUCCESS);
+  const auto& B=P.boundary; const auto& pin=M.patches[B.inlet];
+  double flux=0.0,unMin=std::numeric_limits<double>::max(),unMax=-std::numeric_limits<double>::max();
+  double meanVectorErrMax=0.0;
+  for(PetscInt f=pin.startFace;f<pin.startFace+pin.nFaces;++f) {
+    const Vec3 sf=faceOutwardAreaVector(M,f); const double area=norm3(sf); const Vec3 nf=scale3(sf,1.0/area);
+    double avg[3]; fixedFaceMean(M,D,f,avg); const Vec3 u{avg[0],avg[1],avg[2]};
+    flux += dot3(u,sf); const double un=dot3(u,nf); unMin=std::min(unMin,un); unMax=std::max(unMax,un);
+    meanVectorErrMax=std::max(meanVectorErrMax,norm3(sub3(u,B.inletVelocity)));
+  }
+  const double target=B.signedNormalSpeed*B.inletProjectedArea;
+  const double relErr=std::abs(flux-target)/std::max(std::abs(target),1e-300);
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_INLET_BC_AUDIT patch=%s mode=fixed_normal_speed normalMode=average_patch_normal signedSpeed=%.12e referenceNormal=[%.12e,%.12e,%.12e] U=[%.12e,%.12e,%.12e] area=%.12e projectedArea=%.12e planarityRatio=%.12e targetFlux=%.12e imposedFlux=%.12e relFluxError=%.12e faceNormalVelocityMin=%.12e faceNormalVelocityMax=%.12e faceMeanVectorErrorMax=%.12e status=%s\n",
+    B.inletPatch.c_str(),B.signedNormalSpeed,B.inletReferenceNormal.x,B.inletReferenceNormal.y,B.inletReferenceNormal.z,
+    B.inletVelocity.x,B.inletVelocity.y,B.inletVelocity.z,B.inletArea,B.inletProjectedArea,B.inletProjectedArea/B.inletArea,
+    target,flux,relErr,unMin,unMax,meanVectorErrMax,(relErr<1e-12 && meanVectorErrMax<1e-12)?"PASS":"CHECK"));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+struct PatchSolutionStats {
+  double area=0.0,flux=0.0,pOwnerMean=0.0,normalVelocityMin=std::numeric_limits<double>::max(),normalVelocityMax=-std::numeric_limits<double>::max();
+};
+
+static PatchSolutionStats patchSolutionStatsRoot(const Mesh& M,const Discrete& D,int pi,const std::vector<double>* ua[3],const double* pa) {
+  PatchSolutionStats S; const PetscInt nv=(PetscInt)M.points.size(); const auto& P=M.patches[pi]; double psum=0.0;
+  for(PetscInt f=P.startFace;f<P.startFace+P.nFaces;++f) {
+    const auto& F=M.faces[f]; const Vec3 sf=faceOutwardAreaVector(M,f); const double area=norm3(sf); const Vec3 nf=scale3(sf,1.0/area);
+    double avg[3]={0,0,0};
+    for(int d=0;d<3;++d) {
+      avg[d]=(gatheredEntityValue(D,*ua[d],d,F.v[0])+gatheredEntityValue(D,*ua[d],d,F.v[1])+gatheredEntityValue(D,*ua[d],d,F.v[2]))/3.0;
+      avg[d]+=(9.0/20.0)*gatheredEntityValue(D,*ua[d],d,nv+f);
+    }
+    const Vec3 u{avg[0],avg[1],avg[2]}; const double un=dot3(u,nf);
+    S.area+=area; S.flux+=dot3(u,sf); psum+=area*pa[D.pGid[M.owner[f]]];
+    S.normalVelocityMin=std::min(S.normalVelocityMin,un); S.normalVelocityMax=std::max(S.normalVelocityMax,un);
+  }
+  S.pOwnerMean=psum/std::max(S.area,1e-300); return S;
+}
+
+static PetscErrorCode computeFlowDiagnosticsRoot(const Mesh& M,const Discrete& D,const ProblemConfig& P,const std::array<std::vector<double>,3>& U,const std::vector<double>& p) {
+  PetscFunctionBeginUser;
+  const std::vector<double>* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) ua[d]=&U[(std::size_t)d];
+  const auto in=patchSolutionStatsRoot(M,D,P.boundary.inlet,ua,p.data()),out=patchSolutionStatsRoot(M,D,P.boundary.outlet,ua,p.data());
+  const double net=in.flux+out.flux,scale=std::max({std::abs(in.flux),std::abs(out.flux),1e-300});
+  const double target=(P.inletBC==InletBCMode::FixedNormalSpeed)?P.boundary.signedNormalSpeed*P.boundary.inletProjectedArea:0.0;
+  const double targetRel=(P.inletBC==InletBCMode::FixedNormalSpeed)?std::abs(in.flux-target)/std::max(std::abs(target),1e-300):0.0;
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_FLOW_DIAGNOSTICS inlet=%s outlet=%s inletFlux=%.12e targetInletFlux=%.12e inletFluxRelError=%.12e outletFlux=%.12e netOutwardFlux=%.12e massRelative=%.12e inletArea=%.12e outletArea=%.12e inletFaceNormalVelocity=[%.12e,%.12e] outletFaceNormalVelocity=[%.12e,%.12e]\n",
+    P.boundary.inletPatch.c_str(),P.boundary.outletPatch.c_str(),in.flux,target,targetRel,out.flux,net,std::abs(net)/scale,in.area,out.area,
+    in.normalVelocityMin,in.normalVelocityMax,out.normalVelocityMin,out.normalVelocityMax));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_FLOW_PRESSURE pInOwnerMean=%.12e pOutOwnerMean=%.12e dropInMinusOut=%.12e pressureGauge=physical_outlet_no_nullspace\n",
+    in.pOwnerMean,out.pOwnerMean,in.pOwnerMean-out.pOwnerMean));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static Vec3 tetCellAverageVelocityRoot(const Mesh& M,const Discrete& D,PetscInt c,const std::vector<double>* ua[3]) {
+  // Exact volume mean for P1+BF3 on an affine tetrahedron:
+  // mean(lambda_i)=1/4 and mean(27*lambda_j*lambda_k*lambda_l)=9/40.
+  const PetscInt nv=(PetscInt)M.points.size();
+  PetscInt ent[8];
+  for(int i=0;i<4;++i) ent[i]=M.tets[c][i];
+  for(int i=0;i<4;++i) ent[4+i]=nv+M.oppFace[c][i];
+  double u[3]={0.0,0.0,0.0};
+  for(int d=0;d<3;++d) {
+    for(int i=0;i<4;++i) u[d]+=0.25*gatheredEntityValue(D,*ua[d],d,ent[i]);
+    for(int i=0;i<4;++i) u[d]+=(9.0/40.0)*gatheredEntityValue(D,*ua[d],d,ent[4+i]);
+  }
+  return Vec3{u[0],u[1],u[2]};
+}
+
+static double tetVolumeAbsRoot(const Mesh& M,PetscInt c) {
+  const auto& t=M.tets[c];
+  const Vec3& X0=M.points[t[0]]; const Vec3& X1=M.points[t[1]];
+  const Vec3& X2=M.points[t[2]]; const Vec3& X3=M.points[t[3]];
+  double J[3][3]={{X1.x-X0.x,X2.x-X0.x,X3.x-X0.x},
+                  {X1.y-X0.y,X2.y-X0.y,X3.y-X0.y},
+                  {X1.z-X0.z,X2.z-X0.z,X3.z-X0.z}};
+  return std::abs(det3(J))/6.0;
+}
+
+static PetscErrorCode writeVtuRoot(const std::string& path,const Mesh& M,const Discrete& D,const std::array<std::vector<double>,3>& U,const std::vector<double>& p,PetscBool converged,PetscInt outerIts,const std::string& velocityMode) {
+  PetscFunctionBeginUser;
+  const bool writeLegacy=(velocityMode=="legacy" || velocityMode=="both");
+  const bool writeU0=(velocityMode=="cell_average" || velocityMode=="u0" || velocityMode=="both");
+  if(!writeLegacy && !writeU0) SETERRQ(PETSC_COMM_SELF,PETSC_ERR_USER_INPUT,"unknown VTU velocity mode %s",velocityMode.c_str());
+
+  const std::vector<double>* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) ua[d]=&U[(std::size_t)d];
+
+  // U0 is the exact element-volume average of the solved P1+BF3 polynomial.
+  // U0_stream is a volume-weighted vertex average of neighboring U0 cells.  It
+  // exists only as a continuous visualization surrogate for ParaView streamlines.
+  std::vector<Vec3> u0, u0Stream;
+  if(writeU0) {
+    u0.resize(M.tets.size());
+    u0Stream.assign(M.points.size(),Vec3{0.0,0.0,0.0});
+    std::vector<double> w(M.points.size(),0.0);
+    for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+      u0[c]=tetCellAverageVelocityRoot(M,D,c,ua);
+      const double vol=tetVolumeAbsRoot(M,c);
+      for(int i=0;i<4;++i) {
+        const PetscInt v=M.tets[c][i];
+        u0Stream[v].x+=vol*u0[c].x; u0Stream[v].y+=vol*u0[c].y; u0Stream[v].z+=vol*u0[c].z;
+        w[v]+=vol;
+      }
+    }
+    for(PetscInt v=0;v<(PetscInt)M.points.size();++v) if(w[v]>0.0) {
+      u0Stream[v].x/=w[v]; u0Stream[v].y/=w[v]; u0Stream[v].z/=w[v];
+    }
+  }
+
+  std::ofstream out(path); if(!out) SETERRQ(PETSC_COMM_SELF,PETSC_ERR_FILE_OPEN,"cannot open VTU output %s",path.c_str());
+  out<<std::setprecision(17)<<std::scientific;
+  out<<"<?xml version=\"1.0\"?>\n<VTKFile type=\"UnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n<UnstructuredGrid>\n";
+  out<<"<Piece NumberOfPoints=\""<<M.points.size()<<"\" NumberOfCells=\""<<M.tets.size()<<"\">\n";
+  out<<"<Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+  for(const auto& x:M.points) out<<x.x<<' '<<x.y<<' '<<x.z<<'\n'; out<<"</DataArray></Points>\n";
+  out<<"<Cells>\n<DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">\n";
+  for(const auto& t:M.tets) out<<t[0]<<' '<<t[1]<<' '<<t[2]<<' '<<t[3]<<'\n'; out<<"</DataArray>\n";
+  out<<"<DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">\n"; for(size_t c=0;c<M.tets.size();++c) out<<4*(c+1)<<'\n'; out<<"</DataArray>\n";
+  out<<"<DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n"; for(size_t c=0;c<M.tets.size();++c) out<<10<<'\n'; out<<"</DataArray>\n</Cells>\n";
+
+  out<<"<PointData";
+  if(writeU0) out<<" Vectors=\"U0_stream\""; else if(writeLegacy) out<<" Vectors=\"U_P1\"";
+  out<<">\n";
+  if(writeLegacy) {
+    out<<"<DataArray type=\"Float64\" Name=\"U_P1\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for(PetscInt v=0;v<(PetscInt)M.points.size();++v) out<<gatheredEntityValue(D,*ua[0],0,v)<<' '<<gatheredEntityValue(D,*ua[1],1,v)<<' '<<gatheredEntityValue(D,*ua[2],2,v)<<'\n';
+    out<<"</DataArray>\n";
+  }
+  if(writeU0) {
+    out<<"<DataArray type=\"Float64\" Name=\"U0_stream\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for(const auto& q:u0Stream) out<<q.x<<' '<<q.y<<' '<<q.z<<'\n';
+    out<<"</DataArray>\n";
+  }
+  out<<"</PointData>\n";
+
+  out<<"<CellData Scalars=\"p_P0\" Vectors=\""<<(writeU0?"U0":"U_P1BF3_centroid")<<"\">\n";
+  out<<"<DataArray type=\"Float64\" Name=\"p_P0\" NumberOfComponents=\"1\" format=\"ascii\">\n";
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) out<<p[(std::size_t)D.pGid[c]]<<'\n'; out<<"</DataArray>\n";
+
+  if(writeU0) {
+    out<<"<DataArray type=\"Float64\" Name=\"U0\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for(const auto& q:u0) out<<q.x<<' '<<q.y<<' '<<q.z<<'\n';
+    out<<"</DataArray>\n";
+  }
+
+  if(writeLegacy) {
+    out<<"<DataArray type=\"Float64\" Name=\"U_P1_centroid\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) { double uc[3]={0,0,0}; for(int i=0;i<4;++i) for(int d=0;d<3;++d) uc[d]+=0.25*gatheredEntityValue(D,*ua[d],d,M.tets[c][i]); out<<uc[0]<<' '<<uc[1]<<' '<<uc[2]<<'\n'; }
+    out<<"</DataArray>\n";
+    out<<"<DataArray type=\"Float64\" Name=\"U_P1BF3_centroid\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    std::array<double,4> lam{{0.25,0.25,0.25,0.25}}; double val[8],gr[8][3]; basis(lam,val,gr); const PetscInt nv=(PetscInt)M.points.size();
+    for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) { PetscInt ent[8]; for(int i=0;i<4;++i)ent[i]=M.tets[c][i]; for(int i=0;i<4;++i)ent[4+i]=nv+M.oppFace[c][i]; double uc[3]={0,0,0}; for(int a=0;a<8;++a) for(int d=0;d<3;++d) uc[d]+=val[a]*gatheredEntityValue(D,*ua[d],d,ent[a]); out<<uc[0]<<' '<<uc[1]<<' '<<uc[2]<<'\n'; }
+    out<<"</DataArray>\n";
+  }
+
+  out<<"<DataArray type=\"Int32\" Name=\"solve_converged\" NumberOfComponents=\"1\" format=\"ascii\">\n"; for(size_t c=0;c<M.tets.size();++c) out<<(converged?1:0)<<'\n'; out<<"</DataArray>\n";
+  out<<"<DataArray type=\"Int32\" Name=\"outer_iterations\" NumberOfComponents=\"1\" format=\"ascii\">\n"; for(size_t c=0;c<M.tets.size();++c) out<<outerIts<<'\n'; out<<"</DataArray>\n";
+  out<<"</CellData>\n</Piece>\n</UnstructuredGrid>\n</VTKFile>\n"; out.close();
+
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_VTU path=%s mode=%s points=%zu cells=%zu pointVelocity=%s cellVelocity=%s cellPressure=p_P0 converged=%d outerIts=%" PetscInt_FMT " status=PASS\n",
+    path.c_str(),velocityMode.c_str(),M.points.size(),M.tets.size(),writeU0?"U0_stream":"U_P1",writeU0?"U0":"U_P1BF3_centroid",converged?1:0,outerIts));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode computePipeDiagnosticsRoot(const Mesh& M,const Discrete& D,const ProblemConfig& P,const std::array<std::vector<double>,3>& U,const std::vector<double>& p) {
+  PetscFunctionBeginUser;
+  const auto& G=P.pipe;
+  const std::vector<double>* ua[3]={nullptr,nullptr,nullptr};
+  for(int d=0;d<3;++d) ua[d]=&U[(std::size_t)d];
+  const PetscInt nv=(PetscInt)M.points.size();
+  const auto Q=tetDuffy7();
+  double ue2=0,un2=0,ueMesh2=0,trans2=0,pe2=0,pn2=0,total=0,pdiff=0;
+  double sw=0,sz=0,szz=0,sp=0,szp=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    const auto t=M.tets[c];Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};
+    const double det=det3(J),vol=det/6.0;
+    PetscInt entity[8];for(int i=0;i<4;++i)entity[i]=t[i];for(int i=0;i<4;++i)entity[4+i]=nv+M.oppFace[c][i];
+    double coeff[3][8]={{0}};for(int a=0;a<8;++a)for(int d=0;d<3;++d)coeff[d][a]=gatheredEntityValue(D,*ua[d],d,entity[a]);
+    const double pc=p[(std::size_t)D.pGid[c]];
+    double zc=0;for(int i=0;i<4;++i)zc+=X[i].z;zc*=0.25;
+    sw+=vol;sz+=vol*zc;szz+=vol*zc*zc;sp+=vol*pc;szp+=vol*zc*pc;
+    for(const auto& q:Q) {
+      double val[8],gr[8][3];basis(q.lam,val,gr);
+      double x=0,y=0,z=0;for(int i=0;i<4;++i){x+=q.lam[i]*X[i].x;y+=q.lam[i]*X[i].y;z+=q.lam[i]*X[i].z;}
+      double uh[3]={0,0,0};for(int d=0;d<3;++d)for(int a=0;a<8;++a)uh[d]+=coeff[d][a]*val[a];
+      const double uz=pipeIdealUz(G,x,y),uzMesh=G.profileScale*uz,pex=pipeExactPressure(G,z),w=q.w*det;
+      ue2+=(uh[0]*uh[0]+uh[1]*uh[1]+(uh[2]-uz)*(uh[2]-uz))*w;
+      ueMesh2+=(uh[0]*uh[0]+uh[1]*uh[1]+(uh[2]-uzMesh)*(uh[2]-uzMesh))*w;
+      un2+=uz*uz*w;trans2+=(uh[0]*uh[0]+uh[1]*uh[1])*w;
+      const double dp=pc-pex;pe2+=dp*dp*w;pn2+=pex*pex*w;pdiff+=dp*w;total+=w;
+    }
+  }
+  const double pshift=pdiff/total;
+  double peShift2=0;
+  for(PetscInt c=0;c<(PetscInt)M.tets.size();++c) {
+    const auto t=M.tets[c];Vec3 X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};
+    double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}};
+    const double det=det3(J),pc=p[(std::size_t)D.pGid[c]];
+    for(const auto& q:Q){double z=0;for(int i=0;i<4;++i)z+=q.lam[i]*X[i].z;const double de=pc-pshift-pipeExactPressure(G,z);peShift2+=de*de*q.w*det;}
+  }
+
+  auto faceFluxAndPressure=[&](int pi,double& flux,double& pmean) {
+    flux=0.0;pmean=0.0;double areaSum=0.0;const auto& pp=M.patches[pi];
+    for(PetscInt f=pp.startFace;f<pp.startFace+pp.nFaces;++f) {
+      const auto& F=M.faces[f];const Vec3& x0=M.points[F.v[0]];const Vec3& x1=M.points[F.v[1]];const Vec3& x2=M.points[F.v[2]];
+      const double area=triangleArea(x0,x1,x2);double avg[3]={0,0,0};
+      for(int d=0;d<3;++d) {
+        avg[d]=(gatheredEntityValue(D,*ua[d],d,F.v[0])+gatheredEntityValue(D,*ua[d],d,F.v[1])+gatheredEntityValue(D,*ua[d],d,F.v[2]))/3.0;
+        avg[d]+=(9.0/20.0)*gatheredEntityValue(D,*ua[d],d,nv+f);
+      }
+      flux+=area*avg[2];
+      pmean+=area*p[(std::size_t)D.pGid[M.owner[f]]];areaSum+=area;
+    }
+    pmean/=areaSum;
+  };
+  double qIn=0,pIn=0,qOut=0,pOut=0;faceFluxAndPressure(G.inlet,qIn,pIn);faceFluxAndPressure(G.outlet,qOut,pOut);
+  const double massRel=(qIn!=0)?(qOut-qIn)/qIn:0.0;
+  const double denom=sw*szz-sz*sz;
+  const double slope=(std::abs(denom)>1e-300)?(sw*szp-sz*sp)/denom:0.0;
+  const double fitDrop=-slope*G.L,faceDrop=pIn-pOut;
+
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_PIPE_ERROR U_L2=%.12e U_relL2=%.12e U_meshNormalized_L2=%.12e U_meshNormalized_relL2=%.12e transverse_L2=%.12e P_abs_L2=%.12e P_abs_relL2=%.12e P_shifted_L2=%.12e pressureShift=%.12e\n",
+    std::sqrt(ue2),std::sqrt(ue2/std::max(un2,1e-300)),std::sqrt(ueMesh2),std::sqrt(ueMesh2/std::max(G.profileScale*G.profileScale*un2,1e-300)),std::sqrt(trans2),std::sqrt(pe2),std::sqrt(pe2/std::max(pn2,1e-300)),std::sqrt(peShift2),pshift));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_PIPE_FLOW inletFlux=%.12e outletFlux=%.12e inletMean=%.12e outletMean=%.12e massRelative=%.12e inletArea=%.12e outletArea=%.12e\n",
+    qIn,qOut,qIn/G.inletArea,qOut/G.outletArea,massRel,G.inletArea,G.outletArea));
+  PetscCall(PetscPrintf(PETSC_COMM_SELF,
+    "P1BF3_PIPE_PRESSURE pInOwnerMean=%.12e pOutOwnerMean=%.12e dropFaceOwner=%.12e dropAxialFit=%.12e hpDrop=%.12e faceRelError=%.12e fitRelError=%.12e\n",
+    pIn,pOut,faceDrop,fitDrop,G.hpDrop,(faceDrop-G.hpDrop)/G.hpDrop,(fitDrop-G.hpDrop)/G.hpDrop));
+
+ 
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode destroyDiscrete(Discrete& D){PetscFunctionBeginUser;PetscCall(MatDestroy(&D.A));for(int d=0;d<3;++d){PetscCall(MatDestroy(&D.B[d]));PetscCall(VecDestroy(&D.rhs[d]));}PetscCall(VecDestroy(&D.volumes));PetscCall(VecDestroy(&D.fixedDiv));PetscFunctionReturn(PETSC_SUCCESS);}
+
+static PetscErrorCode buildPositiveRowL1Metric(Mat A, Vec metric) {
+  PetscFunctionBeginUser;
+  PetscInt rstart=0,rend=0,vstart=0,vend=0;
+  PetscCall(MatGetOwnershipRange(A,&rstart,&rend));
+  PetscCall(VecGetOwnershipRange(metric,&vstart,&vend));
+  if(rstart!=vstart || rend!=vend) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,
+    "row-L1 rAU metric ownership does not match momentum matrix ownership");
+
+  PetscScalar *ma=nullptr;
+  PetscCall(VecGetArray(metric,&ma));
+  for(PetscInt row=rstart; row<rend; ++row) {
+    PetscInt ncols=0;
+    const PetscInt *cols=nullptr;
+    const PetscScalar *vals=nullptr;
+    PetscCall(MatGetRow(A,row,&ncols,&cols,&vals));
+    PetscReal l1=0.0;
+    for(PetscInt k=0;k<ncols;++k) l1 += PetscAbsScalar(vals[k]);
+    PetscCall(MatRestoreRow(A,row,&ncols,&cols,&vals));
+    ma[row-rstart]=(PetscScalar)l1;
+  }
+  PetscCall(VecRestoreArray(metric,&ma));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+struct SimplecMetricStats {
+  PetscReal rawMin=0.0, rawMax=0.0;
+  PetscReal blendedMin=0.0, blendedMax=0.0;
+  PetscReal ratioMin=0.0, ratioMax=0.0;
+  PetscInt nonPositiveRows=0, belowFloorRows=0, fallbackRows=0;
+};
+
+// Build the SIMPLEC correction denominator from the relaxed momentum matrix.
+// In matrix sign convention the standard FV denominator a_P - sum(a_nb)
+// becomes A_PP + sum_{N!=P} A_PN, i.e. the signed row sum A_r * 1.
+// simplecBlend=1 gives full SIMPLEC; 0 recovers diagonal SIMPLE.  A positive
+// floor/fallback is retained because CG requires the Schur metric rAU to stay
+// positive even on strongly convective / constrained FE rows.
+static PetscErrorCode buildSimplecMetric(Mat Ar, Vec relaxedDiag, Vec ones,
+  PetscReal simplecBlend, PetscReal floorFraction, const std::string& fallback,
+  Vec metric, SimplecMetricStats& stats) {
+  PetscFunctionBeginUser;
+  if(simplecBlend<0.0 || simplecBlend>1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_blend must satisfy 0 <= blend <= 1");
+  if(floorFraction<0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_floor_fraction must be >= 0");
+  if(fallback!="diag" && fallback!="floor" && fallback!="error")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_fallback must be diag, floor, or error");
+
+  // metric <- signed row sum(Ar)
+  PetscCall(MatMult(Ar,ones,metric));
+
+  PetscInt mstart=0,mend=0,dstart=0,dend=0;
+  PetscCall(VecGetOwnershipRange(metric,&mstart,&mend));
+  PetscCall(VecGetOwnershipRange(relaxedDiag,&dstart,&dend));
+  if(mstart!=dstart || mend!=dend)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"SIMPLEC metric/diagonal ownership mismatch");
+
+  PetscScalar *ma=nullptr;
+  const PetscScalar *da=nullptr;
+  PetscCall(VecGetArray(metric,&ma));
+  PetscCall(VecGetArrayRead(relaxedDiag,&da));
+
+  PetscReal rawMinLocal=PETSC_MAX_REAL,rawMaxLocal=-PETSC_MAX_REAL;
+  PetscReal blendMinLocal=PETSC_MAX_REAL,blendMaxLocal=-PETSC_MAX_REAL;
+  PetscReal ratioMinLocal=PETSC_MAX_REAL,ratioMaxLocal=-PETSC_MAX_REAL;
+  PetscInt nonPositiveLocal=0,belowFloorLocal=0,fallbackLocal=0;
+  PetscBool hardError=PETSC_FALSE;
+
+  for(PetscInt i=0;i<mend-mstart;++i) {
+    const PetscReal raw=PetscRealPart(ma[i]);
+    const PetscReal d=PetscRealPart(da[i]);
+    if(!(d>0.0) || PetscIsInfOrNanReal(d)) {
+      hardError=PETSC_TRUE;
+      continue;
+    }
+    const PetscReal blended=(1.0-simplecBlend)*d + simplecBlend*raw;
+    const PetscReal threshold=floorFraction*d;
+    const PetscReal ratio=raw/d;
+    rawMinLocal=PetscMin(rawMinLocal,raw); rawMaxLocal=PetscMax(rawMaxLocal,raw);
+    blendMinLocal=PetscMin(blendMinLocal,blended); blendMaxLocal=PetscMax(blendMaxLocal,blended);
+    ratioMinLocal=PetscMin(ratioMinLocal,ratio); ratioMaxLocal=PetscMax(ratioMaxLocal,ratio);
+    if(raw<=0.0) ++nonPositiveLocal;
+    if(blended<=threshold) ++belowFloorLocal;
+
+    PetscReal use=blended;
+    if(blended<=threshold || PetscIsInfOrNanReal(blended)) {
+      if(fallback=="error") {
+        hardError=PETSC_TRUE;
+      } else if(fallback=="diag") {
+        use=d;
+        ++fallbackLocal;
+      } else {
+        use=PetscMax(threshold,std::numeric_limits<PetscReal>::min());
+        ++fallbackLocal;
+      }
+    }
+    ma[i]=(PetscScalar)use;
+  }
+
+  PetscCall(VecRestoreArrayRead(relaxedDiag,&da));
+  PetscCall(VecRestoreArray(metric,&ma));
+
+  PetscInt hardLocal=hardError?1:0,hardGlobal=0;
+  PetscCallMPI(MPI_Allreduce(&hardLocal,&hardGlobal,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+  if(hardGlobal) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,
+    "SIMPLEC produced a non-positive/invalid correction denominator; adjust -alpha_u, -simplec_blend, -simplec_floor_fraction, or -simplec_fallback");
+
+  PetscCallMPI(MPI_Allreduce(&rawMinLocal,&stats.rawMin,1,MPIU_REAL,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&rawMaxLocal,&stats.rawMax,1,MPIU_REAL,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&blendMinLocal,&stats.blendedMin,1,MPIU_REAL,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&blendMaxLocal,&stats.blendedMax,1,MPIU_REAL,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&ratioMinLocal,&stats.ratioMin,1,MPIU_REAL,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&ratioMaxLocal,&stats.ratioMax,1,MPIU_REAL,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&nonPositiveLocal,&stats.nonPositiveRows,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&belowFloorLocal,&stats.belowFloorRows,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&fallbackLocal,&stats.fallbackRows,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+} // namespace
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 3: P0 pressure-mass inverse, SHADOW ONLY.
+//
+// The live pressure solve remains Gate-1 PETSc FGMRES + the existing native-face
+// GAMG preconditioner.  The Gate-3 shell applies only
+//
+//      y = M_p^{-1} x,       M_p = diag(cell volume)
+//
+// on the identical pressure RHS.  It immediately reconstructs M_p y and checks
+// M_p(M_p^{-1}x)=x to roundoff.  No Kp, Fp, pressure BC or live-PC change exists
+// in this gate.
+// -----------------------------------------------------------------------------
+struct Gate3MpShellCtx {
+  Vec volumes=nullptr;        // borrowed; owned by Discrete
+  Vec workIn=nullptr;
+  Vec workBack=nullptr;
+  Vec workDiff=nullptr;
+  PetscInt setupCount=0;
+  PetscInt applyCount=0;
+  PetscReal volumeMin=0.0;
+  PetscReal volumeMax=0.0;
+  PetscReal invVolumeMin=0.0;
+  PetscReal invVolumeMax=0.0;
+  PetscReal lastAlgebraRel=0.0;
+  PetscReal maxAlgebraRel=0.0;
+};
+
+static PetscErrorCode gate3MpShellSetUp(PC pc) {
+  Gate3MpShellCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-3 PCShell context is null");
+  if(!ctx->volumes) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-3 P0 mass vector is null");
+  if(!ctx->workIn || !ctx->workBack || !ctx->workDiff) {
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->workIn));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->workBack));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->workDiff));
+  }
+  PetscInt n=0,nloc=0,nv=0,nvloc=0;
+  PetscCall(VecGetSize(ctx->workIn,&n));
+  PetscCall(VecGetLocalSize(ctx->workIn,&nloc));
+  PetscCall(VecGetSize(ctx->volumes,&nv));
+  PetscCall(VecGetLocalSize(ctx->volumes,&nvloc));
+  if(n!=nv || nloc!=nvloc) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_SIZ,"Gate-3 pressure/mass vector layout mismatch");
+  PetscInt imin=-1,imax=-1;
+  PetscCall(VecMin(ctx->volumes,&imin,&ctx->volumeMin));
+  PetscCall(VecMax(ctx->volumes,&imax,&ctx->volumeMax));
+  if(!(ctx->volumeMin>0.0) || !std::isfinite((double)ctx->volumeMin) || !std::isfinite((double)ctx->volumeMax))
+    SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_FP,"Gate-3 P0 mass has non-positive or non-finite cell volume");
+  ctx->invVolumeMin=1.0/ctx->volumeMax;
+  ctx->invVolumeMax=1.0/ctx->volumeMin;
+  ++ctx->setupCount;
+  PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+    "P1BF3_GATE3_MP_SETUP setupCount=%" PetscInt_FMT " globalSize=%" PetscInt_FMT " localSizeRank0=%" PetscInt_FMT " volumeMin=%.12e volumeMax=%.12e invVolumeMin=%.12e invVolumeMax=%.12e mass=P0_cell_volume_diagonal action=Mp_inverse_shadow_only livePressurePC=UNCHANGED_GAMG\n",
+    ctx->setupCount,n,nloc,(double)ctx->volumeMin,(double)ctx->volumeMax,(double)ctx->invVolumeMin,(double)ctx->invVolumeMax));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate3MpShellApply(PC pc,Vec x,Vec y) {
+  Gate3MpShellCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-3 PCShell context is null");
+  if(!ctx->workIn || !ctx->workBack || !ctx->workDiff) PetscCall(gate3MpShellSetUp(pc));
+
+  // P0 pressure basis is one constant per tetrahedron, so the consistent pressure
+  // mass is exactly diagonal with M_p(c,c)=|K_c|.  No lumping approximation is
+  // being introduced here.
+  PetscCall(VecCopy(x,ctx->workIn));
+  PetscCall(VecPointwiseDivide(y,ctx->workIn,ctx->volumes));
+
+  // Independent algebra check: M_p * (M_p^{-1} x) == x.
+  PetscCall(VecPointwiseMult(ctx->workBack,y,ctx->volumes));
+  PetscCall(VecCopy(ctx->workBack,ctx->workDiff));
+  PetscCall(VecAXPY(ctx->workDiff,-1.0,x));
+  PetscReal dn=0.0,xn=0.0;
+  PetscCall(VecNorm(ctx->workDiff,NORM_2,&dn));
+  PetscCall(VecNorm(x,NORM_2,&xn));
+  const PetscReal rel=dn/PetscMax(xn,(PetscReal)1e-300);
+  ctx->lastAlgebraRel=rel;
+  ctx->maxAlgebraRel=PetscMax(ctx->maxAlgebraRel,rel);
+  ++ctx->applyCount;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate3MpShellDestroy(PC pc) {
+  Gate3MpShellCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(ctx) {
+    PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE3_MP_DESTROY setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " maxAlgebraRel=%.3e volumeMin=%.12e volumeMax=%.12e\n",
+      ctx->setupCount,ctx->applyCount,(double)ctx->maxAlgebraRel,(double)ctx->volumeMin,(double)ctx->volumeMax));
+    PetscCall(VecDestroy(&ctx->workIn));
+    PetscCall(VecDestroy(&ctx->workBack));
+    PetscCall(VecDestroy(&ctx->workDiff));
+    ctx->volumes=nullptr;
+    delete ctx;
+    PetscCall(PCShellSetContext(pc,nullptr));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 4: geometric compact pressure Laplacian K_p, SHADOW/SETUP ONLY.
+// Internal coefficient is the proven P21 geometric FV coefficient
+//   a_f = |S_f|^2 / |S_f . (x_N-x_P)| = |S_f|/h_n.
+// Pipe pressure-space BCs in Kp: inlet/wall homogeneous Neumann, outlet p=0.
+// No pressure nullspace is attached because the outlet Dirichlet rows anchor Kp.
+// Kp is NOT attached to the live pressure solve in this gate.
+// -----------------------------------------------------------------------------
+struct Gate4KpCtx {
+  Mat Kp=nullptr;
+  Vec ones=nullptr,kpOnes=nullptr,test=nullptr,kpTest=nullptr,diag=nullptr;
+  PetscInt globalSize=0,localSize=0,nnz=0,expectedNnz=0;
+  PetscInt internalFaces=0,inletFaces=0,wallFaces=0,outletFaces=0;
+  PetscReal coeffMin=PETSC_MAX_REAL,coeffMax=0.0;
+  PetscReal outletCoeffMin=PETSC_MAX_REAL,outletCoeffMax=0.0;
+  PetscReal diagMin=0.0,diagMax=0.0;
+  PetscReal constantActionNorm=0.0,constantActionMin=0.0,constantActionMax=0.0;
+  PetscReal testNorm=0.0,testEnergy=0.0,symmetryTol=1e-13;
+  PetscBool symmetric=PETSC_FALSE,built=PETSC_FALSE;
+};
+
+static Vec3 gate4FaceCentre(const Mesh& M,PetscInt f) {
+  Vec3 q{}; const auto& F=M.faces[(std::size_t)f];
+  if(F.v.empty()) throw std::runtime_error("Gate-4 Kp encountered empty face");
+  for(PetscInt v:F.v) { const auto& x=M.points[(std::size_t)v]; q.x+=x.x; q.y+=x.y; q.z+=x.z; }
+  const double z=1.0/(double)F.v.size(); return {q.x*z,q.y*z,q.z*z};
+}
+
+static Vec3 gate4FaceAreaVector(const Mesh& M,PetscInt f) {
+  const auto& F=M.faces[(std::size_t)f];
+  if(F.v.size()!=3) throw std::runtime_error("Gate-4 Kp requires triangular tetrahedral faces");
+  const Vec3& x0=M.points[(std::size_t)F.v[0]];
+  const Vec3& x1=M.points[(std::size_t)F.v[1]];
+  const Vec3& x2=M.points[(std::size_t)F.v[2]];
+  const Vec3 cr=cross3(sub3(x1,x0),sub3(x2,x0));
+  return {0.5*cr.x,0.5*cr.y,0.5*cr.z};
+}
+
+static double gate4GeomCoeff(const Vec3& S,const Vec3& d) {
+  const double s2=S.x*S.x+S.y*S.y+S.z*S.z;
+  const double sd=std::abs(S.x*d.x+S.y*d.y+S.z*d.z);
+  if(!(s2>0.0) || !(sd>1.0e-30) || !std::isfinite(s2) || !std::isfinite(sd))
+    throw std::runtime_error("Gate-4 geometric Kp encountered degenerate/nonorthogonal face metric");
+  const double a=s2/sd;
+  if(!(a>0.0) || !std::isfinite(a)) throw std::runtime_error("Gate-4 geometric Kp produced non-positive/non-finite coefficient");
+  return a;
+}
+
+
+// -----------------------------------------------------------------------------
+// Gate 9E: NGQI-style nodal-gradient auxiliary pressure Laplacian.
+//
+// 1) At each mesh vertex v, reconstruct grad(p)_v from a WIDE affine/P1 LSQ
+//    fit to surrounding cell-centred P0 values.  The first support is the direct
+//    vertex star plus all cells sharing any vertex with a star cell; if that is
+//    rank deficient, expand by one additional cell-node-neighbour layer.
+// 2) On a triangular face f, use the arithmetic mean of its three nodal
+//    gradients, exactly as in the accepted tet NGQI reconstruction lineage.
+// 3) Assemble the conservative raw FV/Gauss operator
+//       L_raw p |_K = - sum_f S_{Kf} . grad_f(p)
+//    on internal faces; inlet/wall fluxes are homogeneous Neumann and the
+//    outlet gets the same p=0 geometric anchor as Gate 4.
+// 4) L_raw is generally nonsymmetric.  PCG requires an SPD preconditioner, so
+//    the live Kp is the symmetric M-matrix projection of L_raw:
+//       s_ij = 0.5 (L_ij + L_ji),  w_ij=max(0,-s_ij),
+//       K_ij=-w_ij, K_ii=sum_j w_ij + outlet_anchor_i.
+//    This preserves the learned wide-stencil couplings that have Laplacian sign,
+//    guarantees a symmetric graph Laplacian plus the outlet anchor, and keeps
+//    the exact FE SIMPLE Schur completely unchanged.
+// -----------------------------------------------------------------------------
+struct Gate9eNodalKpAudit {
+  Mat raw=nullptr;
+  PetscInt rawNnz=0,kpNnz=0,nNodes=0;
+  PetscInt supportMin=PETSC_MAX_INT,supportMax=0;
+  PetscReal supportMean=0.0;
+  PetscReal lsqConstDefect=0.0,lsqLinearDefect=0.0;
+  PetscReal rawSymmetryDefect=0.0;
+  PetscInt keptNegativePairs=0,discardedPositivePairs=0;
+  PetscReal discardedPositiveAbs=0.0,keptNegativeAbs=0.0;
+};
+
+static bool gate9eInvert4(const double A[4][4],double AI[4][4]) {
+  double q[4][8]={{0}};
+  for(int i=0;i<4;++i) { for(int j=0;j<4;++j) q[i][j]=A[i][j]; q[i][4+i]=1.0; }
+  for(int k=0;k<4;++k) {
+    int piv=k; double best=std::abs(q[k][k]);
+    for(int i=k+1;i<4;++i) if(std::abs(q[i][k])>best) {best=std::abs(q[i][k]);piv=i;}
+    if(!(best>1e-14) || !std::isfinite(best)) return false;
+    if(piv!=k) for(int j=0;j<8;++j) std::swap(q[k][j],q[piv][j]);
+    const double d=q[k][k]; for(int j=0;j<8;++j) q[k][j]/=d;
+    for(int i=0;i<4;++i) if(i!=k) { const double a=q[i][k]; for(int j=0;j<8;++j) q[i][j]-=a*q[k][j]; }
+  }
+  for(int i=0;i<4;++i) for(int j=0;j<4;++j) AI[i][j]=q[i][4+j];
+  return true;
+}
+
+struct Gate9eNodeWeight { PetscInt cell=-1; Vec3 w{}; };
+
+static PetscErrorCode gate9eBuildNodalKp(const Mesh& M,const Discrete& D,const ProblemConfig& P,int rank,Gate4KpCtx& G4,Gate9eNodalKpAudit& A9) {
+  PetscFunctionBeginUser;
+  if(P.mode==ProblemMode::MMS) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9E nodal Kp currently targets pipe/flow BCs");
+  const PetscInt nc=(PetscInt)M.tets.size(),nv=(PetscInt)M.points.size(),ni=(PetscInt)M.neighbour.size();
+  const PetscInt nlp=D.cellCount[(std::size_t)rank];
+  PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[(std::size_t)r];
+  const auto cc=cellCentroids(M);
+
+  std::vector<std::vector<PetscInt>> vertexCells((std::size_t)nv);
+  for(PetscInt c=0;c<nc;++c) for(int a=0;a<4;++a) vertexCells[(std::size_t)M.tets[(std::size_t)c][a]].push_back(c);
+
+  std::vector<std::vector<Gate9eNodeWeight>> W((std::size_t)nv);
+  long long localSupportSum=0; PetscInt localSupportMin=PETSC_MAX_INT,localSupportMax=0;
+  double localConstDef=0.0,localLinDef=0.0;
+  for(PetscInt v=0;v<nv;++v) {
+    std::set<PetscInt> supp;
+    auto addCellNodeNeighbours=[&](const std::vector<PetscInt>& seed) {
+      for(PetscInt c:seed) {
+        supp.insert(c);
+        for(int a=0;a<4;++a) {
+          const PetscInt qv=M.tets[(std::size_t)c][a];
+          for(PetscInt q:vertexCells[(std::size_t)qv]) supp.insert(q);
+        }
+      }
+    };
+    addCellNodeNeighbours(vertexCells[(std::size_t)v]);
+    bool ok=false; double AI[4][4]={{0}},scale=1.0;
+    for(int attempt=0;attempt<2 && !ok;++attempt) {
+      if(attempt==1) { std::vector<PetscInt> seed(supp.begin(),supp.end()); addCellNodeNeighbours(seed); }
+      scale=0.0; for(PetscInt c:supp) scale=std::max(scale,norm3(sub3(cc[(std::size_t)c],M.points[(std::size_t)v])));
+      scale=std::max(scale,1e-30);
+      double H[4][4]={{0}};
+      for(PetscInt c:supp) {
+        const Vec3 d=scale3(sub3(cc[(std::size_t)c],M.points[(std::size_t)v]),1.0/scale);
+        const double a[4]={1.0,d.x,d.y,d.z};
+        for(int i=0;i<4;++i) for(int j=0;j<4;++j) H[i][j]+=a[i]*a[j];
+      }
+      ok=gate9eInvert4(H,AI);
+    }
+    if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9E nodal affine LSQ remained rank deficient after support expansion");
+    auto& wv=W[(std::size_t)v]; wv.reserve(supp.size());
+    Vec3 sumW{},linX{},linY{},linZ{};
+    for(PetscInt c:supp) {
+      const Vec3 d=scale3(sub3(cc[(std::size_t)c],M.points[(std::size_t)v]),1.0/scale);
+      const double a[4]={1.0,d.x,d.y,d.z};
+      Vec3 w{};
+      for(int j=0;j<4;++j) { w.x+=AI[1][j]*a[j]/scale; w.y+=AI[2][j]*a[j]/scale; w.z+=AI[3][j]*a[j]/scale; }
+      wv.push_back({c,w}); sumW=add3(sumW,w);
+      const Vec3 dr=sub3(cc[(std::size_t)c],M.points[(std::size_t)v]);
+      linX=add3(linX,scale3(w,dr.x)); linY=add3(linY,scale3(w,dr.y)); linZ=add3(linZ,scale3(w,dr.z));
+    }
+    const double cdef=norm3(sumW);
+    const double ldef=std::max({std::abs(linX.x-1.0),std::abs(linX.y),std::abs(linX.z),
+                                std::abs(linY.x),std::abs(linY.y-1.0),std::abs(linY.z),
+                                std::abs(linZ.x),std::abs(linZ.y),std::abs(linZ.z-1.0)});
+    localConstDef=std::max(localConstDef,cdef); localLinDef=std::max(localLinDef,ldef);
+    const PetscInt ns=(PetscInt)supp.size(); localSupportMin=std::min(localSupportMin,ns); localSupportMax=std::max(localSupportMax,ns); localSupportSum+=ns;
+  }
+  A9.nNodes=nv;
+  double gSupportSum=0.0,gConstDef=0.0,gLinDef=0.0; PetscInt gMin=0,gMax=0;
+  const double ls=(double)localSupportSum;
+  PetscCallMPI(MPI_Allreduce(&ls,&gSupportSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localSupportMin,&gMin,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localSupportMax,&gMax,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localConstDef,&gConstDef,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localLinDef,&gLinDef,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  // Mesh is replicated, so every rank sees every node; divide support sum by nranks below.
+  int nranks=1; PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD,&nranks));
+  A9.supportMin=gMin; A9.supportMax=gMax; A9.supportMean=(PetscReal)(gSupportSum/((double)nranks*(double)PetscMax(nv,(PetscInt)1)));
+  A9.lsqConstDefect=(PetscReal)gConstDef; A9.lsqLinearDefect=(PetscReal)gLinDef;
+
+  // Conservative raw Gauss FV Laplacian from face-averaged nodal gradients.
+  PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,32,nullptr,32,nullptr,&A9.raw));
+  PetscCall(MatSetOption(A9.raw,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_FALSE));
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt row=D.pGid[(std::size_t)K];
+    std::map<PetscInt,double> rv;
+    for(int lf=0;lf<4;++lf) {
+      const PetscInt f=M.oppFace[(std::size_t)K][lf];
+      if(f<ni) {
+        Vec3 Sout=gate4FaceAreaVector(M,f);
+        const Vec3 fc=gate4FaceCentre(M,f);
+        if(Sout.x*(fc.x-cc[(std::size_t)K].x)+Sout.y*(fc.y-cc[(std::size_t)K].y)+Sout.z*(fc.z-cc[(std::size_t)K].z)<0.0) Sout=scale3(Sout,-1.0);
+        const auto& F=M.faces[(std::size_t)f];
+        for(PetscInt v:F.v) for(const auto& wc:W[(std::size_t)v]) {
+          const double q=-(Sout.x*wc.w.x+Sout.y*wc.w.y+Sout.z*wc.w.z)/3.0;
+          rv[D.pGid[(std::size_t)wc.cell]] += q;
+        }
+      } else {
+        const int pi=M.facePatch[(std::size_t)f];
+        if(pi==P.boundary.outlet) {
+          const double a=gate4GeomCoeff(gate4FaceAreaVector(M,f),sub3(gate4FaceCentre(M,f),cc[(std::size_t)K]));
+          rv[row]+=a;
+        } else if(pi==P.boundary.inlet || isWallPatch(P.boundary,pi)) {
+          // homogeneous Neumann: no flux
+        } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9E encountered unclassified pressure boundary face");
+      }
+    }
+    std::vector<PetscInt> cols; std::vector<PetscScalar> vals; cols.reserve(rv.size());vals.reserve(rv.size());
+    for(const auto& kv:rv) if(std::abs(kv.second)>1e-18) {cols.push_back(kv.first);vals.push_back((PetscScalar)kv.second);}
+    if(!cols.empty()) PetscCall(MatSetValues(A9.raw,1,&row,(PetscInt)cols.size(),cols.data(),vals.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(A9.raw,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(A9.raw,MAT_FINAL_ASSEMBLY));
+  MatInfo rawInfo{}; PetscCall(MatGetInfo(A9.raw,MAT_GLOBAL_SUM,&rawInfo)); A9.rawNnz=(PetscInt)(rawInfo.nz_used+0.5);
+  Mat RT=nullptr,SYM=nullptr; PetscCall(MatTranspose(A9.raw,MAT_INITIAL_MATRIX,&RT)); PetscCall(MatDuplicate(A9.raw,MAT_COPY_VALUES,&SYM));
+  PetscCall(MatAXPY(SYM,1.0,RT,DIFFERENT_NONZERO_PATTERN)); PetscCall(MatScale(SYM,0.5)); PetscCall(MatDestroy(&RT));
+  Mat rawDiff=nullptr; PetscCall(MatDuplicate(A9.raw,MAT_COPY_VALUES,&rawDiff)); Mat RT2=nullptr; PetscCall(MatTranspose(A9.raw,MAT_INITIAL_MATRIX,&RT2)); PetscCall(MatAXPY(rawDiff,-1.0,RT2,DIFFERENT_NONZERO_PATTERN));
+  PetscReal rawNorm=0.0,diffNorm=0.0; PetscCall(MatNorm(A9.raw,NORM_FROBENIUS,&rawNorm)); PetscCall(MatNorm(rawDiff,NORM_FROBENIUS,&diffNorm));
+  A9.rawSymmetryDefect=(PetscReal)(diffNorm/std::max((double)rawNorm,1e-300)); PetscCall(MatDestroy(&rawDiff)); PetscCall(MatDestroy(&RT2));
+
+  // Symmetric M-matrix projection for PCG/GAMG.
+  PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,32,nullptr,32,nullptr,&G4.Kp));
+  PetscCall(MatSetOption(G4.Kp,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_FALSE)); PetscCall(MatSetOption(G4.Kp,MAT_SYMMETRIC,PETSC_TRUE));
+  PetscInt localKeep=0,localDiscard=0; double localKeepAbs=0.0,localDiscardAbs=0.0;
+  for(PetscInt row=pStart;row<pStart+nlp;++row) {
+    const PetscInt *cols=nullptr; const PetscScalar *vals=nullptr; PetscInt ncols=0;
+    PetscCall(MatGetRow(SYM,row,&ncols,&cols,&vals));
+    std::vector<PetscInt> outC; std::vector<PetscScalar> outV; double diag=0.0;
+    for(PetscInt j=0;j<ncols;++j) if(cols[j]!=row) {
+      const double sij=PetscRealPart(vals[j]);
+      if(sij<0.0) { const double w=-sij; outC.push_back(cols[j]); outV.push_back((PetscScalar)(-w)); diag+=w; ++localKeep; localKeepAbs+=w; }
+      else if(sij>1e-18) { ++localDiscard; localDiscardAbs+=sij; }
+    }
+    PetscCall(MatRestoreRow(SYM,row,&ncols,&cols,&vals));
+    // Preserve physical outlet p=0 anchoring explicitly.
+    PetscInt K=-1; for(PetscInt c=0;c<nc;++c) if(D.pGid[(std::size_t)c]==row) {K=c;break;}
+    if(K<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9E pressure gid->cell lookup failed");
+    for(int lf=0;lf<4;++lf) { const PetscInt f=M.oppFace[(std::size_t)K][lf]; if(f>=ni && M.facePatch[(std::size_t)f]==P.boundary.outlet) diag+=gate4GeomCoeff(gate4FaceAreaVector(M,f),sub3(gate4FaceCentre(M,f),cc[(std::size_t)K])); }
+    outC.push_back(row); outV.push_back((PetscScalar)diag);
+    PetscCall(MatSetValues(G4.Kp,1,&row,(PetscInt)outC.size(),outC.data(),outV.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(G4.Kp,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(G4.Kp,MAT_FINAL_ASSEMBLY)); PetscCall(MatDestroy(&SYM));
+  PetscCallMPI(MPI_Allreduce(&localKeep,&A9.keptNegativePairs,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localDiscard,&A9.discardedPositivePairs,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localKeepAbs,&A9.keptNegativeAbs,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localDiscardAbs,&A9.discardedPositiveAbs,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+
+  G4.globalSize=nc; G4.localSize=nlp; G4.internalFaces=ni; G4.inletFaces=0; G4.wallFaces=0; G4.outletFaces=0; G4.expectedNnz=0;
+  for(PetscInt f=ni;f<(PetscInt)M.faces.size();++f) { const int pi=M.facePatch[(std::size_t)f]; if(pi==P.boundary.inlet)++G4.inletFaces; else if(pi==P.boundary.outlet)++G4.outletFaces; else if(isWallPatch(P.boundary,pi))++G4.wallFaces; }
+  MatInfo info{}; PetscCall(MatGetInfo(G4.Kp,MAT_GLOBAL_SUM,&info)); G4.nnz=(PetscInt)(info.nz_used+0.5); A9.kpNnz=G4.nnz;
+  G4.expectedNnz=G4.nnz; G4.coeffMin=1.0; G4.coeffMax=1.0;
+  PetscCall(MatIsSymmetric(G4.Kp,1e-12,&G4.symmetric)); G4.symmetryTol=1e-12;
+  PetscCall(MatCreateVecs(G4.Kp,&G4.ones,&G4.kpOnes)); PetscCall(VecDuplicate(G4.ones,&G4.test)); PetscCall(VecDuplicate(G4.ones,&G4.kpTest)); PetscCall(VecDuplicate(G4.ones,&G4.diag));
+  PetscCall(VecSet(G4.ones,1.0)); PetscCall(MatMult(G4.Kp,G4.ones,G4.kpOnes)); PetscCall(VecNorm(G4.kpOnes,NORM_2,&G4.constantActionNorm)); PetscInt ii=-1; PetscCall(VecMin(G4.kpOnes,&ii,&G4.constantActionMin)); PetscCall(VecMax(G4.kpOnes,&ii,&G4.constantActionMax));
+  PetscCall(MatGetDiagonal(G4.Kp,G4.diag)); PetscCall(VecMin(G4.diag,&ii,&G4.diagMin)); PetscCall(VecMax(G4.diag,&ii,&G4.diagMax));
+  PetscInt xs=0,xe=0; PetscCall(VecGetOwnershipRange(G4.test,&xs,&xe)); PetscScalar *xa=nullptr; PetscCall(VecGetArray(G4.test,&xa)); for(PetscInt g=xs;g<xe;++g){const double z=(double)(g+1);xa[(std::size_t)(g-xs)]=(PetscScalar)(std::sin(.017*z)+.31*std::cos(.031*z));} PetscCall(VecRestoreArray(G4.test,&xa));
+  PetscCall(MatMult(G4.Kp,G4.test,G4.kpTest)); PetscScalar dot=0.0; PetscCall(VecDot(G4.test,G4.kpTest,&dot)); G4.testEnergy=(PetscReal)PetscRealPart(dot); PetscCall(VecNorm(G4.test,NORM_2,&G4.testNorm)); G4.built=PETSC_TRUE;
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE9E_NODAL_LSQ nodes=%" PetscInt_FMT " supportMin=%" PetscInt_FMT " supportMean=%.3f supportMax=%" PetscInt_FMT " constDefect=%.3e linearDefect=%.3e basis=affine_P1 wideSupport=pointCells_plus_cellNodeNeighbours runtimeUnknowns=cell_P0_only\n",
+    nv,A9.supportMin,(double)A9.supportMean,A9.supportMax,(double)A9.lsqConstDefect,(double)A9.lsqLinearDefect));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE9E_RAW_FV rows=%" PetscInt_FMT " nnz=%" PetscInt_FMT " avgNnzPerRow=%.3f faceGradient=mean_3_nodal_gradients cellGradient=mean_4_nodal_gradients_available rawSymmetryDefect=%.3e operator=-GaussDiv_faceNodalGradient outletAnchor=TPFA_p0 inletWall=Neumann\n",
+    nc,A9.rawNnz,(double)A9.rawNnz/(double)PetscMax(nc,(PetscInt)1),(double)A9.rawSymmetryDefect));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE9E_KP_PROJECTED rows=%" PetscInt_FMT " nnz=%" PetscInt_FMT " avgNnzPerRow=%.3f symmetric=%d diagMin=%.3e testEnergy=%.3e keptNegativeDirected=%" PetscInt_FMT " discardedPositiveDirected=%" PetscInt_FMT " discardedToKeptAbs=%.6e projection=symmetric_Mmatrix_of_raw_NGQI_FV purpose=PCG_GAMG\n",
+    nc,G4.nnz,(double)G4.nnz/(double)PetscMax(nc,(PetscInt)1),(int)G4.symmetric,(double)G4.diagMin,(double)G4.testEnergy,A9.keptNegativePairs,A9.discardedPositivePairs,(double)A9.discardedPositiveAbs/std::max((double)A9.keptNegativeAbs,1e-300)));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate4BuildKp(const Mesh& M,const Discrete& D,const ProblemConfig& P,int rank,Gate4KpCtx& G4) {
+  PetscFunctionBeginUser;
+  if(P.mode==ProblemMode::MMS) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-4 pipe Kp probe requires -problem pipe or flow");
+  const PetscInt nc=(PetscInt)M.tets.size(), ni=(PetscInt)M.neighbour.size();
+  const PetscInt nlp=D.cellCount[(std::size_t)rank];
+  PetscInt pStart=0; for(int r=0;r<rank;++r) pStart+=D.cellCount[(std::size_t)r];
+  const PetscInt pEnd=pStart+nlp;
+  G4.globalSize=nc; G4.localSize=nlp; G4.expectedNnz=nc+2*ni;
+
+  std::vector<PetscInt> dnnz((std::size_t)nlp,1),onnz((std::size_t)nlp,0);
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt lr=D.pGid[(std::size_t)K]-pStart;
+    if(lr<0 || lr>=nlp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-4 pressure ownership mismatch during Kp preallocation");
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i]; if(f>=ni) continue;
+      const PetscInt L=(M.owner[(std::size_t)f]==K)?M.neighbour[(std::size_t)f]:M.owner[(std::size_t)f];
+      const PetscInt pg=D.pGid[(std::size_t)L];
+      if(pg>=pStart && pg<pEnd) ++dnnz[(std::size_t)lr]; else ++onnz[(std::size_t)lr];
+    }
+  }
+  PetscCall(MatCreateAIJ(PETSC_COMM_WORLD,nlp,nlp,nc,nc,0,dnnz.data(),0,onnz.data(),&G4.Kp));
+  PetscCall(MatSetOption(G4.Kp,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
+  PetscCall(MatSetOption(G4.Kp,MAT_SYMMETRIC,PETSC_TRUE));
+
+  const auto cc=cellCentroids(M);
+  PetscInt localDirectedInternal=0,localInlet=0,localWall=0,localOutlet=0;
+  double localCoeffMin=PETSC_MAX_REAL,localCoeffMax=0.0,localOutMin=PETSC_MAX_REAL,localOutMax=0.0;
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt row=D.pGid[(std::size_t)K];
+    double diagK=0.0;
+    std::array<PetscInt,5> cols{}; std::array<PetscScalar,5> vals{};
+    PetscInt ncol=1; cols[0]=row; vals[0]=0.0;
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i];
+      const Vec3 S=gate4FaceAreaVector(M,f);
+      if(f<ni) {
+        const PetscInt L=(M.owner[(std::size_t)f]==K)?M.neighbour[(std::size_t)f]:M.owner[(std::size_t)f];
+        const double a=gate4GeomCoeff(S,sub3(cc[(std::size_t)L],cc[(std::size_t)K]));
+        diagK+=a; cols[(std::size_t)ncol]=D.pGid[(std::size_t)L]; vals[(std::size_t)ncol]=(PetscScalar)(-a); ++ncol;
+        ++localDirectedInternal; localCoeffMin=std::min(localCoeffMin,a); localCoeffMax=std::max(localCoeffMax,a);
+      } else {
+        const int pi=M.facePatch[(std::size_t)f];
+        if(pi==P.boundary.outlet) {
+          const double a=gate4GeomCoeff(S,sub3(gate4FaceCentre(M,f),cc[(std::size_t)K]));
+          diagK+=a; ++localOutlet; localOutMin=std::min(localOutMin,a); localOutMax=std::max(localOutMax,a);
+          localCoeffMin=std::min(localCoeffMin,a); localCoeffMax=std::max(localCoeffMax,a);
+        } else if(pi==P.boundary.inlet) ++localInlet;
+        else if(isWallPatch(P.boundary,pi)) ++localWall;
+        else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-4 Kp encountered unclassified pressure boundary face");
+      }
+    }
+    vals[0]=(PetscScalar)diagK;
+    if(!(diagK>0.0) || !std::isfinite(diagK)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-4 Kp row has non-positive/non-finite diagonal");
+    PetscCall(MatSetValues(G4.Kp,1,&row,ncol,cols.data(),vals.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(G4.Kp,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(G4.Kp,MAT_FINAL_ASSEMBLY));
+
+  PetscInt globalDirectedInternal=0;
+  PetscCallMPI(MPI_Allreduce(&localDirectedInternal,&globalDirectedInternal,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localInlet,&G4.inletFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWall,&G4.wallFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutlet,&G4.outletFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  if(globalDirectedInternal%2) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-4 Kp directed internal-face count is odd");
+  G4.internalFaces=globalDirectedInternal/2;
+  double gCoeffMin=0.0,gCoeffMax=0.0,gOutMin=0.0,gOutMax=0.0;
+  PetscCallMPI(MPI_Allreduce(&localCoeffMin,&gCoeffMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localCoeffMax,&gCoeffMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutMin,&gOutMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutMax,&gOutMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  G4.coeffMin=(PetscReal)gCoeffMin; G4.coeffMax=(PetscReal)gCoeffMax; G4.outletCoeffMin=(PetscReal)gOutMin; G4.outletCoeffMax=(PetscReal)gOutMax;
+
+  MatInfo info{}; PetscCall(MatGetInfo(G4.Kp,MAT_GLOBAL_SUM,&info)); G4.nnz=(PetscInt)(info.nz_used+0.5);
+  PetscCall(MatIsSymmetric(G4.Kp,G4.symmetryTol,&G4.symmetric));
+  PetscCall(MatCreateVecs(G4.Kp,&G4.ones,&G4.kpOnes)); PetscCall(VecDuplicate(G4.ones,&G4.test));
+  PetscCall(VecDuplicate(G4.ones,&G4.kpTest)); PetscCall(VecDuplicate(G4.ones,&G4.diag));
+  PetscCall(VecSet(G4.ones,1.0)); PetscCall(MatMult(G4.Kp,G4.ones,G4.kpOnes)); PetscCall(VecNorm(G4.kpOnes,NORM_2,&G4.constantActionNorm));
+  PetscInt imin=-1,imax=-1; PetscCall(VecMin(G4.kpOnes,&imin,&G4.constantActionMin)); PetscCall(VecMax(G4.kpOnes,&imax,&G4.constantActionMax));
+  PetscCall(MatGetDiagonal(G4.Kp,G4.diag)); PetscCall(VecMin(G4.diag,&imin,&G4.diagMin)); PetscCall(VecMax(G4.diag,&imax,&G4.diagMax));
+
+  PetscInt xs=0,xe=0; PetscCall(VecGetOwnershipRange(G4.test,&xs,&xe)); PetscScalar *xa=nullptr; PetscCall(VecGetArray(G4.test,&xa));
+  for(PetscInt g=xs;g<xe;++g) { const double gd=(double)(g+1); xa[(std::size_t)(g-xs)]=(PetscScalar)(std::sin(0.017*gd)+0.31*std::cos(0.031*gd)); }
+  PetscCall(VecRestoreArray(G4.test,&xa)); PetscCall(MatMult(G4.Kp,G4.test,G4.kpTest));
+  PetscScalar dot=0.0; PetscCall(VecDot(G4.test,G4.kpTest,&dot)); G4.testEnergy=(PetscReal)PetscRealPart(dot); PetscCall(VecNorm(G4.test,NORM_2,&G4.testNorm));
+  G4.built=PETSC_TRUE;
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE4_KP_SETUP rows=%" PetscInt_FMT " localRowsRank0=%" PetscInt_FMT " nnz=%" PetscInt_FMT " expectedNnz=%" PetscInt_FMT " avgNnzPerRow=%.6f internalFaces=%" PetscInt_FMT " inletFaces=%" PetscInt_FMT " wallFaces=%" PetscInt_FMT " outletFaces=%" PetscInt_FMT " coeffMin=%.12e coeffMax=%.12e outletCoeffMin=%.12e outletCoeffMax=%.12e source=geometric_FV_laplacian_area2_over_absSdotd\n",
+    G4.globalSize,G4.localSize,G4.nnz,G4.expectedNnz,(double)G4.nnz/(double)PetscMax(G4.globalSize,(PetscInt)1),G4.internalFaces,G4.inletFaces,G4.wallFaces,G4.outletFaces,(double)G4.coeffMin,(double)G4.coeffMax,(double)G4.outletCoeffMin,(double)G4.outletCoeffMax));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE4_KP_BC inlet=homogeneous_Neumann wall=homogeneous_Neumann outlet=homogeneous_Dirichlet_p0 pressureNullspace=OFF outletAnchorFaces=%" PetscInt_FMT " constantActionNorm=%.12e constantActionMin=%.12e constantActionMax=%.12e\n",
+    G4.outletFaces,(double)G4.constantActionNorm,(double)G4.constantActionMin,(double)G4.constantActionMax));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE4_KP_AUDIT symmetric=%d symmetryTol=%.3e diagMin=%.12e diagMax=%.12e testNorm=%.12e testEnergy=%.12e liveSolveTouched=0 GAMG=NOT_ATTACHED_YET Fp=NONE\n",
+    (int)G4.symmetric,(double)G4.symmetryTol,(double)G4.diagMin,(double)G4.diagMax,(double)G4.testNorm,(double)G4.testEnergy));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 5: standalone Kp^{-1} probe with PETSc CG+GAMG.
+// SHADOW ONLY.  G4.test is manufactured p_* and G4.kpTest=Kp*p_*.
+// After the tight CG+GAMG solve, reuse the SAME GAMG PC directly for four
+// residual-correction V-cycles.  That no-outer-Krylov sequence is diagnostic
+// only in Gate 5; it does not alter the live SIMPLE pressure solve.
+// -----------------------------------------------------------------------------
+struct Gate5KpGamgStats {
+  PetscBool ran=PETSC_FALSE,cgPass=PETSC_FALSE,cyclesFinite=PETSC_FALSE;
+  PetscInt cgIts=0;
+  KSPConvergedReason reason=KSP_CONVERGED_ITERATING;
+  PetscReal trueRel=PETSC_MAX_REAL,solutionRel=PETSC_MAX_REAL;
+  PetscReal cycleRel[4]={PETSC_MAX_REAL,PETSC_MAX_REAL,PETSC_MAX_REAL,PETSC_MAX_REAL};
+  PetscReal setupSeconds=0.0,solveSeconds=0.0;
+};
+
+static PetscErrorCode gate5StandaloneKpGamg(Gate4KpCtx& G4,Gate5KpGamgStats& G5) {
+  PetscFunctionBeginUser;
+  if(!G4.built || !G4.Kp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-5 requires validated Gate-4 Kp");
+  KSP ksp=nullptr; PC pc=nullptr;
+  Vec sol=nullptr,diff=nullptr,res=nullptr,kpSol=nullptr,cycleX=nullptr,cycleR=nullptr,cycleZ=nullptr;
+  PetscLogDouble t0=0,t1=0;
+  PetscCall(VecDuplicate(G4.test,&sol)); PetscCall(VecDuplicate(G4.test,&diff));
+  PetscCall(VecDuplicate(G4.test,&res)); PetscCall(VecDuplicate(G4.test,&kpSol));
+  PetscCall(VecDuplicate(G4.test,&cycleX)); PetscCall(VecDuplicate(G4.test,&cycleR)); PetscCall(VecDuplicate(G4.test,&cycleZ));
+  PetscCall(VecSet(sol,0.0));
+
+  PetscCall(KSPCreate(PETSC_COMM_WORLD,&ksp));
+  PetscCall(KSPSetOptionsPrefix(ksp,"gate5_kp_"));
+  PetscCall(KSPSetOperators(ksp,G4.Kp,G4.Kp));
+  PetscCall(KSPSetType(ksp,KSPCG));
+  PetscCall(KSPSetTolerances(ksp,1.0e-10,0.0,PETSC_DEFAULT,200));
+  PetscCall(KSPGetPC(ksp,&pc)); PetscCall(PCSetType(pc,PCGAMG));
+  PetscCall(KSPSetFromOptions(ksp));
+  PetscCall(PetscTime(&t0)); PetscCall(KSPSetUp(ksp)); PetscCall(PetscTime(&t1)); G5.setupSeconds=(PetscReal)(t1-t0);
+
+  PetscCall(PetscTime(&t0)); PetscCall(KSPSolve(ksp,G4.kpTest,sol)); PetscCall(PetscTime(&t1)); G5.solveSeconds=(PetscReal)(t1-t0);
+  PetscCall(KSPGetIterationNumber(ksp,&G5.cgIts)); PetscCall(KSPGetConvergedReason(ksp,&G5.reason));
+  PetscCall(MatMult(G4.Kp,sol,kpSol)); PetscCall(VecWAXPY(res,-1.0,kpSol,G4.kpTest));
+  PetscReal bnorm=0.0,rnorm=0.0,xnorm=0.0,dnorm=0.0;
+  PetscCall(VecNorm(G4.kpTest,NORM_2,&bnorm)); PetscCall(VecNorm(res,NORM_2,&rnorm));
+  PetscCall(VecWAXPY(diff,-1.0,G4.test,sol)); PetscCall(VecNorm(G4.test,NORM_2,&xnorm)); PetscCall(VecNorm(diff,NORM_2,&dnorm));
+  G5.trueRel=rnorm/PetscMax(bnorm,(PetscReal)1.0e-300);
+  G5.solutionRel=dnorm/PetscMax(xnorm,(PetscReal)1.0e-300);
+  G5.cgPass=(G5.reason>0 && G5.trueRel<=1.0e-8 && G5.solutionRel<=1.0e-7) ? PETSC_TRUE : PETSC_FALSE;
+
+  // Direct GAMG-only experiment: x_{j+1}=x_j + PC_GAMG(r_j), r=b-Kp*x.
+  PetscCall(VecSet(cycleX,0.0)); PetscCall(VecCopy(G4.kpTest,cycleR));
+  PetscReal prevRel=1.0; G5.cyclesFinite=PETSC_TRUE;
+  for(int j=0;j<4;++j) {
+    PetscCall(PCApply(pc,cycleR,cycleZ));
+    PetscCall(VecAXPY(cycleX,1.0,cycleZ));
+    PetscCall(MatMult(G4.Kp,cycleX,kpSol)); PetscCall(VecWAXPY(cycleR,-1.0,kpSol,G4.kpTest));
+    PetscCall(VecNorm(cycleR,NORM_2,&rnorm)); G5.cycleRel[j]=rnorm/PetscMax(bnorm,(PetscReal)1.0e-300);
+    if(!std::isfinite((double)G5.cycleRel[j])) G5.cyclesFinite=PETSC_FALSE;
+    const PetscReal contraction=(prevRel>0.0)?G5.cycleRel[j]/prevRel:PETSC_MAX_REAL;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE5_GAMG_ONLY_CYCLE cycle=%d relResidual=%.12e contraction=%.12e semantics=direct_PCApply_one_GAMG_Vcycle_no_outer_Krylov diagnosticOnly=1\n",
+      j+1,(double)G5.cycleRel[j],(double)contraction));
+    prevRel=G5.cycleRel[j];
+  }
+  G5.ran=PETSC_TRUE;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE5_KP_GAMG_SOLVE ksp=cg pc=gamg reason=%d its=%" PetscInt_FMT " trueRel=%.12e solutionRel=%.12e setupSeconds=%.6f solveSeconds=%.6f manufacturedRhs=Kp_times_pstar liveSolveTouched=0\n",
+    (int)G5.reason,G5.cgIts,(double)G5.trueRel,(double)G5.solutionRel,(double)G5.setupSeconds,(double)G5.solveSeconds));
+
+  PetscCall(VecDestroy(&sol)); PetscCall(VecDestroy(&diff)); PetscCall(VecDestroy(&res)); PetscCall(VecDestroy(&kpSol));
+  PetscCall(VecDestroy(&cycleX)); PetscCall(VecDestroy(&cycleR)); PetscCall(VecDestroy(&cycleZ)); PetscCall(KSPDestroy(&ksp));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 7: pressure-space INTERNAL convection C_p(w), SHADOW ONLY.
+//
+// The current Picard/Oseen P1+BF3 velocity field is already available in the
+// custom momentum owned/ghost halo.  On an internal triangular face the exact
+// mean trace is
+//
+//   wbar_f = (w_v0+w_v1+w_v2)/3 + (9/20) w_BF3,f,
+//
+// because the BF3 trace is 27 lambda1 lambda2 lambda3 and its face mean is 9/20.
+// Thus phi_f = S_f . wbar_f is the exact integrated normal flux of the current
+// FE advecting velocity through the face.
+//
+// Gate 7 uses conservative CENTRAL pressure transport on INTERNAL faces only:
+//   (Cp p)_P +=  phi_f (p_P+p_N)/2
+//   (Cp p)_N += -phi_f (p_P+p_N)/2
+// with S oriented owner P -> neighbour N.  This is +div(w p), equivalent to
+// +w.grad(p) for divergence-free w.  Pressure-boundary convection/Robin terms
+// are deliberately OFF until Gate 8.  Cp never enters the live pressure solve.
+// -----------------------------------------------------------------------------
+struct Gate7CpCtx {
+  Mat Cp=nullptr;
+  Vec ones=nullptr,cpOnes=nullptr,pMass=nullptr,cpMass=nullptr,diffMass=nullptr,fpInteriorMass=nullptr;
+  PetscInt setupCount=0,updateCount=0,probeCount=0,internalFaces=0;
+  PetscInt lastNonzeroFluxFaces=0,maxNonzeroFluxFaces=0;
+  PetscReal lastFluxMin=0.0,lastFluxMax=0.0,lastFluxAbsMax=0.0,lastFluxL1=0.0,lastFluxL2=0.0,maxFluxAbs=0.0;
+  PetscReal lastCpOneNorm=0.0,lastCpMassNorm=0.0,lastDiffMassNorm=0.0,lastFpInteriorNorm=0.0;
+  PetscReal lastConvToDiff=0.0,maxConvToDiff=0.0,maxCpMassNorm=0.0;
+  PetscBool lastSymmetric=PETSC_TRUE,sawNonsymmetric=PETSC_FALSE,allFinite=PETSC_TRUE;
+};
+
+static PetscErrorCode gate7EntityVelocity(const Discrete& D,const CustomMomentumCSR& A,PetscInt entity,double v[3]) {
+  PetscFunctionBeginUser;
+  if(entity<0 || entity>=(PetscInt)D.g2free.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_OUTOFRANGE,"Gate-7 velocity entity out of range");
+  const PetscInt gid=D.g2free[(std::size_t)entity];
+  if(gid>=0) {
+    const PetscInt li=customMomentumLocalIndex(A,gid);
+    if(li<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-7 Picard velocity entity absent from custom momentum owned/ghost halo");
+    for(int d=0;d<3;++d) v[d]=customMomentumFieldValue(A,d,li);
+  } else {
+    for(int d=0;d<3;++d) v[d]=entityDirValue(D,d,entity);
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate7FaceMeanVelocity(const Mesh& M,const Discrete& D,const CustomMomentumCSR& A,PetscInt f,double vbar[3]) {
+  PetscFunctionBeginUser;
+  const auto& F=M.faces[(std::size_t)f];
+  if(F.v.size()!=3) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"Gate-7 requires triangular tetrahedral faces");
+  double vv[3][3]={{0}},vb[3]={0};
+  for(int j=0;j<3;++j) PetscCall(gate7EntityVelocity(D,A,(PetscInt)F.v[(std::size_t)j],vv[j]));
+  PetscCall(gate7EntityVelocity(D,A,(PetscInt)M.points.size()+f,vb));
+  for(int d=0;d<3;++d) vbar[d]=(vv[0][d]+vv[1][d]+vv[2][d])/3.0+(9.0/20.0)*vb[d];
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate7CpSetUp(const Gate4KpCtx& G4,Gate7CpCtx& G7) {
+  PetscFunctionBeginUser;
+  if(!G4.built || !G4.Kp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-7 requires validated Gate-4 Kp");
+  PetscCall(MatDuplicate(G4.Kp,MAT_DO_NOT_COPY_VALUES,&G7.Cp));
+  PetscCall(MatSetOption(G7.Cp,MAT_NEW_NONZERO_ALLOCATION_ERR,PETSC_TRUE));
+  PetscCall(MatCreateVecs(G7.Cp,&G7.pMass,&G7.cpMass));
+  PetscCall(VecDuplicate(G7.pMass,&G7.diffMass)); PetscCall(VecDuplicate(G7.pMass,&G7.fpInteriorMass));
+  PetscCall(VecDuplicate(G7.pMass,&G7.ones)); PetscCall(VecDuplicate(G7.pMass,&G7.cpOnes)); PetscCall(VecSet(G7.ones,1.0));
+  G7.setupCount++;
+  MatInfo info{}; PetscCall(MatGetInfo(G7.Cp,MAT_GLOBAL_SUM,&info));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE7_CP_SETUP setupCount=%" PetscInt_FMT " rows=%" PetscInt_FMT " allocatedPatternNnz=%.0f pattern=diag_plus_internal_face_neighbours sourceVelocity=current_Picard_P1plusBF3 exactFaceMean=P1_vertex_mean_plus_9over20_BF3 boundaryConvection=OFF liveSolveTouched=0\n",
+    G7.setupCount,G4.globalSize,(double)info.nz_allocated));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate7UpdateCpInterior(const Mesh& M,const Discrete& D,const ProblemConfig& P,int rank,
+  const CustomMomentumCSR& A,Gate7CpCtx& G7,PetscInt simpleIt) {
+  PetscFunctionBeginUser;
+  if(!G7.Cp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-7 Cp not set up");
+  if(P.mode==ProblemMode::MMS) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-7 Cp probe requires pipe/flow mode");
+  const PetscInt nc=(PetscInt)M.tets.size(),ni=(PetscInt)M.neighbour.size();
+  const auto cc=cellCentroids(M);
+  PetscCall(MatZeroEntries(G7.Cp));
+  PetscInt localCanonicalFaces=0,localNonzero=0;
+  double localMin=PETSC_MAX_REAL,localMax=-PETSC_MAX_REAL,localAbsMax=0.0,localL1=0.0,localL2sq=0.0;
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt row=D.pGid[(std::size_t)K];
+    double diag=0.0; std::array<PetscInt,5> cols{}; std::array<PetscScalar,5> vals{}; PetscInt ncol=1;
+    cols[0]=row; vals[0]=0.0;
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i];
+      if(f>=ni) continue; // Gate 7: ALL pressure boundary convection is OFF.
+      const PetscInt Pcell=M.owner[(std::size_t)f],Ncell=M.neighbour[(std::size_t)f];
+      const PetscInt L=(Pcell==K)?Ncell:Pcell;
+      Vec3 S=gate4FaceAreaVector(M,f); const Vec3 dPN=sub3(cc[(std::size_t)Ncell],cc[(std::size_t)Pcell]);
+      if(S.x*dPN.x+S.y*dPN.y+S.z*dPN.z<0.0) { S.x=-S.x; S.y=-S.y; S.z=-S.z; }
+      double wbar[3]={0,0,0}; PetscCall(gate7FaceMeanVelocity(M,D,A,f,wbar));
+      const double phi=S.x*wbar[0]+S.y*wbar[1]+S.z*wbar[2];
+      if(!std::isfinite(phi)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-7 non-finite internal pressure convection flux");
+      const double outward=(K==Pcell)?phi:-phi, c=0.5*outward;
+      diag+=c; cols[(std::size_t)ncol]=D.pGid[(std::size_t)L]; vals[(std::size_t)ncol]=(PetscScalar)c; ++ncol;
+      if(K==Pcell) {
+        ++localCanonicalFaces; localMin=std::min(localMin,phi); localMax=std::max(localMax,phi);
+        localAbsMax=std::max(localAbsMax,std::abs(phi)); localL1+=std::abs(phi); localL2sq+=phi*phi;
+        if(std::abs(phi)>1.0e-14) ++localNonzero;
+      }
+    }
+    vals[0]=(PetscScalar)diag;
+    PetscCall(MatSetValues(G7.Cp,1,&row,ncol,cols.data(),vals.data(),INSERT_VALUES));
+  }
+  PetscCall(MatAssemblyBegin(G7.Cp,MAT_FINAL_ASSEMBLY)); PetscCall(MatAssemblyEnd(G7.Cp,MAT_FINAL_ASSEMBLY));
+  PetscInt globalFaces=0,globalNonzero=0; double gMin=0.0,gMax=0.0,gAbsMax=0.0,gL1=0.0,gL2sq=0.0;
+  PetscCallMPI(MPI_Allreduce(&localCanonicalFaces,&globalFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localNonzero,&globalNonzero,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localMin,&gMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&localMax,&gMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localAbsMax,&gAbsMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD)); PetscCallMPI(MPI_Allreduce(&localL1,&gL1,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localL2sq,&gL2sq,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  if(globalFaces!=ni) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-7 internal-face diagnostic count mismatch");
+  G7.internalFaces=globalFaces; G7.lastNonzeroFluxFaces=globalNonzero; G7.maxNonzeroFluxFaces=PetscMax(G7.maxNonzeroFluxFaces,globalNonzero);
+  G7.lastFluxMin=(PetscReal)gMin; G7.lastFluxMax=(PetscReal)gMax; G7.lastFluxAbsMax=(PetscReal)gAbsMax; G7.lastFluxL1=(PetscReal)gL1; G7.lastFluxL2=(PetscReal)std::sqrt(gL2sq);
+  G7.maxFluxAbs=PetscMax(G7.maxFluxAbs,G7.lastFluxAbsMax);
+  PetscCall(MatMult(G7.Cp,G7.ones,G7.cpOnes)); PetscCall(VecNorm(G7.cpOnes,NORM_2,&G7.lastCpOneNorm));
+  PetscCall(MatIsSymmetric(G7.Cp,1.0e-13,&G7.lastSymmetric)); if(!G7.lastSymmetric) G7.sawNonsymmetric=PETSC_TRUE;
+  if(!std::isfinite((double)G7.lastFluxAbsMax) || !std::isfinite((double)G7.lastCpOneNorm)) G7.allFinite=PETSC_FALSE;
+  G7.updateCount++;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE7_CP_UPDATE it=%" PetscInt_FMT " updateCount=%" PetscInt_FMT " internalFaces=%" PetscInt_FMT " nonzeroFluxFaces=%" PetscInt_FMT " fluxMin=%.12e fluxMax=%.12e fluxAbsMax=%.12e fluxL1=%.12e fluxL2=%.12e CpOneNorm=%.12e symmetric=%d centralFacePressure=arithmetic_mean boundaryConvection=OFF liveSolveTouched=0\n",
+    simpleIt,G7.updateCount,G7.internalFaces,G7.lastNonzeroFluxFaces,(double)G7.lastFluxMin,(double)G7.lastFluxMax,(double)G7.lastFluxAbsMax,(double)G7.lastFluxL1,(double)G7.lastFluxL2,(double)G7.lastCpOneNorm,(int)G7.lastSymmetric));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate7ProbeActualPressureRhs(const Gate4KpCtx& G4,Gate7CpCtx& G7,Vec volumes,PetscReal nu,Vec rhs,PetscInt simpleIt) {
+  PetscFunctionBeginUser;
+  PetscCall(VecPointwiseDivide(G7.pMass,rhs,volumes)); PetscCall(MatMult(G7.Cp,G7.pMass,G7.cpMass));
+  PetscCall(MatMult(G4.Kp,G7.pMass,G7.diffMass)); PetscCall(VecScale(G7.diffMass,nu));
+  PetscCall(VecWAXPY(G7.fpInteriorMass,1.0,G7.cpMass,G7.diffMass));
+  PetscCall(VecNorm(G7.cpMass,NORM_2,&G7.lastCpMassNorm)); PetscCall(VecNorm(G7.diffMass,NORM_2,&G7.lastDiffMassNorm)); PetscCall(VecNorm(G7.fpInteriorMass,NORM_2,&G7.lastFpInteriorNorm));
+  G7.lastConvToDiff=G7.lastCpMassNorm/PetscMax(G7.lastDiffMassNorm,(PetscReal)1.0e-300); G7.maxConvToDiff=PetscMax(G7.maxConvToDiff,G7.lastConvToDiff); G7.maxCpMassNorm=PetscMax(G7.maxCpMassNorm,G7.lastCpMassNorm);
+  if(!std::isfinite((double)G7.lastCpMassNorm) || !std::isfinite((double)G7.lastDiffMassNorm) || !std::isfinite((double)G7.lastFpInteriorNorm) || !std::isfinite((double)G7.lastConvToDiff)) G7.allFinite=PETSC_FALSE;
+  G7.probeCount++;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE7_CP_ACTION it=%" PetscInt_FMT " probeCount=%" PetscInt_FMT " CpMpInvRhsNorm=%.12e nuKpMpInvRhsNorm=%.12e FpInteriorMpInvRhsNorm=%.12e convToDiff=%.12e Fp=nuKp_plus_internal_Cp boundaryConvection=OFF KpInverse=NOT_APPLIED_GATE7 liveSolveTouched=0\n",
+    simpleIt,G7.probeCount,(double)G7.lastCpMassNorm,(double)G7.lastDiffMassNorm,(double)G7.lastFpInteriorNorm,(double)G7.lastConvToDiff));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate7CpDestroy(Gate7CpCtx& G7) {
+  PetscFunctionBeginUser;
+  PetscCall(MatDestroy(&G7.Cp)); PetscCall(VecDestroy(&G7.ones)); PetscCall(VecDestroy(&G7.cpOnes)); PetscCall(VecDestroy(&G7.pMass)); PetscCall(VecDestroy(&G7.cpMass)); PetscCall(VecDestroy(&G7.diffMass)); PetscCall(VecDestroy(&G7.fpInteriorMass));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 8: ESW pressure-space boundary-condition audit, SHADOW ONLY.
+//
+// The supplied ESW screenshot audit records the inflow condition
+//
+//   -nu * dp/dn + (w_h . n) p = 0.
+//
+// Gate 7 discretizes pressure convection in conservative flux form.  Therefore
+// on an inlet face the explicit conservative boundary convection contribution
+// is
+//
+//   C_in p = + phi_f p,      phi_f = integral_face (w_h . n) dS,
+//
+// while the Robin diffusion boundary contribution implied by the ESW condition
+// is
+//
+//   R_in p = - phi_f p.
+//
+// Hence C_in + R_in must cancel exactly.  Gate 8 constructs BOTH pieces
+// explicitly from the exact P1+BF3 face-mean advecting velocity and checks that
+// cancellation on the actual SIMPLE pressure RHS after M_p^{-1}.  This makes
+// the Robin condition explicit without double-counting an inlet term in F_p.
+//
+// Wall: w.n=0 (no-slip trace), homogeneous Neumann pressure diffusion.
+// Outlet: p=0 Dirichlet for K_p/F_p, so the unknown pressure convection trace
+//         contributes zero there; the Gate-4 K_p Dirichlet anchor remains.
+//
+// No Gate-8 object enters the live pressure solve.
+// -----------------------------------------------------------------------------
+struct Gate8EswBcCtx {
+  Vec convDiag=nullptr,robinDiag=nullptr,boundaryDiag=nullptr;
+  Vec pMass=nullptr,convAction=nullptr,robinAction=nullptr,boundaryAction=nullptr,fpFull=nullptr,fpDiff=nullptr;
+  PetscInt setupCount=0,updateCount=0,probeCount=0;
+  PetscInt inletFaces=0,wallFaces=0,outletFaces=0,lastInletNegativeFaces=0;
+  PetscReal lastInletFluxMin=0.0,lastInletFluxMax=0.0,lastInletFluxAbsMax=0.0,lastInletFluxSum=0.0;
+  PetscReal lastWallFluxAbsMax=0.0,lastOutletFluxAbsMax=0.0;
+  PetscReal lastRobinCoeffMin=0.0,lastRobinCoeffMax=0.0;
+  PetscReal lastConvNorm=0.0,lastRobinNorm=0.0,lastBoundaryNorm=0.0,lastCancelRel=0.0,maxCancelRel=0.0;
+  PetscReal lastFullFpNorm=0.0,lastFullVsInteriorRel=0.0,maxFullVsInteriorRel=0.0;
+  PetscReal maxWallFluxAbs=0.0;
+  PetscBool inletFluxSignOkay=PETSC_TRUE,allFinite=PETSC_TRUE;
+};
+
+static PetscErrorCode gate8EswBcSetUp(const Gate4KpCtx& G4,Gate8EswBcCtx& G8) {
+  PetscFunctionBeginUser;
+  if(!G4.built || !G4.Kp) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-8 requires validated Gate-4 Kp");
+  PetscCall(MatCreateVecs(G4.Kp,&G8.convDiag,&G8.robinDiag));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.boundaryDiag));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.pMass));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.convAction));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.robinAction));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.boundaryAction));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.fpFull));
+  PetscCall(VecDuplicate(G8.convDiag,&G8.fpDiff));
+  G8.setupCount++;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE8_ESW_BC_SETUP setupCount=%" PetscInt_FMT " rows=%" PetscInt_FMT " formula=-nu_dpdn_plus_wdotn_p_eq_0 inletImplementation=explicit_conservative_convection_plus_explicit_Robin_cancellation wall=homogeneous_Neumann_and_no_normal_velocity outlet=p0_Dirichlet unknownConvectionTrace=zero attachment=shadow_only liveSolveTouched=0\n",
+    G8.setupCount,G4.globalSize));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate8UpdateEswBoundary(const Mesh& M,const Discrete& D,const ProblemConfig& P,int rank,
+  const CustomMomentumCSR& A,Gate8EswBcCtx& G8,PetscInt simpleIt) {
+  PetscFunctionBeginUser;
+  const PetscInt nc=(PetscInt)M.tets.size(),ni=(PetscInt)M.neighbour.size();
+  PetscCall(VecSet(G8.convDiag,0.0)); PetscCall(VecSet(G8.robinDiag,0.0));
+  PetscInt localInlet=0,localWall=0,localOutlet=0,localNeg=0;
+  double localInMin=PETSC_MAX_REAL,localInMax=-PETSC_MAX_REAL,localInAbs=0.0,localInSum=0.0;
+  double localWallAbs=0.0,localOutAbs=0.0,localRobinMin=PETSC_MAX_REAL,localRobinMax=0.0;
+  for(PetscInt K=0;K<nc;++K) if(D.cellOwner[(std::size_t)K]==rank) {
+    const PetscInt row=D.pGid[(std::size_t)K];
+    double convCell=0.0,robinCell=0.0;
+    for(int i=0;i<4;++i) {
+      const PetscInt f=M.oppFace[(std::size_t)K][i];
+      if(f<ni) continue;
+      const int pi=M.facePatch[(std::size_t)f];
+      Vec3 S=faceOutwardAreaVector(M,f);
+      double wbar[3]={0,0,0}; PetscCall(gate7FaceMeanVelocity(M,D,A,f,wbar));
+      const double phi=S.x*wbar[0]+S.y*wbar[1]+S.z*wbar[2];
+      if(!std::isfinite(phi)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-8 non-finite boundary advecting flux");
+      if(pi==P.boundary.inlet) {
+        // Conservative boundary convection: +phi*p.  ESW Robin contribution:
+        // -phi*p from -nu dp/dn + (w.n)p=0.  They must cancel in Fp.
+        convCell += phi; robinCell += -phi; ++localInlet;
+        localInMin=std::min(localInMin,phi); localInMax=std::max(localInMax,phi);
+        localInAbs=std::max(localInAbs,std::abs(phi)); localInSum+=phi;
+        if(phi<0.0) ++localNeg;
+        const double rc=-phi; localRobinMin=std::min(localRobinMin,rc); localRobinMax=std::max(localRobinMax,rc);
+      } else if(isWallPatch(P.boundary,pi)) {
+        ++localWall; localWallAbs=std::max(localWallAbs,std::abs(phi));
+      } else if(pi==P.boundary.outlet) {
+        ++localOutlet; localOutAbs=std::max(localOutAbs,std::abs(phi));
+        // p=0: no unknown convection boundary coefficient is inserted.
+      } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-8 encountered unclassified boundary face");
+    }
+    PetscCall(VecSetValue(G8.convDiag,row,(PetscScalar)convCell,INSERT_VALUES));
+    PetscCall(VecSetValue(G8.robinDiag,row,(PetscScalar)robinCell,INSERT_VALUES));
+  }
+  PetscCall(VecAssemblyBegin(G8.convDiag)); PetscCall(VecAssemblyEnd(G8.convDiag));
+  PetscCall(VecAssemblyBegin(G8.robinDiag)); PetscCall(VecAssemblyEnd(G8.robinDiag));
+  PetscCall(VecWAXPY(G8.boundaryDiag,1.0,G8.convDiag,G8.robinDiag));
+
+  PetscCallMPI(MPI_Allreduce(&localInlet,&G8.inletFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWall,&G8.wallFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutlet,&G8.outletFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localNeg,&G8.lastInletNegativeFaces,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+  double gInMin=0,gInMax=0,gInAbs=0,gInSum=0,gWallAbs=0,gOutAbs=0,gRobinMin=0,gRobinMax=0;
+  PetscCallMPI(MPI_Allreduce(&localInMin,&gInMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localInMax,&gInMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localInAbs,&gInAbs,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localInSum,&gInSum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localWallAbs,&gWallAbs,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localOutAbs,&gOutAbs,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRobinMin,&gRobinMin,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&localRobinMax,&gRobinMax,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+  G8.lastInletFluxMin=(PetscReal)gInMin; G8.lastInletFluxMax=(PetscReal)gInMax; G8.lastInletFluxAbsMax=(PetscReal)gInAbs; G8.lastInletFluxSum=(PetscReal)gInSum;
+  G8.lastWallFluxAbsMax=(PetscReal)gWallAbs; G8.lastOutletFluxAbsMax=(PetscReal)gOutAbs; G8.maxWallFluxAbs=PetscMax(G8.maxWallFluxAbs,G8.lastWallFluxAbsMax);
+  G8.lastRobinCoeffMin=(PetscReal)gRobinMin; G8.lastRobinCoeffMax=(PetscReal)gRobinMax;
+  const PetscReal signTol=1.0e-13*PetscMax((PetscReal)1.0,G8.lastInletFluxAbsMax);
+  if(G8.lastInletFluxSum>=0.0 || G8.lastInletFluxMax>signTol) G8.inletFluxSignOkay=PETSC_FALSE;
+  if(!std::isfinite((double)G8.lastInletFluxSum) || !std::isfinite((double)G8.lastWallFluxAbsMax) || !std::isfinite((double)G8.lastOutletFluxAbsMax)) G8.allFinite=PETSC_FALSE;
+  G8.updateCount++;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE8_ESW_BC_UPDATE it=%" PetscInt_FMT " updateCount=%" PetscInt_FMT " inletFaces=%" PetscInt_FMT " inletNegativeFluxFaces=%" PetscInt_FMT " inletFluxMin=%.12e inletFluxMax=%.12e inletFluxAbsMax=%.12e inletFluxSum=%.12e robinCoeffMin=%.12e robinCoeffMax=%.12e wallFaces=%" PetscInt_FMT " wallFluxAbsMax=%.12e outletFaces=%" PetscInt_FMT " outletFluxAbsMax=%.12e inletRobinActive=1 sourceVelocity=current_Picard_P1plusBF3 exactFaceMean=1 liveSolveTouched=0\n",
+    simpleIt,G8.updateCount,G8.inletFaces,G8.lastInletNegativeFaces,(double)G8.lastInletFluxMin,(double)G8.lastInletFluxMax,(double)G8.lastInletFluxAbsMax,(double)G8.lastInletFluxSum,(double)G8.lastRobinCoeffMin,(double)G8.lastRobinCoeffMax,G8.wallFaces,(double)G8.lastWallFluxAbsMax,G8.outletFaces,(double)G8.lastOutletFluxAbsMax));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate8ProbeActualPressureRhs(const Gate7CpCtx& G7,Gate8EswBcCtx& G8,Vec volumes,Vec rhs,PetscInt simpleIt) {
+  PetscFunctionBeginUser;
+  if(G7.probeCount<1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-8 RHS probe requires Gate-7 interior Fp probe first");
+  PetscCall(VecPointwiseDivide(G8.pMass,rhs,volumes));
+  PetscCall(VecPointwiseMult(G8.convAction,G8.convDiag,G8.pMass));
+  PetscCall(VecPointwiseMult(G8.robinAction,G8.robinDiag,G8.pMass));
+  PetscCall(VecWAXPY(G8.boundaryAction,1.0,G8.convAction,G8.robinAction));
+  PetscCall(VecNorm(G8.convAction,NORM_2,&G8.lastConvNorm)); PetscCall(VecNorm(G8.robinAction,NORM_2,&G8.lastRobinNorm)); PetscCall(VecNorm(G8.boundaryAction,NORM_2,&G8.lastBoundaryNorm));
+  const PetscReal scale=PetscMax(PetscMax(G8.lastConvNorm,G8.lastRobinNorm),(PetscReal)1.0e-300);
+  G8.lastCancelRel=G8.lastBoundaryNorm/scale; G8.maxCancelRel=PetscMax(G8.maxCancelRel,G8.lastCancelRel);
+  PetscCall(VecWAXPY(G8.fpFull,1.0,G8.boundaryAction,G7.fpInteriorMass)); PetscCall(VecNorm(G8.fpFull,NORM_2,&G8.lastFullFpNorm));
+  PetscCall(VecCopy(G8.fpFull,G8.fpDiff)); PetscCall(VecAXPY(G8.fpDiff,-1.0,G7.fpInteriorMass));
+  PetscReal diffNorm=0.0,interiorNorm=0.0; PetscCall(VecNorm(G8.fpDiff,NORM_2,&diffNorm)); PetscCall(VecNorm(G7.fpInteriorMass,NORM_2,&interiorNorm));
+  G8.lastFullVsInteriorRel=diffNorm/PetscMax(interiorNorm,(PetscReal)1.0e-300); G8.maxFullVsInteriorRel=PetscMax(G8.maxFullVsInteriorRel,G8.lastFullVsInteriorRel);
+  if(!std::isfinite((double)G8.lastCancelRel) || !std::isfinite((double)G8.lastFullFpNorm) || !std::isfinite((double)G8.lastFullVsInteriorRel)) G8.allFinite=PETSC_FALSE;
+  G8.probeCount++;
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_GATE8_ESW_BC_ACTION it=%" PetscInt_FMT " probeCount=%" PetscInt_FMT " inletConvectionNorm=%.12e inletRobinNorm=%.12e inletCombinedNorm=%.12e inletCancellationRel=%.12e FpFullMpInvRhsNorm=%.12e fullVsGate7InteriorRel=%.12e semantics=conservative_inlet_convection_plus_ESW_Robin_cancel wall=no_normal_flux outlet=p0_Dirichlet KpInverse=NOT_APPLIED_GATE8 liveSolveTouched=0\n",
+    simpleIt,G8.probeCount,(double)G8.lastConvNorm,(double)G8.lastRobinNorm,(double)G8.lastBoundaryNorm,(double)G8.lastCancelRel,(double)G8.lastFullFpNorm,(double)G8.lastFullVsInteriorRel));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate8EswBcDestroy(Gate8EswBcCtx& G8) {
+  PetscFunctionBeginUser;
+  PetscCall(VecDestroy(&G8.convDiag)); PetscCall(VecDestroy(&G8.robinDiag)); PetscCall(VecDestroy(&G8.boundaryDiag));
+  PetscCall(VecDestroy(&G8.pMass)); PetscCall(VecDestroy(&G8.convAction)); PetscCall(VecDestroy(&G8.robinAction)); PetscCall(VecDestroy(&G8.boundaryAction)); PetscCall(VecDestroy(&G8.fpFull)); PetscCall(VecDestroy(&G8.fpDiff));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+
+// -----------------------------------------------------------------------------
+// PCD Gate 9: FIRST LIVE full PCD pressure preconditioner.
+//
+// The exact SIMPLE pressure-correction operator remains
+//
+//      S = B diag(rAU) B^T
+//
+// and PETSc FGMRES still solves S dp = r.  Only the preconditioner is changed
+// from the old native-face GAMG surrogate to the ESW PCD action
+//
+//      y = K_p^{-1} F_p M_p^{-1} x,
+//      F_p = nu K_p + C_p(w) + boundary terms.
+//
+// Gate 8 showed that, with the conservative pressure convection used here, the
+// explicit inlet convection and ESW Robin diffusion terms cancel exactly.  We
+// nevertheless apply the explicit Gate-8 boundaryDiag so the live algebra is
+// exactly the audited full F_p, not a silently simplified variant.
+//
+// K_p^{-1} is deliberately tight CG+GAMG in Gate 9.  This is a correctness
+// gate, not yet a performance-tuned production PCD implementation.
+// -----------------------------------------------------------------------------
+struct Gate9LivePcdCtx {
+  Mat Kp=nullptr;                 // borrowed Gate-4 geometric pressure Laplacian
+  Mat Cp=nullptr;                 // borrowed, retained only so legacy Gate-9 setup wiring stays unchanged
+  Vec volumes=nullptr;            // borrowed, retained only for pressure-layout validation
+  Vec boundaryDiag=nullptr;       // borrowed, not used by Gate 9C
+  PetscReal nu=0.0;
+  PC kpPc=nullptr;                // LIVE Gate-9C: one direct GAMG PCApply, no inner Krylov
+  Vec kpCheck=nullptr,kpResidual=nullptr;
+  PetscInt setupCount=0,applyCount=0,currentSimpleIt=0,outerSolveCount=0;
+  PetscBool gamgOnlySolve=PETSC_FALSE; // Gate 9D: no KSPSolve; stationary exact-Schur residual correction only
+  PetscReal lastKpCycleRel=PETSC_MAX_REAL,maxKpCycleRel=0.0;
+  PetscReal lastInputNorm=0.0,lastOutputNorm=0.0;
+  PetscReal lastApplySeconds=0.0,totalApplySeconds=0.0;
+  PetscReal lastOuterTrueRel=PETSC_MAX_REAL,maxOuterTrueRel=0.0;
+  PetscBool allFinite=PETSC_TRUE;
+};
+
+static PetscErrorCode gate9LivePcdSetUp(PC pc) {
+  Gate9LivePcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-9C direct GAMG PCShell context is null");
+  if(!ctx->Kp || !ctx->volumes)
+    SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-9C requires Kp and the pressure-layout vector");
+
+  if(!ctx->kpCheck) {
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->kpCheck));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->kpResidual));
+  }
+  if(!ctx->kpPc) {
+    PetscCall(PCCreate(PetscObjectComm((PetscObject)ctx->Kp),&ctx->kpPc));
+    PetscCall(PCSetOptionsPrefix(ctx->kpPc,"gate9c_kp_"));
+    PetscCall(PCSetOperators(ctx->kpPc,ctx->Kp,ctx->Kp));
+    PetscCall(PCSetType(ctx->kpPc,PCGAMG));
+    PetscCall(PCSetFromOptions(ctx->kpPc));
+    PetscCall(PCSetUp(ctx->kpPc));
+  }
+
+  PetscInt nkpr=0,nkpc=0,nv=0;
+  PetscCall(MatGetSize(ctx->Kp,&nkpr,&nkpc)); PetscCall(VecGetSize(ctx->volumes,&nv));
+  if(nkpr!=nv || nkpc!=nv)
+    SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_SIZ,"Gate-9C Kp/pressure layout mismatch");
+  ++ctx->setupCount;
+  if(ctx->gamgOnlySolve) {
+    PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE9D_GAMG_SETUP setupCount=%" PetscInt_FMT " rows=%" PetscInt_FMT " action=ONE_direct_PCApply_GAMG_on_geometric_Kp_per_stationary_cycle outerKrylov=NONE KSPSolve=NEVER_CALLED exactSchur=UNCHANGED_custom_FP64_B_rAU_Bt\n",
+      ctx->setupCount,nv));
+  } else {
+    PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE9C_GAMG_SETUP setupCount=%" PetscInt_FMT " rows=%" PetscInt_FMT " action=ONE_direct_PCApply_GAMG_on_geometric_Kp innerKrylov=NONE attachment=LIVE_outer_FGMRES_PC exactSchur=UNCHANGED_custom_FP64_B_rAU_Bt\n",
+      ctx->setupCount,nv));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate9LivePcdApply(PC pc,Vec x,Vec y) {
+  Gate9LivePcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-9C direct GAMG context is null");
+  if(!ctx->kpPc || !ctx->kpCheck) PetscCall(gate9LivePcdSetUp(pc));
+  PetscLogDouble t0=0,t1=0; PetscCall(PetscTime(&t0));
+
+  // Gate 9C: M23-style live preconditioner.  Apply exactly one GAMG V-cycle
+  // built from the clean geometric Kp.  There is NO inner KSP/CG solve.
+  PetscCall(PCApply(ctx->kpPc,x,y));
+
+  // Diagnostic only: how well that one V-cycle solves Kp y = x.  This is not
+  // a pass/fail condition because the outer FGMRES is responsible for Krylov
+  // acceleration, exactly as in the M23-style architecture.
+  PetscCall(MatMult(ctx->Kp,y,ctx->kpCheck));
+  PetscCall(VecWAXPY(ctx->kpResidual,-1.0,ctx->kpCheck,x));
+  PetscReal rhsNorm=0.0,resNorm=0.0;
+  PetscCall(VecNorm(x,NORM_2,&rhsNorm)); PetscCall(VecNorm(ctx->kpResidual,NORM_2,&resNorm));
+  ctx->lastKpCycleRel=resNorm/PetscMax(rhsNorm,(PetscReal)1.0e-300);
+  ctx->maxKpCycleRel=PetscMax(ctx->maxKpCycleRel,ctx->lastKpCycleRel);
+  ctx->lastInputNorm=rhsNorm; PetscCall(VecNorm(y,NORM_2,&ctx->lastOutputNorm));
+  PetscCall(PetscTime(&t1)); ctx->lastApplySeconds=(PetscReal)(t1-t0); ctx->totalApplySeconds+=ctx->lastApplySeconds; ++ctx->applyCount;
+  if(!std::isfinite((double)ctx->lastKpCycleRel) || !std::isfinite((double)ctx->lastOutputNorm) || !std::isfinite((double)ctx->lastApplySeconds)) ctx->allFinite=PETSC_FALSE;
+  if(ctx->applyCount<=12 || ctx->applyCount%10==0) {
+    if(ctx->gamgOnlySolve) PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE9D_GAMG_APPLY simpleIt=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " oneCycleKpRel=%.3e inputNorm=%.3e outputNorm=%.3e applySeconds=%.6e semantics=ONE_direct_PCApply_GAMG_no_inner_Krylov_no_outer_Krylov\n",
+      ctx->currentSimpleIt,ctx->applyCount,(double)ctx->lastKpCycleRel,(double)ctx->lastInputNorm,(double)ctx->lastOutputNorm,(double)ctx->lastApplySeconds));
+    else PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE9C_GAMG_APPLY simpleIt=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " oneCycleKpRel=%.3e inputNorm=%.3e outputNorm=%.3e applySeconds=%.6e semantics=ONE_direct_PCApply_GAMG_no_inner_Krylov\n",
+      ctx->currentSimpleIt,ctx->applyCount,(double)ctx->lastKpCycleRel,(double)ctx->lastInputNorm,(double)ctx->lastOutputNorm,(double)ctx->lastApplySeconds));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate9LivePcdDestroy(PC pc) {
+  Gate9LivePcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(ctx) {
+    PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      ctx->gamgOnlySolve ?
+      "P1BF3_GATE9D_GAMG_DESTROY setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " pressureSolveCount=%" PetscInt_FMT " maxOneCycleKpRel=%.3e maxTrueRel=%.3e totalApplySeconds=%.6e\n" :
+      "P1BF3_GATE9C_GAMG_DESTROY setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " outerSolveCount=%" PetscInt_FMT " maxOneCycleKpRel=%.3e maxOuterTrueRel=%.3e totalApplySeconds=%.6e\n",
+      ctx->setupCount,ctx->applyCount,ctx->outerSolveCount,(double)ctx->maxKpCycleRel,(double)ctx->maxOuterTrueRel,(double)ctx->totalApplySeconds));
+    PetscCall(PCDestroy(&ctx->kpPc));
+    PetscCall(VecDestroy(&ctx->kpCheck)); PetscCall(VecDestroy(&ctx->kpResidual));
+    ctx->Kp=nullptr; ctx->Cp=nullptr; ctx->volumes=nullptr; ctx->boundaryDiag=nullptr;
+    delete ctx; PetscCall(PCShellSetContext(pc,nullptr));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+// -----------------------------------------------------------------------------
+// PCD Gate 6: diffusion-only PCD chain, SHADOW ONLY.
+//
+// On the actual SIMPLE pressure RHS r, apply
+//
+//   pMass = M_p^{-1} r,       M_p = diag(cell volume)
+//   pFp   = F_p pMass,        F_p = nu K_p   (diffusion-only Gate 6)
+//   y     = K_p^{-1} pFp      using tight CG + PETSc GAMG
+//
+// Therefore the exact chain is y = nu M_p^{-1} r.  Gate 6 checks this identity
+// and the explicit K_p solve residual.  The PCShell is shadow-only: its output
+// never enters the live SIMPLE pressure solve.
+// -----------------------------------------------------------------------------
+struct Gate6DiffusionPcdCtx {
+  Mat Kp=nullptr;          // borrowed from validated Gate-4 context
+  Vec volumes=nullptr;     // borrowed from Discrete; exact P0 pressure mass diagonal
+  PetscReal nu=0.0;
+  KSP kpKsp=nullptr;
+  Vec pMass=nullptr,pFp=nullptr,kpY=nullptr,kpResidual=nullptr,expected=nullptr,diff=nullptr;
+  PetscInt setupCount=0,applyCount=0,lastKpIts=0,totalKpIts=0;
+  KSPConvergedReason lastKpReason=KSP_CONVERGED_ITERATING;
+  PetscReal lastChainRel=PETSC_MAX_REAL,maxChainRel=0.0;
+  PetscReal lastKpTrueRel=PETSC_MAX_REAL,maxKpTrueRel=0.0;
+  PetscReal lastRhsNorm=0.0,lastMassNorm=0.0,lastFpNorm=0.0,lastOutNorm=0.0;
+  PetscBool allKpConverged=PETSC_TRUE;
+};
+
+static PetscErrorCode gate6DiffusionPcdSetUp(PC pc) {
+  Gate6DiffusionPcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-6 PCShell context is null");
+  if(!ctx->Kp || !ctx->volumes) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-6 requires Kp and P0 mass volumes");
+  if(!(ctx->nu>0.0) || !std::isfinite((double)ctx->nu)) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_FP,"Gate-6 viscosity must be positive and finite");
+
+  if(!ctx->pMass) {
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->pMass));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->pFp));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->kpY));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->kpResidual));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->expected));
+    PetscCall(VecDuplicate(ctx->volumes,&ctx->diff));
+  }
+  if(!ctx->kpKsp) {
+    PetscCall(KSPCreate(PetscObjectComm((PetscObject)ctx->Kp),&ctx->kpKsp));
+    PetscCall(KSPSetOptionsPrefix(ctx->kpKsp,"gate6_kp_"));
+    PetscCall(KSPSetOperators(ctx->kpKsp,ctx->Kp,ctx->Kp));
+    PetscCall(KSPSetType(ctx->kpKsp,KSPCG));
+    PetscCall(KSPSetTolerances(ctx->kpKsp,1.0e-10,0.0,PETSC_DEFAULT,200));
+    PC kpPc=nullptr; PetscCall(KSPGetPC(ctx->kpKsp,&kpPc));
+    PetscCall(PCSetType(kpPc,PCGAMG));
+    PetscCall(KSPSetFromOptions(ctx->kpKsp));
+    PetscCall(KSPSetUp(ctx->kpKsp));
+  }
+
+  PetscInt n=0,nv=0,nkpr=0,nkpc=0;
+  PetscCall(VecGetSize(ctx->volumes,&nv));
+  PetscCall(MatGetSize(ctx->Kp,&nkpr,&nkpc));
+  PetscCall(VecGetSize(ctx->pMass,&n));
+  if(n!=nv || nkpr!=nv || nkpc!=nv) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_SIZ,"Gate-6 Kp/Mp pressure layout mismatch");
+
+  ++ctx->setupCount;
+  PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+    "P1BF3_GATE6_DIFFUSION_PCD_SETUP setupCount=%" PetscInt_FMT " rows=%" PetscInt_FMT " nu=%.12e chain=Kp_inverse_times_Fp_times_Mp_inverse Fp=nu_times_Kp KpInverse=CG_plus_GAMG attachment=shadow_only livePressurePC=UNCHANGED_GAMG\n",
+    ctx->setupCount,n,(double)ctx->nu));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate6DiffusionPcdApply(PC pc,Vec x,Vec y) {
+  Gate6DiffusionPcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(!ctx) SETERRQ(PetscObjectComm((PetscObject)pc),PETSC_ERR_ARG_NULL,"Gate-6 PCShell context is null");
+  if(!ctx->kpKsp || !ctx->pMass) PetscCall(gate6DiffusionPcdSetUp(pc));
+
+  // M_p^{-1} r, exact for P0 pressure since M_p(c,c)=cell volume.
+  PetscCall(VecPointwiseDivide(ctx->pMass,x,ctx->volumes));
+
+  // F_p M_p^{-1} r with the diffusion-only Gate-6 choice F_p = nu K_p.
+  PetscCall(MatMult(ctx->Kp,ctx->pMass,ctx->pFp));
+  PetscCall(VecScale(ctx->pFp,ctx->nu));
+
+  // Tight standalone K_p^{-1}; this is still shadow-only and does not alter the
+  // live pressure solve or its native-face GAMG hierarchy.
+  PetscCall(VecSet(y,0.0));
+  PetscCall(KSPSetInitialGuessNonzero(ctx->kpKsp,PETSC_FALSE));
+  PetscCall(KSPSolve(ctx->kpKsp,ctx->pFp,y));
+  PetscCall(KSPGetConvergedReason(ctx->kpKsp,&ctx->lastKpReason));
+  PetscCall(KSPGetIterationNumber(ctx->kpKsp,&ctx->lastKpIts));
+  ctx->totalKpIts += ctx->lastKpIts;
+  if(ctx->lastKpReason<0) ctx->allKpConverged=PETSC_FALSE;
+
+  // Explicit K_p solve residual: ||F_p M_p^-1 r - K_p y|| / ||F_p M_p^-1 r||.
+  PetscCall(MatMult(ctx->Kp,y,ctx->kpY));
+  PetscCall(VecCopy(ctx->pFp,ctx->kpResidual));
+  PetscCall(VecAXPY(ctx->kpResidual,-1.0,ctx->kpY));
+  PetscReal kr=0.0,fn=0.0;
+  PetscCall(VecNorm(ctx->kpResidual,NORM_2,&kr));
+  PetscCall(VecNorm(ctx->pFp,NORM_2,&fn));
+  ctx->lastKpTrueRel=kr/PetscMax(fn,(PetscReal)1e-300);
+  ctx->maxKpTrueRel=PetscMax(ctx->maxKpTrueRel,ctx->lastKpTrueRel);
+
+  // Exact diffusion-PCD identity: K_p^-1 (nu K_p) M_p^-1 r = nu M_p^-1 r.
+  PetscCall(VecCopy(ctx->pMass,ctx->expected));
+  PetscCall(VecScale(ctx->expected,ctx->nu));
+  PetscCall(VecCopy(y,ctx->diff));
+  PetscCall(VecAXPY(ctx->diff,-1.0,ctx->expected));
+  PetscReal dn=0.0,en=0.0;
+  PetscCall(VecNorm(ctx->diff,NORM_2,&dn));
+  PetscCall(VecNorm(ctx->expected,NORM_2,&en));
+  ctx->lastChainRel=dn/PetscMax(en,(PetscReal)1e-300);
+  ctx->maxChainRel=PetscMax(ctx->maxChainRel,ctx->lastChainRel);
+
+  PetscCall(VecNorm(x,NORM_2,&ctx->lastRhsNorm));
+  PetscCall(VecNorm(ctx->pMass,NORM_2,&ctx->lastMassNorm));
+  ctx->lastFpNorm=fn;
+  PetscCall(VecNorm(y,NORM_2,&ctx->lastOutNorm));
+  ++ctx->applyCount;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate6DiffusionPcdDestroy(PC pc) {
+  Gate6DiffusionPcdCtx *ctx=nullptr;
+  PetscFunctionBeginUser;
+  PetscCall(PCShellGetContext(pc,(void**)&ctx));
+  if(ctx) {
+    PetscCall(PetscPrintf(PetscObjectComm((PetscObject)pc),
+      "P1BF3_GATE6_DIFFUSION_PCD_DESTROY setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " totalKpIts=%" PetscInt_FMT " maxChainRel=%.3e maxKpTrueRel=%.3e\n",
+      ctx->setupCount,ctx->applyCount,ctx->totalKpIts,(double)ctx->maxChainRel,(double)ctx->maxKpTrueRel));
+    PetscCall(KSPDestroy(&ctx->kpKsp));
+    PetscCall(VecDestroy(&ctx->pMass));
+    PetscCall(VecDestroy(&ctx->pFp));
+    PetscCall(VecDestroy(&ctx->kpY));
+    PetscCall(VecDestroy(&ctx->kpResidual));
+    PetscCall(VecDestroy(&ctx->expected));
+    PetscCall(VecDestroy(&ctx->diff));
+    ctx->Kp=nullptr; ctx->volumes=nullptr;
+    delete ctx;
+    PetscCall(PCShellSetContext(pc,nullptr));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+static PetscErrorCode gate4DestroyKp(Gate4KpCtx& G4) {
+  PetscFunctionBeginUser;
+  PetscCall(VecDestroy(&G4.ones)); PetscCall(VecDestroy(&G4.kpOnes)); PetscCall(VecDestroy(&G4.test)); PetscCall(VecDestroy(&G4.kpTest)); PetscCall(VecDestroy(&G4.diag));
+  PetscCall(MatDestroy(&G4.Kp)); G4.built=PETSC_FALSE; PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+#include "custom_pressure_amg_DG.inc"
+
+int main(int argc,char **argv) {
+  PetscFunctionBeginUser;
+  PetscCall(PetscInitialize(&argc,&argv,nullptr,"MPI P1+BF3/P0 SIMPLE steady Navier-Stokes MMS/pipe/generic-flow on OpenFOAM tetrahedral polyMesh\n"));
+  int rank=0,size=1;
+  MPI_Comm_rank(PETSC_COMM_WORLD,&rank);
+  MPI_Comm_size(PETSC_COMM_WORLD,&size);
+
+  // Mixed-precision gate: the production physics/state is native C++ double,
+  // while PETSc storage/arithmetic follows the precision of this PETSc build.
+  // In an FP32 PETSc build, customVecWriteOwnedRange/customVecOwnedRange form
+  // the explicit FP64 -> FP32 -> FP64 boundary around GAMG PCApply.
+  static_assert(sizeof(double)==8,"P1BF3 requires IEEE-like 64-bit C++ double for physical/state algebra");
+  PetscBool requirePetscFp32=PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-require_petsc_fp32",&requirePetscFp32,nullptr));
+  const PetscBool petscIsFp32=(sizeof(PetscReal)==4 && sizeof(PetscScalar)==4)?PETSC_TRUE:PETSC_FALSE;
+  if(requirePetscFp32 && !petscIsFp32)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"-require_petsc_fp32 requested but this executable is not linked to a real single-precision PETSc build");
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_PRECISION_ARCH petscRealBytes=%zu petscScalarBytes=%zu nativeDoubleBytes=%zu petscBackend=%s physicalMomentum=FP64_double physicalPressureState=FP64_double exactSchur=FP64_double outerPCG=FP64_double outerChebyshev=FP64_double GAMG=PetscScalar bridge=FP64_to_PetscScalar_to_FP64 requirePetscFp32=%d\n",
+    sizeof(PetscReal),sizeof(PetscScalar),sizeof(double),petscIsFp32?"FP32":"FP64_or_other",(int)requirePetscFp32));
+
+  char meshPath[PETSC_MAX_PATH_LEN]="";
+  PetscBool set=PETSC_FALSE;
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-mesh",meshPath,sizeof(meshPath),&set));
+  if(!set) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Pass -mesh /path/to/constant/polyMesh");
+
+  char problemName[32]="mms";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-problem",problemName,sizeof(problemName),nullptr));
+  const std::string problem(problemName);
+  if(problem!="mms" && problem!="pipe" && problem!="flow") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-problem must be mms, pipe, or flow");
+
+  char convectionName[32]="central";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-convection",convectionName,sizeof(convectionName),nullptr));
+  const std::string convection(convectionName);
+  const bool centralConvection=(convection=="central");
+  if(convection!="central" && convection!="none") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-convection must be central or none");
+
+  PetscBool useSupg=PETSC_FALSE,mixingLength=PETSC_FALSE,mixlenAudit=PETSC_FALSE,weakWallFunction=PETSC_FALSE;
+  PetscReal supgTauScale=0.05,supgMagic=9.0,mixlenScale=1.0;
+  PetscReal wallKappa=0.4,wallB=5.5,wallDistanceFactor=0.25,wallBetaScale=1.0,wallTangentBlend=1.0;
+  PetscBool wallMolecularConsistency=PETSC_TRUE;
+  PetscInt supgQuadPoints=64;
+  char supgFormName[32]="implicit",supgKernelName[32]="fast",supgStrongViscosityName[32]="effective",mixlenModelName[32]="nikuradse_pipe",mixlenStrainModeName[32]="raw",wallLawName[32]="spalding",wallLinearizationName[32]="secant",wallSampleModeName[48]="legacy_face_trace";
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-supg",&useSupg,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-supg_tau_scale",&supgTauScale,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-supg_magic",&supgMagic,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-supg_quad_points",&supgQuadPoints,nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-supg_form",supgFormName,sizeof(supgFormName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-supg_kernel",supgKernelName,sizeof(supgKernelName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-supg_strong_viscosity",supgStrongViscosityName,sizeof(supgStrongViscosityName),nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-mixing_length",&mixingLength,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-mixlen_audit",&mixlenAudit,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-mixlen_scale",&mixlenScale,nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-mixlen_model",mixlenModelName,sizeof(mixlenModelName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-mixlen_strain_mode",mixlenStrainModeName,sizeof(mixlenStrainModeName),nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-weak_wall_function",&weakWallFunction,nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-wall_law",wallLawName,sizeof(wallLawName),nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-wall_kappa",&wallKappa,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-wall_B",&wallB,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-wall_distance_factor",&wallDistanceFactor,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-wall_beta_scale",&wallBetaScale,nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-wall_linearization",wallLinearizationName,sizeof(wallLinearizationName),nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-wall_tangent_blend",&wallTangentBlend,nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-wall_sample_mode",wallSampleModeName,sizeof(wallSampleModeName),nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-wall_molecular_consistency",&wallMolecularConsistency,nullptr));
+  const std::string supgForm(supgFormName),supgKernel(supgKernelName),supgStrongViscosity(supgStrongViscosityName),mixlenModel(mixlenModelName),mixlenStrainMode(mixlenStrainModeName),wallLaw(wallLawName),wallLinearization(wallLinearizationName),wallSampleMode(wallSampleModeName);
+  const PetscBool supgStrongMolecular=(supgStrongViscosity=="molecular")?PETSC_TRUE:PETSC_FALSE;
+  const PetscBool mixlenDeviatoric=(mixlenStrainMode=="deviatoric")?PETSC_TRUE:PETSC_FALSE;
+  if(useSupg && !centralConvection) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"SUPG requires -convection central in this branch");
+  if(supgTauScale<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"supg_tau_scale >= 0 required");
+  if(supgMagic<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"supg_magic > 0 required");
+  if(supgQuadPoints!=125 && supgQuadPoints!=64 && supgQuadPoints!=45) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-supg_quad_points must be 125, 64, or 45");
+  if(supgForm!="implicit" && supgForm!="explicit") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-supg_form must be implicit or explicit");
+  if(supgKernel!="fast" && supgKernel!="legacy") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-supg_kernel must be fast or legacy");
+  if(supgStrongViscosity!="effective" && supgStrongViscosity!="molecular") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-supg_strong_viscosity must be effective or molecular");
+  if(useSupg && supgKernel=="legacy" && (supgQuadPoints!=125 || supgForm!="implicit")) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"legacy SUPG supports only -supg_quad_points 125 -supg_form implicit");
+  if(mixingLength && problem!="pipe") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Stage-2 mixing length currently supports -problem pipe only");
+  if(mixingLength && mixlenModel!="nikuradse_pipe") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-mixlen_model currently supports only nikuradse_pipe");
+  if(mixlenStrainMode!="raw" && mixlenStrainMode!="deviatoric") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-mixlen_strain_mode must be raw or deviatoric");
+  if(mixlenScale<0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-mixlen_scale must be >= 0");
+  if(weakWallFunction && problem!="pipe") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Stage-3 weak wall function currently supports -problem pipe only");
+  if(weakWallFunction && wallLaw!="spalding") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-wall_law currently supports only spalding");
+  if(wallLinearization!="secant" && wallLinearization!="consistent_tangent")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-wall_linearization must be secant or consistent_tangent");
+  if(wallSampleMode!="legacy_face_trace" && wallSampleMode!="offwall_quarterplane")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-wall_sample_mode must be legacy_face_trace or offwall_quarterplane");
+  if(wallSampleMode=="offwall_quarterplane" && !(wallDistanceFactor>0.0 && wallDistanceFactor<1.0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"offwall_quarterplane requires 0 < -wall_distance_factor < 1");
+  if(wallTangentBlend<0.0 || wallTangentBlend>1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-wall_tangent_blend must satisfy 0 <= blend <= 1");
+  if(wallKappa<=0.0 || wallB<=0.0 || wallDistanceFactor<=0.0 || wallBetaScale<0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"wall law requires kappa>0, B>0, distance_factor>0, beta_scale>=0");
+
+  PetscReal re=(problem=="pipe"?20.0:1.0),au=.5,ap=.5,rauScale=1.0,simpleTol=1e-6,uTol=1e-10,uAtol=0.0,uRelDrop=0.0,uOmega=1.0,pipeBulkVelocity=1.0;
+  PetscReal rauCellBlockBlend=1.0,rauCellBlockRatioMin=0.0,rauCellBlockRatioMax=0.0,rauCellBlockPivotTol=1.0e-14;
+  PetscInt maxOuter=2000,uMax=20000,uCheck=5,uLocalSweeps=1,pPreconditionerRefresh=0;
+  PetscBool pressureProfile=PETSC_FALSE,factoredBenchmark=PETSC_FALSE,m10PcgProfile=PETSC_FALSE;
+  PetscInt factoredBenchmarkAt=1,factoredBenchmarkReps=200;
+  PetscInt pressureProfileAt=1,pressureProfileFineReps=200,pressureProfilePcReps=50,pressureProfileCgIts=10,pressureProfileCgReps=5,pressureProfileLevelMatReps=50,pressureProfileLevelSolveReps=10;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-re",&re,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-pipe_bulk_velocity",&pipeBulkVelocity,nullptr));
+  PetscReal nuOption=1.0,inletNormalSpeed=-1.0; PetscBool nuWasSet=PETSC_FALSE,meshAuditOnly=PETSC_FALSE,distributedMeshGate0=PETSC_FALSE,distributedMesh=PETSC_FALSE,writeVtu=PETSC_TRUE,resourceProfile=PETSC_FALSE,memoryAudit=PETSC_FALSE,momentumBudget=PETSC_FALSE;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-nu",&nuOption,&nuWasSet));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-inlet_normal_speed",&inletNormalSpeed,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-mesh_audit_only",&meshAuditOnly,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-distributed_mesh_gate0",&distributedMeshGate0,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-distributed_mesh",&distributedMesh,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-write_vtu",&writeVtu,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-resource_profile",&resourceProfile,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-memory_audit",&memoryAudit,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-momentum_budget",&momentumBudget,nullptr));
+  PetscBool customMomentumLive=PETSC_FALSE,customMomentumShadow=PETSC_FALSE,customMomentumShadowStrict=PETSC_FALSE,customMomentumShadowSgs=PETSC_TRUE;
+  PetscBool m2bDirectDynamic=PETSC_TRUE,m3StaticReference=PETSC_FALSE,m4bBReference=PETSC_FALSE,m5bPcgReference=PETSC_FALSE,m6bVelocityReference=PETSC_FALSE,m1m2LegacyReference=PETSC_FALSE,dynPlanCompact=PETSC_TRUE;
+  PetscReal customMomentumShadowTol=5e-12,customPressureBShadowTol=5e-12,customPressurePcgReferenceTol=5e-10; PetscInt customMomentumShadowInterval=50;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_momentum_live",&customMomentumLive,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_momentum_shadow",&customMomentumShadow,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_momentum_shadow_strict",&customMomentumShadowStrict,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-custom_momentum_shadow_sgs",&customMomentumShadowSgs,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_momentum_shadow_tol",&customMomentumShadowTol,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_momentum_shadow_interval",&customMomentumShadowInterval,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m2b_direct_dynamic",&m2bDirectDynamic,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m3_static_reference",&m3StaticReference,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m4b_b_reference",&m4bBReference,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_pressure_b_shadow_tol",&customPressureBShadowTol,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m5b_pcg_reference",&m5bPcgReference,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m6b_velocity_reference",&m6bVelocityReference,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m1m2_legacy_reference",&m1m2LegacyReference,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-dynamic_plan_compact",&dynPlanCompact,nullptr));
+  if(m1m2LegacyReference) dynPlanCompact=PETSC_FALSE;
+  if(mixingLength && !dynPlanCompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Stage-2 mixing length requires production -dynamic_plan_compact true");
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_pressure_pcg_reference_tol",&customPressurePcgReferenceTol,nullptr));
+  if(customPressureBShadowTol<=0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_pressure_b_shadow_tol must be > 0");
+  if(customPressurePcgReferenceTol<=0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_pressure_pcg_reference_tol must be > 0");
+  if(customMomentumShadowTol<=0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_momentum_shadow_tol must be > 0");
+  if(customMomentumShadowInterval<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-custom_momentum_shadow_interval must be >= 0");
+  char inletBcName[32]; std::snprintf(inletBcName,sizeof(inletBcName),"%s",problem=="flow"?"fixed_normal_speed":"parabolic");
+  char inletNormalModeName[32]="average_patch_normal";
+  char initialPipeVelocityName[32]="zero";
+  char vtuOutput[PETSC_MAX_PATH_LEN]="p1bf3_solution.vtu";
+  char vtuVelocityModeName[32]="legacy";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-inlet_bc",inletBcName,sizeof(inletBcName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-inlet_normal_mode",inletNormalModeName,sizeof(inletNormalModeName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-initial_pipe_velocity",initialPipeVelocityName,sizeof(initialPipeVelocityName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-vtu_output",vtuOutput,sizeof(vtuOutput),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-vtu_velocity_mode",vtuVelocityModeName,sizeof(vtuVelocityModeName),nullptr));
+  const std::string inletBc(inletBcName),inletNormalMode(inletNormalModeName),initialPipeVelocity(initialPipeVelocityName),vtuVelocityMode(vtuVelocityModeName);
+  if(initialPipeVelocity!="zero" && initialPipeVelocity!="plug" && initialPipeVelocity!="parabolic" && initialPipeVelocity!="one_seventh")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-initial_pipe_velocity must be zero, plug, parabolic, or one_seventh");
+  if(initialPipeVelocity!="zero" && problem!="pipe")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"nonzero -initial_pipe_velocity modes currently require -problem pipe");
+  // Profile initializers intentionally use the exact mesh-normalization already
+  // computed for the matching inlet profile.  Keep the requested profile and
+  // inlet mode paired so initialization and the fixed inlet trace are identical.
+  if(initialPipeVelocity=="parabolic" && inletBc!="parabolic")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-initial_pipe_velocity parabolic currently requires -inlet_bc parabolic");
+  if(initialPipeVelocity=="one_seventh" && inletBc!="one_seventh")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-initial_pipe_velocity one_seventh currently requires -inlet_bc one_seventh");
+  if(vtuVelocityMode!="legacy" && vtuVelocityMode!="cell_average" && vtuVelocityMode!="u0" && vtuVelocityMode!="both")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-vtu_velocity_mode must be legacy, cell_average (or u0), or both");
+  if(inletBc!="parabolic" && inletBc!="one_seventh" && inletBc!="fixed_normal_speed" && inletBc!="dg_numerical_trace") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-inlet_bc must be parabolic, one_seventh, fixed_normal_speed, or dg_numerical_trace");
+  if(problem=="flow" && inletBc!="fixed_normal_speed") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"generic -problem flow currently requires -inlet_bc fixed_normal_speed");
+  if((inletBc=="fixed_normal_speed" || inletBc=="dg_numerical_trace") && inletNormalMode!="average_patch_normal") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"fixed_normal_speed/dg_numerical_trace currently supports only -inlet_normal_mode average_patch_normal");
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-alpha_u",&au,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-alpha_p",&ap,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-rau_scale",&rauScale,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-rau_cell_block_blend",&rauCellBlockBlend,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-rau_cell_block_ratio_min",&rauCellBlockRatioMin,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-rau_cell_block_ratio_max",&rauCellBlockRatioMax,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-rau_cell_block_pivot_tol",&rauCellBlockPivotTol,nullptr));
+
+  // Separate pressure-velocity coupling selector.  This branch defaults to
+  // SIMPLEC, while -simple_variant simple exactly restores the previous SIMPLE
+  // correction metric and therefore provides an in-branch A/B control.
+  char simpleVariantName[32]="simplec";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-simple_variant",simpleVariantName,sizeof(simpleVariantName),nullptr));
+  const std::string simpleVariant(simpleVariantName);
+  if(simpleVariant!="simple" && simpleVariant!="simplec")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simple_variant must be simple or simplec");
+  PetscReal simplecBlend=1.0,simplecFloorFraction=1e-6;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-simplec_blend",&simplecBlend,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-simplec_floor_fraction",&simplecFloorFraction,nullptr));
+  char simplecFallbackName[32]="diag";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-simplec_fallback",simplecFallbackName,sizeof(simplecFallbackName),nullptr));
+  const std::string simplecFallback(simplecFallbackName);
+  if(simplecBlend<0.0 || simplecBlend>1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_blend must satisfy 0 <= blend <= 1");
+  if(simplecFloorFraction<0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_floor_fraction must be >= 0");
+  if(simplecFallback!="diag" && simplecFallback!="floor" && simplecFallback!="error")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-simplec_fallback must be diag, floor, or error");
+
+  char rauModeName[32]="diag";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-rau_mode",rauModeName,sizeof(rauModeName),nullptr));
+  const std::string rauMode(rauModeName);
+  if(rauMode!="diag" && rauMode!="row_l1" && rauMode!="cell_block_diag")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-rau_mode must be diag, row_l1, or cell_block_diag");
+  if(rauMode=="cell_block_diag" && simpleVariant!="simple")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-rau_mode cell_block_diag currently requires -simple_variant simple");
+  char rauCellBlockFallbackName[32]="diag";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-rau_cell_block_fallback",rauCellBlockFallbackName,sizeof(rauCellBlockFallbackName),nullptr));
+  const std::string rauCellBlockFallback(rauCellBlockFallbackName);
+  if(rauCellBlockFallback!="diag" && rauCellBlockFallback!="error")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-rau_cell_block_fallback must be diag or error");
+
+  char uRelaxModeName[32]="diag";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-u_relax_mode",uRelaxModeName,sizeof(uRelaxModeName),nullptr));
+  const std::string uRelaxMode(uRelaxModeName);
+  if(uRelaxMode!="diag" && uRelaxMode!="row_l1") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-u_relax_mode must be diag or row_l1");
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-simple_rtol",&simpleTol,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-simple_max_it",&maxOuter,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-u_rtol",&uTol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-u_atol",&uAtol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-u_rel_drop",&uRelDrop,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-u_max_it",&uMax,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-u_check_every",&uCheck,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-u_local_sweeps",&uLocalSweeps,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-u_sor_omega",&uOmega,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-p_preconditioner_refresh",&pPreconditionerRefresh,nullptr));
+  // PCD Gate 1: make the outer pressure Krylov selectable while leaving the
+  // exact Schur operator and the existing PETSc pressure preconditioner intact.
+  // custom_pcg is the untouched production path; petsc_fgmres is the Gate-1 path.
+  char pressureSolveModeName[32]="custom_pcg";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pressure_solve_mode",pressureSolveModeName,sizeof(pressureSolveModeName),nullptr));
+  const std::string pressureSolveMode(pressureSolveModeName);
+
+  char pressurePcBackendOption[48]="petsc_full_gamg";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pressure_pc_backend",
+    pressurePcBackendOption,sizeof(pressurePcBackendOption),nullptr));
+  PressurePCBackendKind pressurePcBackend=PressurePCBackendKind::PetscFullGAMG;
+  PetscCall(pressurePCBackendParse(pressurePcBackendOption,&pressurePcBackend));
+  const PetscBool customPressureBackend=pressurePCBackendIsCustom(pressurePcBackend);
+
+  CustomPressureAMGConfig customAMGConfig;
+  char customAMGSmootherOption[32]="sgs";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-custom_amg_smoother",
+    customAMGSmootherOption,sizeof(customAMGSmootherOption),nullptr));
+  const std::string customAMGSmoother(customAMGSmootherOption);
+  if(customAMGSmoother=="sgs") {
+    customAMGConfig.directSGSSmoother=PETSC_TRUE;
+    customAMGConfig.directJacobiSmoother=PETSC_FALSE;
+  } else if(customAMGSmoother=="jacobi") {
+    customAMGConfig.directSGSSmoother=PETSC_FALSE;
+    customAMGConfig.directJacobiSmoother=PETSC_TRUE;
+  } else if(customAMGSmoother=="chebyshev") {
+    customAMGConfig.directSGSSmoother=PETSC_FALSE;
+    customAMGConfig.directJacobiSmoother=PETSC_FALSE;
+  } else SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,
+      "-custom_amg_smoother must be sgs, jacobi, or chebyshev");
+
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_target_aggregate",
+    &customAMGConfig.targetAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_min_aggregate",
+    &customAMGConfig.minAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_soft_max_aggregate",
+    &customAMGConfig.softMaxAggregateSize,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_cheb_degree",
+    &customAMGConfig.chebyshevDegree,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_power_its",
+    &customAMGConfig.powerIterations,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_lambda_safety",
+    &customAMGConfig.lambdaSafety,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_lambda_low_fraction",
+    &customAMGConfig.lambdaLowFraction,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_coarse_target",
+    &customAMGConfig.coarseTargetRows,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-custom_amg_interp_max_nnz",
+    &customAMGConfig.interpolationMaxRowNnz,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-custom_amg_sa_damping",
+    &customAMGConfig.smoothedAggregationDamping,nullptr));
+
+  customAMGConfig.smoothedAggregation=
+    (pressurePcBackend==PressurePCBackendKind::CustomAggSmoothed)?PETSC_TRUE:PETSC_FALSE;
+  if(customPressureBackend && pressureSolveMode!="custom_pcg")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,
+      "RANS custom AMG experiment currently requires -pressure_solve_mode custom_pcg");
+  if(customAMGConfig.smoothedAggregation &&
+     (customAMGConfig.directJacobiSmoother || customAMGConfig.directSGSSmoother))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,
+      "smoothed aggregation currently requires the Chebyshev/Jacobi spectral smoother");
+  if(customAMGConfig.chebyshevDegree<1 || customAMGConfig.powerIterations<2 ||
+     customAMGConfig.lambdaSafety<=1.0 || customAMGConfig.lambdaLowFraction<=0.0 ||
+     customAMGConfig.lambdaLowFraction>=1.0 || customAMGConfig.interpolationMaxRowNnz<1 ||
+     customAMGConfig.smoothedAggregationDamping<=0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,
+      "invalid custom AMG Chebyshev/smoothed-aggregation controls");
+
+  if(customPressureBackend) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+    "P1BF3_RANS_CUSTOM_AMG_CONFIG backend=%s outer=custom_FP64_PCG smoother=%s "
+    "targetAggregate=%" PetscInt_FMT " minAggregate=%" PetscInt_FMT
+    " softMaxAggregate=%" PetscInt_FMT " coarseTargetRows=%" PetscInt_FMT
+    " chebDegree=%" PetscInt_FMT " powerIts=%" PetscInt_FMT
+    " lambdaSafety=%.6f lambdaLowFraction=%.6f interpMaxNnz=%" PetscInt_FMT
+    " saDamping=%.12e smoothedAggregation=%d "
+    "fineB=canonical_effective_B_plan exactOperator=matrix_free_Beff_rAU_BeffT "
+    "PETScGAMG=initial_oracle_only\n",
+    pressurePCBackendName(pressurePcBackend),customAMGSmoother.c_str(),
+    customAMGConfig.targetAggregateSize,customAMGConfig.minAggregateSize,
+    customAMGConfig.softMaxAggregateSize,customAMGConfig.coarseTargetRows,
+    customAMGConfig.chebyshevDegree,customAMGConfig.powerIterations,
+    (double)customAMGConfig.lambdaSafety,(double)customAMGConfig.lambdaLowFraction,
+    customAMGConfig.interpolationMaxRowNnz,(double)customAMGConfig.smoothedAggregationDamping,
+    (int)customAMGConfig.smoothedAggregation));
+  if(pressureSolveMode!="custom_pcg" && pressureSolveMode!="petsc_fgmres" && pressureSolveMode!="gamg_richardson")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-pressure_solve_mode must be custom_pcg, gamg_richardson, or petsc_fgmres");
+  PetscBool gate1ComparePcg=PETSC_TRUE;
+  PetscReal gate1SolutionTol=5e-8,gate1TrueResidualTol=1e-8;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate1_compare_pcg",&gate1ComparePcg,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate1_solution_tol",&gate1SolutionTol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate1_true_residual_tol",&gate1TrueResidualTol,nullptr));
+  if(gate1SolutionTol<=0.0 || gate1TrueResidualTol<=0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-1 tolerances must be > 0");
+  PetscBool gate3MpProbe=PETSC_FALSE;
+  PetscReal gate3MpAlgebraTol=1e-14;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate3_mp_probe",&gate3MpProbe,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate3_mp_algebra_tol",&gate3MpAlgebraTol,nullptr));
+  if(gate3MpAlgebraTol<=0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-gate3_mp_algebra_tol must be > 0");
+  if(gate3MpProbe && pressureSolveMode!="petsc_fgmres")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-3 Mp probe requires -pressure_solve_mode petsc_fgmres");
+  PetscBool gate4KpProbe=PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate4_kp_probe",&gate4KpProbe,nullptr));
+  PetscBool gate5KpGamgProbe=PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate5_kp_gamg_probe",&gate5KpGamgProbe,nullptr));
+  PetscBool gate6DiffusionPcdProbe=PETSC_FALSE;
+  PetscReal gate6ChainTol=1e-7,gate6KpTrueResidualTol=1e-8;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate6_diffusion_pcd_probe",&gate6DiffusionPcdProbe,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate6_chain_tol",&gate6ChainTol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate6_kp_true_residual_tol",&gate6KpTrueResidualTol,nullptr));
+  if(gate6ChainTol<=0.0 || gate6KpTrueResidualTol<=0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-6 tolerances must be > 0");
+  PetscBool gate7CpProbe=PETSC_FALSE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate7_cp_probe",&gate7CpProbe,nullptr));
+  PetscBool gate8EswBcProbe=PETSC_FALSE;
+  PetscReal gate8CancelTol=1e-13,gate8WallFluxTol=1e-13;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate8_esw_bc_probe",&gate8EswBcProbe,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate8_cancel_tol",&gate8CancelTol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate8_wall_flux_tol",&gate8WallFluxTol,nullptr));
+  if(gate8CancelTol<=0.0 || gate8WallFluxTol<=0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-8 tolerances must be > 0");
+  PetscBool gate9LivePcd=PETSC_FALSE,gate9dGamgOnly=PETSC_FALSE,gate9eNgfv=PETSC_FALSE,gate9gFeFace=PETSC_FALSE,gate9gRichardson=PETSC_FALSE,gate9hChebyshev=PETSC_FALSE,gate9iAutoChebyshev=PETSC_FALSE;
+  PetscReal gate9KpRtol=1e-10,gate9KpTrueResidualTol=1e-8,gate9OuterTrueResidualTol=1e-8;
+  PetscReal gate9dOmega=1.0,gate9dDivergenceFactor=1e6;
+  PetscReal gate9hLambdaMin=0.1,gate9hLambdaMax=4.5;
+  PetscReal gate9iSafety=1.2,gate9iLambdaMinFraction=0.06,gate9iRtol=0.1,gate9iAtol=1e-10;
+  PetscInt gate9KpMaxIts=200,gate9dMaxCycles=100,gate9hMaxSteps=60,gate9hCheckEvery=5;
+  PetscInt gate9iPowerIts=8,gate9iInitialBlock=8,gate9iExtendBlock=4,gate9iMaxSteps=40;
+  PetscInt gate9iSpectrumRefresh=0,gate9iFixedSteps=0;
+  PetscBool gate9iRequireTarget=PETSC_TRUE;
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9_live_pcd",&gate9LivePcd,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9d_gamg_only",&gate9dGamgOnly,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9e_ngfv",&gate9eNgfv,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9g_fe_face_energy",&gate9gFeFace,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9g_richardson",&gate9gRichardson,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9h_chebyshev",&gate9hChebyshev,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9i_auto_chebyshev",&gate9iAutoChebyshev,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9h_lambda_min",&gate9hLambdaMin,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9h_lambda_max",&gate9hLambdaMax,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9h_max_steps",&gate9hMaxSteps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9h_check_every",&gate9hCheckEvery,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_power_its",&gate9iPowerIts,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9i_safety",&gate9iSafety,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9i_lambda_min_fraction",&gate9iLambdaMinFraction,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9i_rtol",&gate9iRtol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9i_atol",&gate9iAtol,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_initial_block",&gate9iInitialBlock,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_extend_block",&gate9iExtendBlock,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_max_steps",&gate9iMaxSteps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_spectrum_refresh",&gate9iSpectrumRefresh,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9i_fixed_steps",&gate9iFixedSteps,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-gate9i_require_target",&gate9iRequireTarget,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9d_omega",&gate9dOmega,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9d_max_cycles",&gate9dMaxCycles,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9d_divergence_factor",&gate9dDivergenceFactor,nullptr));
+  if(gate9dGamgOnly) gate9LivePcd=PETSC_TRUE;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9_kp_rtol",&gate9KpRtol,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-gate9_kp_max_it",&gate9KpMaxIts,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9_kp_true_residual_tol",&gate9KpTrueResidualTol,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-gate9_outer_true_residual_tol",&gate9OuterTrueResidualTol,nullptr));
+  if(gate9KpRtol<=0.0 || gate9KpMaxIts<1 || gate9KpTrueResidualTol<=0.0 || gate9OuterTrueResidualTol<=0.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 Kp/outer tolerances must be positive");
+  if(gate9dOmega<=0.0 || gate9dMaxCycles<1 || gate9dDivergenceFactor<=1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9D requires omega>0, max_cycles>=1, divergence_factor>1");
+  if(gate9gRichardson && !gate9gFeFace) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-gate9g_richardson requires -gate9g_fe_face_energy 1");
+  // FULLFAST-B1: Chebyshev is a pressure-outer algorithm, not a compact-Pmat-specific gate.
+  // It may therefore drive either native_face GAMG or the explicit full-Schur GAMG Pmat.
+  // Richardson Gate-9G remains tied to the compact diagnostic path; the production
+  // full-Schur Richardson route uses -pressure_solve_mode gamg_richardson instead.
+  if((gate9hChebyshev?1:0)+(gate9iAutoChebyshev?1:0)+(gate9gRichardson?1:0)>1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9G Richardson, Gate-9H fixed Chebyshev, and Gate-9I auto Chebyshev are mutually exclusive");
+  if(gate9hLambdaMin<=0.0 || gate9hLambdaMax<=gate9hLambdaMin || gate9hMaxSteps<1 || gate9hCheckEvery<1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9H requires 0<lambda_min<lambda_max, max_steps>=1, check_every>=1");
+  // Gate-9I option validation is relevant only when adaptive Chebyshev is active.
+  // Historical/custom-PCG pressure solves legitimately use p_atol=0; RUN_GATE9N_PIPE
+  // mirrors that value into dormant Gate-9I options, so unconditional validation
+  // incorrectly rejected otherwise-valid non-Chebyshev runs before mesh setup.
+  if(gate9iAutoChebyshev &&
+     (gate9iPowerIts<2 || gate9iSafety<=1.0 || gate9iLambdaMinFraction<=0.0 || gate9iLambdaMinFraction>=1.0 || gate9iRtol<=0.0 || gate9iRtol>=1.0 || gate9iAtol<=0.0 || gate9iInitialBlock<1 || gate9iExtendBlock<1 || gate9iMaxSteps<gate9iInitialBlock || gate9iSpectrumRefresh<0 || gate9iFixedSteps<0))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9I requires power_its>=2, safety>1, 0<lambda_min_fraction<1, 0<rtol<1, atol>0, valid block sizes, spectrum_refresh>=0, fixed_steps>=0");
+  // Gate-9G FE-face energy is a Pmat construction and can therefore be used
+  // either by the historical custom-PCG outer solve (PETSc owns only GAMG
+  // PCApply) or directly as the PETSc Pmat for the existing exact-Schur
+  // FGMRES path.  Gate-9G Richardson / Gate-9H / Gate-9I remain no-Krylov
+  // algorithms and keep their historical custom_pcg KSP-container semantics.
+  if(gate9gFeFace && pressureSolveMode!="custom_pcg" && pressureSolveMode!="petsc_fgmres")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-gate9g_fe_face_energy supports -pressure_solve_mode custom_pcg or petsc_fgmres");
+  if(pressureSolveMode=="petsc_fgmres" && (gate9gRichardson || gate9hChebyshev || gate9iAutoChebyshev))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9G Richardson / Gate-9H / Gate-9I are no-Krylov pressure algorithms and require -pressure_solve_mode custom_pcg");
+  // Gate 9C needs only Gate-4 geometric Kp; do not force Gate-7/8 PCD pieces.
+  if(gate8EswBcProbe) gate7CpProbe=PETSC_TRUE;
+  if(gate7CpProbe && !centralConvection) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-7/8/9 Cp/ESW/PCD require -convection central");
+  if(gate5KpGamgProbe || gate6DiffusionPcdProbe || gate7CpProbe || gate8EswBcProbe || gate9LivePcd || gate9eNgfv) gate4KpProbe=PETSC_TRUE;
+  if(gate4KpProbe && pressureSolveMode!="petsc_fgmres" && !gate9eNgfv)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-4/5/6/7/8/9 Kp/PCD requires -pressure_solve_mode petsc_fgmres");
+  if(gate9LivePcd && problem=="mms") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 live PCD is a pipe/flow gate, not MMS");
+  char pPmatName[32]="full";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-p_pmat",pPmatName,sizeof(pPmatName),nullptr));
+  const std::string pPmatMode(pPmatName);
+  if(pPmatMode!="full" && pPmatMode!="compact_face" && pPmatMode!="fe_fv_face" && pPmatMode!="fv_lsq" && pPmatMode!="native_face")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_pmat must be full, compact_face, fe_fv_face, fv_lsq, or native_face");
+  char pOperatorName[32]="explicit";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-p_operator",pOperatorName,sizeof(pOperatorName),nullptr));
+  const std::string pOperatorMode(pOperatorName);
+  if(pOperatorMode!="explicit" && pOperatorMode!="factored")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_operator must be explicit or factored");
+  if(pPmatMode=="native_face" && pOperatorMode!="factored")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_pmat native_face requires -p_operator factored so the exact custom B rAU Bt remains the Krylov operator");
+  if(gate9gFeFace && pressureSolveMode=="petsc_fgmres" && pPmatMode!="native_face")
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9G FE-face + PETSc FGMRES requires -p_pmat native_face");
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-pressure_factored_benchmark",&factoredBenchmark,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_factored_benchmark_at",&factoredBenchmarkAt,nullptr));
+  if(pPmatMode=="native_face" && factoredBenchmark) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_pmat native_face does not materialize the exact Schur benchmark matrix; disable -pressure_factored_benchmark");
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_factored_benchmark_reps",&factoredBenchmarkReps,nullptr));
+  PetscReal feFvP1Strength=1.0;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_fe_fv_p1_strength",&feFvP1Strength,nullptr));
+  if(feFvP1Strength<0.0 || feFvP1Strength>3.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_fe_fv_p1_strength must satisfy 0 <= strength <= 3 (values >1 are diagnostic and need not remain diagonally dominant)");
+  PetscReal fvLsqStrength=0.9,fvLsqTpfaFloor=0.10;
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_fv_lsq_strength",&fvLsqStrength,nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr,nullptr,"-p_fv_lsq_tpfa_floor",&fvLsqTpfaFloor,nullptr));
+  if(fvLsqStrength<=0.0 || fvLsqStrength>1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_fv_lsq_strength must satisfy 0 < strength <= 1");
+  if(fvLsqTpfaFloor<0.0 || fvLsqTpfaFloor>1.0)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-p_fv_lsq_tpfa_floor must satisfy 0 <= floor <= 1");
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-pressure_profile",&pressureProfile,nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr,nullptr,"-m10_pcg_profile",&m10PcgProfile,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_at",&pressureProfileAt,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_fine_reps",&pressureProfileFineReps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_pc_reps",&pressureProfilePcReps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_cg_its",&pressureProfileCgIts,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_cg_reps",&pressureProfileCgReps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_level_mat_reps",&pressureProfileLevelMatReps,nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr,nullptr,"-pressure_profile_level_solve_reps",&pressureProfileLevelSolveReps,nullptr));
+
+  char wallPatchName[64]="patch_0_0",inletPatchName[64]="patch_2_0",outletPatchName[64]="patch_1_0";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pipe_wall_patch",wallPatchName,sizeof(wallPatchName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pipe_inlet_patch",inletPatchName,sizeof(inletPatchName),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-pipe_outlet_patch",outletPatchName,sizeof(outletPatchName),nullptr));
+  char flowWallPatches[512]="",flowInletPatch[128]="",flowOutletPatch[128]="";
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-flow_wall_patches",flowWallPatches,sizeof(flowWallPatches),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-flow_inlet_patch",flowInletPatch,sizeof(flowInletPatch),nullptr));
+  PetscCall(PetscOptionsGetString(nullptr,nullptr,"-flow_outlet_patch",flowOutletPatch,sizeof(flowOutletPatch),nullptr));
+
+  if(re<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Re > 0 required");
+  if(pipeBulkVelocity<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"pipe_bulk_velocity > 0 required");
+  if(nuWasSet && nuOption<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-nu > 0 required");
+  if((inletBc=="fixed_normal_speed" || inletBc=="dg_numerical_trace") && inletNormalSpeed==0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-inlet_normal_speed must be nonzero for fixed_normal_speed/dg_numerical_trace");
+  if(au<=0||au>1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 < alpha_u <= 1 required");
+  if(ap<=0||ap>1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 < alpha_p <= 1 required");
+  if(rauScale<=0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"rau_scale > 0 required");
+  if(rauCellBlockBlend<0.0 || rauCellBlockBlend>1.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 <= rau_cell_block_blend <= 1 required");
+  if(rauCellBlockRatioMin<0.0 || rauCellBlockRatioMax<0.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"rau_cell_block_ratio_min/max must be >= 0 (0 disables that clamp)");
+  if(rauCellBlockRatioMin>0.0 && rauCellBlockRatioMax>0.0 && rauCellBlockRatioMin>rauCellBlockRatioMax) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"rau_cell_block_ratio_min must be <= ratio_max when both clamps are enabled");
+  if(!(rauCellBlockPivotTol>0.0) || rauCellBlockPivotTol>=1.0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 < rau_cell_block_pivot_tol < 1 required");
+  if(uOmega<=0||uOmega>=2) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 < u_sor_omega < 2 required");
+  if(uTol<0 || uAtol<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"u_rtol and u_atol must be >= 0");
+  if(uRelDrop<0||uRelDrop>=1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"0 <= u_rel_drop < 1 required (0 disables initial-residual-drop stopping)");
+  if(uLocalSweeps<1) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"u_local_sweeps >= 1 required");
+  if(pPreconditionerRefresh<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"p_preconditioner_refresh >= 0 required (0 = PETSc default refresh behavior)");
+  if(pressureProfileAt<1 || pressureProfileFineReps<1 || pressureProfilePcReps<1 || pressureProfileCgIts<1 || pressureProfileCgReps<1 || pressureProfileLevelMatReps<1 || pressureProfileLevelSolveReps<1)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"pressure profile counts must all be >= 1");
+  if(factoredBenchmarkAt<1 || factoredBenchmarkReps<1)
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"factored Schur benchmark counts must be >= 1");
+
+  if(inletBc=="dg_numerical_trace" &&
+     (problem!="pipe" || !centralConvection || pOperatorMode!="factored" || pPmatMode!="full" ||
+      (pressureSolveMode!="petsc_fgmres" && pressureSolveMode!="custom_pcg") || !dynPlanCompact))
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,
+      "dg_numerical_trace requires pipe + central + factored exact pressure operator + full Schur Pmat + pressure solve petsc_fgmres or custom_pcg + compact dynamic plan");
+
+  try {
+    PetscLogDouble tTotal0,tAsm0,tAsm1,tSolve0,tSolve1;
+    PetscLogDouble tMesh0,tMesh1,tAudit0,tAudit1,tProblem0,tProblem1,tGhost0,tGhost1,tPPlan0,tPPlan1,tCPlan0,tCPlan1,tSupgPlan0,tSupgPlan1,tObjects0,tObjects1;
+    PetscCall(PetscTime(&tTotal0));
+    if(resourceProfile) PetscCall(printResourceMark("startup",0,0.0,tTotal0));
+    PetscCall(PetscTime(&tMesh0));
+    Mesh M, MrootGlobal;
+    Discrete D, DrootGlobal;
+    ProblemConfig P;
+    PetscInt reportCells=0, reportInternalFaces=0;
+    PetscBool rootGlobalRetained=PETSC_FALSE;
+
+    if(distributedMesh && distributedMeshGate0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"-distributed_mesh and -distributed_mesh_gate0 are mutually exclusive");
+    if(distributedMesh) {
+      if(problem!="pipe" || (inletBc!="parabolic" && inletBc!="one_seventh" && inletBc!="fixed_normal_speed" && inletBc!="dg_numerical_trace") || (pPmatMode!="native_face" && pPmatMode!="full") || pOperatorMode!="factored")
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"distributed production currently supports pipe with parabolic, one_seventh, fixed_normal_speed, or dg_numerical_trace inlet, p_pmat native_face or full, and p_operator factored");
+      // M1M2 Gate 1 is allowed to create one temporary distributed PETSc D.A
+      // diffusion oracle. assembleMPI() explicitly supports this reference and
+      // D.A is destroyed before the live SIMPLE solve.  B/velocity legacy
+      // references remain prohibited in the distributed production branch.
+      if(m4bBReference || m6bVelocityReference)
+        SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"distributed production gate does not support B/velocity legacy reference objects; use production Gate9N options");
+      if(rank==0) MrootGlobal=loadFoamTetMesh(meshPath);
+      PetscInt globalCounts[4]={0,0,0,0};
+      if(rank==0){globalCounts[0]=(PetscInt)MrootGlobal.points.size();globalCounts[1]=(PetscInt)MrootGlobal.faces.size();globalCounts[2]=(PetscInt)MrootGlobal.neighbour.size();globalCounts[3]=(PetscInt)MrootGlobal.tets.size();}
+      PetscCallMPI(MPI_Bcast(globalCounts,4,MPIU_INT,0,PETSC_COMM_WORLD)); reportCells=globalCounts[3]; reportInternalFaces=globalCounts[2];
+      PetscCall(PetscTime(&tMesh1));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MESH path=%s points=%" PetscInt_FMT " faces=%" PetscInt_FMT " internalFaces=%" PetscInt_FMT " boundaryFaces=%" PetscInt_FMT " cells=%" PetscInt_FMT " meshRead=root_only_global_then_scatter_local\n",
+        meshPath,globalCounts[0],globalCounts[1],globalCounts[2],globalCounts[1]-globalCounts[2],globalCounts[3]));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MESH_STORAGE faceVertices=std_array_int3 parser=streaming_token distributed=owned_plus_velocity_star_plus_pressure_face_neighbour rootFullCopy=1 nonrootFullCopy=0\n"));
+      PetscCall(PetscTime(&tAudit0));
+      if(rank==0){PetscCall(buildPlexAuditSelf(MrootGlobal));PetscCall(printPatchAuditRoot(MrootGlobal));}
+      PetscCall(PetscTime(&tAudit1));
+      PetscCall(printSetupPhase("mesh_patch_audit_root",tAudit1-tAudit0,reportCells));
+      if(resourceProfile) PetscCall(printResourceMark("after_root_global_mesh",reportCells,tMesh1-tMesh0,tTotal0));
+
+      PetscCall(PetscTime(&tProblem0));
+      if(rank==0) {
+        P.mode=ProblemMode::Pipe; P.centralConvection=centralConvection; P.weakWallFunction=weakWallFunction; P.re=(double)re;
+        P.inletBC=(inletBc=="dg_numerical_trace")?InletBCMode::DgNumericalTrace:((inletBc=="fixed_normal_speed")?InletBCMode::FixedNormalSpeed:((inletBc=="one_seventh")?InletBCMode::PipeOneSeventh:InletBCMode::PipeParabolic));
+        const double inletCharacteristicSpeed=(P.inletBC==InletBCMode::FixedNormalSpeed || P.inletBC==InletBCMode::DgNumericalTrace)?std::abs((double)inletNormalSpeed):(double)pipeBulkVelocity;
+        P.pipe=makePipeGeometry(MrootGlobal,(double)re,inletCharacteristicSpeed,P.inletBC,wallPatchName,inletPatchName,outletPatchName);
+        if(nuWasSet){P.pipe.nu=(double)nuOption;P.pipe.re=inletCharacteristicSpeed*P.pipe.D/P.pipe.nu;P.pipe.hpGradient=32.0*P.pipe.nu*inletCharacteristicSpeed/(P.pipe.D*P.pipe.D);P.pipe.hpDrop=P.pipe.hpGradient*P.pipe.L;}
+        P.re=P.pipe.re;P.nu=P.pipe.nu;P.boundary=makeBoundaryGeometry(MrootGlobal,{wallPatchName},inletPatchName,outletPatchName,(double)inletNormalSpeed);
+        PetscCall(buildOwnership(MrootGlobal,rank,size,P,DrootGlobal));
+        if(P.inletBC==InletBCMode::FixedNormalSpeed) PetscCall(auditFixedNormalInletRoot(MrootGlobal,DrootGlobal,P));
+      }
+      std::vector<char> pb;if(rank==0)pb=packProblemConfigPipe(P);PetscCall(distBcastBytes(pb));if(rank!=0)P=unpackProblemConfigPipe(pb);
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_PIPE_GEOMETRY axis=z zIn=%.12g zOut=%.12g L=%.12g R=%.12g D=%.12g Uchar=%.12g Re=%.12g nu=%.12g inletArea=%.12e circleArea=%.12e areaRatio=%.9f inletProfileScale=%.9f hpDrop=%.12g hpGrad=%.12g\n",
+        P.pipe.zIn,P.pipe.zOut,P.pipe.L,P.pipe.R,P.pipe.D,P.pipe.bulkVelocity,P.pipe.re,P.pipe.nu,P.pipe.inletArea,P.pipe.circleArea,P.pipe.areaRatio,P.pipe.profileScale,P.pipe.hpDrop,P.pipe.hpGradient));
+      if(P.inletBC==InletBCMode::PipeParabolic) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_PIPE_BC wall=%s:%s inlet=%s:parabolic_faceMeanNormalized outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",
+        P.pipe.wallPatch.c_str(),P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",P.pipe.inletPatch.c_str(),P.pipe.outletPatch.c_str()));
+      else if(P.inletBC==InletBCMode::PipeOneSeventh) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_PIPE_BC wall=%s:%s inlet=%s:one_seventh_faceMeanNormalized exponent=0.142857142857 analyticCircleScale=1.224489795918 meshScale=%.12g outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",
+        P.pipe.wallPatch.c_str(),P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",P.pipe.inletPatch.c_str(),P.pipe.profileScale,P.pipe.outletPatch.c_str()));
+      else PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_PIPE_BC wall=%s:%s inlet=%s:fixed_normal_speed signedSpeed=%.12g normalMode=average_patch_normal U=[%.12e,%.12e,%.12e] outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",
+        P.pipe.wallPatch.c_str(),P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",P.pipe.inletPatch.c_str(),(double)P.boundary.signedNormalSpeed,
+        P.boundary.inletVelocity.x,P.boundary.inletVelocity.y,P.boundary.inletVelocity.z,P.pipe.outletPatch.c_str()));
+      PetscCall(PetscTime(&tProblem1));
+      PetscCall(printSetupPhase("problem_boundary_config_and_global_ownership_root",tProblem1-tProblem0,reportCells));
+
+      DistProductionPacket localPacket; PetscLogDouble tDist0=0,tDist1=0;PetscCall(PetscTime(&tDist0));PetscCall(distributeProductionMeshRoot(MrootGlobal,DrootGlobal,rank,size,localPacket,pPmatMode=="full"?PETSC_TRUE:PETSC_FALSE));PetscCall(PetscTime(&tDist1));
+      M=std::move(localPacket.M);D=std::move(localPacket.D);rootGlobalRetained=(rank==0)?PETSC_TRUE:PETSC_FALSE;
+      PetscInt lc=(PetscInt)M.tets.size(),lf=(PetscInt)M.faces.size(),lp=(PetscInt)M.points.size(),sc=0,sf=0,sp=0,minc=0,maxc=0;
+      PetscCallMPI(MPI_Allreduce(&lc,&sc,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lf,&sf,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lp,&sp,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lc,&minc,1,MPIU_INT,MPI_MIN,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lc,&maxc,1,MPIU_INT,MPI_MAX,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_DIST_ACTIVE ranks=%d rootOnlyRead=1 rootGlobalRetained=1 nonrootGlobalRetained=0 localCellMin=%" PetscInt_FMT " localCellMax=%" PetscInt_FMT " aggregateLocalCells=%" PetscInt_FMT " supportDuplication=%.6f aggregateLocalPoints=%" PetscInt_FMT " aggregateLocalFaces=%" PetscInt_FMT " pressureSupport=%s\n",
+        size,minc,maxc,sc,reportCells?((double)sc/(double)reportCells):0.0,sp,sf,pPmatMode=="full"?"owned_pressure_vertex_stars_plus_base":"base_compact"));
+      PetscCall(printSetupPhase("distributed_pack_scatter",tDist1-tDist0,reportCells));
+      if(resourceProfile) PetscCall(printResourceMark("after_distributed_local_mesh",reportCells,tDist1-tDist0,tTotal0));
+      if(memoryAudit){PetscCall(auditMeshMemory(M,reportCells,"distributed_rank_local_support"));PetscCall(auditRootGlobalMeshMemory(MrootGlobal,rank,reportCells));}
+      if(meshAuditOnly){PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MESH_AUDIT_ONLY status=PASS distributed=1 no_solve=1\n"));PetscCall(PetscFinalize());return 0;}
+    } else {
+      M=loadFoamTetMesh(meshPath); reportCells=(PetscInt)M.tets.size(); reportInternalFaces=(PetscInt)M.neighbour.size();
+      PetscCall(PetscTime(&tMesh1));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MESH path=%s points=%zu faces=%zu internalFaces=%zu boundaryFaces=%zu cells=%zu meshRead=replicated_per_rank\n",
+        meshPath,M.points.size(),M.faces.size(),M.neighbour.size(),M.faces.size()-M.neighbour.size(),M.tets.size()));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MESH_STORAGE faceVertices=std_array_int3 parser=streaming_token noPerFaceHeap=1 noWholeFileRegexCopies=1\n"));
+      PetscCall(PetscTime(&tAudit0));
+      if(rank==0){PetscCall(buildPlexAuditSelf(M));PetscCall(printPatchAuditRoot(M));}
+      PetscCall(PetscTime(&tAudit1));
+      PetscCall(printSetupPhase("mesh_patch_audit_root",tAudit1-tAudit0,reportCells));
+      if(resourceProfile)PetscCall(printResourceMark("after_mesh",reportCells,tMesh1-tMesh0,tTotal0));
+      if(memoryAudit)PetscCall(auditMeshMemory(M,reportCells));
+      PetscCall(printSetupPhase("mesh_load",tMesh1-tMesh0,reportCells));
+      if(meshAuditOnly){PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MESH_AUDIT_ONLY status=PASS no_solve=1\n"));PetscCall(PetscFinalize());return 0;}
+
+      PetscCall(PetscTime(&tProblem0));
+      P.mode=(problem=="pipe")?ProblemMode::Pipe:((problem=="flow")?ProblemMode::Flow:ProblemMode::MMS);P.centralConvection=centralConvection;P.weakWallFunction=weakWallFunction;P.re=(double)re;P.inletBC=(inletBc=="dg_numerical_trace")?InletBCMode::DgNumericalTrace:((inletBc=="fixed_normal_speed")?InletBCMode::FixedNormalSpeed:((inletBc=="one_seventh")?InletBCMode::PipeOneSeventh:InletBCMode::PipeParabolic));
+      if(P.mode==ProblemMode::Pipe){const double inletCharacteristicSpeed=(P.inletBC==InletBCMode::FixedNormalSpeed || P.inletBC==InletBCMode::DgNumericalTrace)?std::abs((double)inletNormalSpeed):(double)pipeBulkVelocity;P.pipe=makePipeGeometry(M,(double)re,inletCharacteristicSpeed,P.inletBC,wallPatchName,inletPatchName,outletPatchName);if(nuWasSet){P.pipe.nu=(double)nuOption;P.pipe.re=inletCharacteristicSpeed*P.pipe.D/P.pipe.nu;P.pipe.hpGradient=32.0*P.pipe.nu*inletCharacteristicSpeed/(P.pipe.D*P.pipe.D);P.pipe.hpDrop=P.pipe.hpGradient*P.pipe.L;}P.re=P.pipe.re;P.nu=P.pipe.nu;P.boundary=makeBoundaryGeometry(M,{wallPatchName},inletPatchName,outletPatchName,(double)inletNormalSpeed);PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_PIPE_GEOMETRY axis=z zIn=%.12g zOut=%.12g L=%.12g R=%.12g D=%.12g Uchar=%.12g Re=%.12g nu=%.12g inletArea=%.12e circleArea=%.12e areaRatio=%.9f inletProfileScale=%.9f hpDrop=%.12g hpGrad=%.12g\n",P.pipe.zIn,P.pipe.zOut,P.pipe.L,P.pipe.R,P.pipe.D,P.pipe.bulkVelocity,P.pipe.re,P.pipe.nu,P.pipe.inletArea,P.pipe.circleArea,P.pipe.areaRatio,P.pipe.profileScale,P.pipe.hpDrop,P.pipe.hpGradient));if(P.inletBC==InletBCMode::PipeParabolic)PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_PIPE_BC wall=%s:%s inlet=%s:parabolic_faceMeanNormalized outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",P.pipe.wallPatch.c_str(),P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",P.pipe.inletPatch.c_str(),P.pipe.outletPatch.c_str()));else if(P.inletBC==InletBCMode::PipeOneSeventh)PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_PIPE_BC wall=%s:%s inlet=%s:one_seventh_faceMeanNormalized exponent=0.142857142857 analyticCircleScale=1.224489795918 meshScale=%.12g outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",P.pipe.wallPatch.c_str(),P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",P.pipe.inletPatch.c_str(),P.pipe.profileScale,P.pipe.outletPatch.c_str()));else PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_PIPE_BC wall=%s:%s inlet=%s:fixed_normal_speed signedSpeed=%.12g normalMode=average_patch_normal U=[%.12e,%.12e,%.12e] outlet=%s:natural_zero_traction pressureGauge=physical_outlet_no_nullspace\n",wallPatchName,P.weakWallFunction?"weakSpalding_axialTangential_UxUyStrongZero":"noSlip",inletPatchName,(double)inletNormalSpeed,P.boundary.inletVelocity.x,P.boundary.inletVelocity.y,P.boundary.inletVelocity.z,outletPatchName));}
+      else if(P.mode==ProblemMode::Flow){const auto walls=splitPatchNames(flowWallPatches);if(walls.empty()||std::string(flowInletPatch).empty()||std::string(flowOutletPatch).empty())throw std::runtime_error("-problem flow requires wall/inlet/outlet patches");P.boundary=makeBoundaryGeometry(M,walls,flowInletPatch,flowOutletPatch,(double)inletNormalSpeed);P.nu=nuWasSet?(double)nuOption:1.0/(double)re;P.re=1.0/P.nu;}
+      else P.nu=1.0/(double)re;
+      PetscCall(PetscTime(&tProblem1));PetscCall(printSetupPhase("problem_boundary_config",tProblem1-tProblem0,reportCells));if(resourceProfile)PetscCall(printResourceMark("after_problem_config",reportCells,tProblem1-tProblem0,tTotal0));
+
+      if(distributedMeshGate0){PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_DIST_GATE0_BEGIN ranks=%d mesh=%s mode=construction_and_parity_only productionSolve=DISABLED\n",size,meshPath));PetscCall(runDistributedMeshGate0(M,P,rank,size));if(resourceProfile)PetscCall(printResourceMark("distributed_mesh_gate0_complete",reportCells,0.0,tTotal0));PetscCall(PetscFinalize());return 0;}
+    }
+    if(dgNumericalTraceInlet(P)) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_DG_INLET_CONFIG mode=dg_numerical_trace inlet=%s velocityDOFs=FREE numericalTrace=P0_prescribed_flux B=volume_minus_face_trace momentum=inflow_plus_nonsymmetric_Nitsche nuEff=nu_plus_lagged_nuT Uhat=[%.12e,%.12e,%.12e] fullSchurParity=REQUIRED\n",
+      P.boundary.inletPatch.c_str(),P.boundary.inletVelocity.x,P.boundary.inletVelocity.y,P.boundary.inletVelocity.z));
+    const double nu=P.nu;
+
+    PetscCall(PetscTime(&tAsm0));
+    PetscCall(assembleMPI(M,rank,size,P,D,m3StaticReference,m4bBReference,m6bVelocityReference));
+    PetscCall(PetscTime(&tAsm1));
+    PetscCall(printSetupPhase("fe_assembly",tAsm1-tAsm0,reportCells));
+    if(resourceProfile) PetscCall(printResourceMark("after_fe_assembly",reportCells,tAsm1-tAsm0,tTotal0));
+    if(memoryAudit) {PetscCall(auditDiscreteMemory(D,reportCells,PETSC_TRUE)); if(distributedMesh) PetscCall(auditRootGlobalOwnershipMemory(DrootGlobal,rank,reportCells));}
+    if(!distributedMesh && rank==0 && P.inletBC==InletBCMode::FixedNormalSpeed) PetscCall(auditFixedNormalInletRoot(M,D,P));
+
+    GhostPlan G;
+    PetscCall(PetscTime(&tGhost0));
+    PetscCall(buildVelocityGhostPlan(M,D,rank,G));
+    PetscCall(PetscTime(&tGhost1));
+    PetscCall(printSetupPhase("velocity_ghost_plan",tGhost1-tGhost0,reportCells));
+    PressureAssemblyPlan PSchur;
+    const PetscBool buildExpandedSchur = (pOperatorMode=="explicit" || pPmatMode=="full" || factoredBenchmark) ? PETSC_TRUE : PETSC_FALSE;
+    PetscCall(PetscTime(&tPPlan0));
+    PetscCall(buildPressureAssemblyPlan(M,D,P,rank,G,pPmatMode,buildExpandedSchur,PSchur));
+    PetscCall(PetscTime(&tPPlan1));
+    PetscCall(printSetupPhase("pressure_assembly_plan",tPPlan1-tPPlan0,reportCells));
+    CentralAssemblyPlan CPlan; SupgAssemblyPlan SupgPlan; // empty legacy plans in M2B
+    PetscCall(PetscTime(&tCPlan0)); PetscCall(PetscTime(&tCPlan1));
+    PetscCall(printSetupPhase("central_assembly_plan",tCPlan1-tCPlan0,reportCells));
+    PetscCall(PetscTime(&tSupgPlan0)); PetscCall(PetscTime(&tSupgPlan1));
+    PetscCall(printSetupPhase("supg_assembly_plan",tSupgPlan1-tSupgPlan0,reportCells));
+    if(resourceProfile) PetscCall(printResourceMark("after_plans",reportCells,(tGhost1-tGhost0)+(tPPlan1-tPPlan0),tTotal0));
+    if(memoryAudit) PetscCall(auditPlanMemory(G,PSchur,CPlan,SupgPlan,reportCells));
+
+    PetscCall(PetscTime(&tObjects0));
+    std::array<std::vector<double>,3> U;
+    for(int d=0;d<3;++d) U[(std::size_t)d].assign((std::size_t)D.velCount[rank],0.0);
+    if(initialPipeVelocity!="zero") {
+      PetscInt vStart=0; for(int r=0;r<rank;++r) vStart+=D.velCount[(std::size_t)r];
+      const PetscInt vEnd=vStart+D.velCount[(std::size_t)rank];
+      PetscInt localSet=0,globalSet=0;
+      double localMinUz=1e300,localMaxUz=-1e300,globalMinUz=0.0,globalMaxUz=0.0;
+
+      // Preserve FIX10 exactly for fixed-normal plug initialization.  For a
+      // profile inlet, plug means the straight-pipe potential-flow state with
+      // +z speed equal to the requested bulk velocity.
+      const std::array<double,3> plugVec=(P.inletBC==InletBCMode::FixedNormalSpeed || P.inletBC==InletBCMode::DgNumericalTrace)
+        ? std::array<double,3>{P.boundary.inletVelocity.x,P.boundary.inletVelocity.y,P.boundary.inletVelocity.z}
+        : std::array<double,3>{0.0,0.0,P.pipe.bulkVelocity};
+
+      for(PetscInt v=0;v<(PetscInt)M.points.size();++v) {
+        const PetscInt gid=D.g2free[(std::size_t)v];
+        if(gid>=vStart && gid<vEnd) {
+          double ux=0.0,uy=0.0,uz=0.0;
+          if(initialPipeVelocity=="plug") {
+            ux=plugVec[0]; uy=plugVec[1]; uz=plugVec[2];
+          } else if(initialPipeVelocity=="parabolic") {
+            uz=P.pipe.profileScale*pipeIdealUz(P.pipe,M.points[(std::size_t)v].x,M.points[(std::size_t)v].y);
+          } else { // one_seventh; validation above guarantees the matching inlet normalization
+            uz=P.pipe.profileScale*pipeIdealOneSeventhUz(P.pipe,M.points[(std::size_t)v].x,M.points[(std::size_t)v].y);
+          }
+          const std::size_t lv=(std::size_t)(gid-vStart);
+          U[0][lv]=ux; U[1][lv]=uy; U[2][lv]=uz;
+          localMinUz=std::min(localMinUz,uz); localMaxUz=std::max(localMaxUz,uz);
+          ++localSet;
+        }
+      }
+      PetscCallMPI(MPI_Allreduce(&localSet,&globalSet,1,MPIU_INT,MPI_SUM,PETSC_COMM_WORLD));
+      if(globalSet!=D.freeVertices) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"pipe initialization did not visit every global free P1 vertex exactly once");
+      PetscCallMPI(MPI_Allreduce(&localMinUz,&globalMinUz,1,MPI_DOUBLE,MPI_MIN,PETSC_COMM_WORLD));
+      PetscCallMPI(MPI_Allreduce(&localMaxUz,&globalMaxUz,1,MPI_DOUBLE,MPI_MAX,PETSC_COMM_WORLD));
+
+      if(initialPipeVelocity=="plug") {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_INITIAL_PIPE_VELOCITY mode=plug inletBC=%s vector=[%.12e,%.12e,%.12e] uzRange=[%.12e,%.12e] freeP1VerticesSet=%" PetscInt_FMT " expectedFreeP1Vertices=%" PetscInt_FMT " freeBF3Faces=%" PetscInt_FMT " bf3Init=zero fixedDirichlet=unchanged semantics=constant_P1_field status=PASS\n",
+          inletBc.c_str(),plugVec[0],plugVec[1],plugVec[2],globalMinUz,globalMaxUz,globalSet,D.freeVertices,D.freeFaces));
+      } else {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_INITIAL_PIPE_VELOCITY mode=%s inletBC=%s Ubulk=%.12e profileScale=%.12e uzRange=[%.12e,%.12e] freeP1VerticesSet=%" PetscInt_FMT " expectedFreeP1Vertices=%" PetscInt_FMT " freeBF3Faces=%" PetscInt_FMT " bf3Init=zero fixedDirichlet=unchanged semantics=matched_radial_P1_profile status=PASS\n",
+          initialPipeVelocity.c_str(),inletBc.c_str(),P.pipe.bulkVelocity,P.pipe.profileScale,globalMinUz,globalMaxUz,globalSet,D.freeVertices,D.freeFaces));
+      }
+    } else {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_INITIAL_PIPE_VELOCITY mode=zero vector=[0,0,0] freeP1VerticesSet=0 freeBF3Faces=%" PetscInt_FMT " bf3Init=zero fixedDirichlet=unchanged status=PASS\n",D.freeFaces));
+    }
+
+    // M1+M2: build owned-row topology and row-slot plan once.  Static diffusion
+    // is integrated into the single active aRel CSR for the setup parity check,
+    // then re-integrated directly into aRel on every physical-operator rebuild.
+    Mat C=nullptr,Sg=nullptr;
+    CustomMomentumCSR customMom;
+    CellBlockJacobiPlan rauCellBlockPlan;
+    PetscLogDouble tc0=0,tc1=0; PetscCall(PetscTime(&tc0));
+    PetscCall(buildCustomMomentumCSR(M,D,rank,customMom));
+    if(rauMode=="cell_block_diag") PetscCall(buildCellBlockJacobiPlan(M,D,rank,customMom,rauCellBlockPlan));
+    if(weakWallFunction && (PetscInt)customMom.wallOwned.size()!=customMom.nOwned)
+      customMom.wallOwned.assign((std::size_t)customMom.nOwned,0);
+    if(mixingLength) for(int d=0;d<3;++d) customMom.mixlenRhs[d].assign((std::size_t)customMom.nOwned,0.0);
+    if(weakWallFunction) for(int d=0;d<3;++d) customMom.wallRhs[d].assign((std::size_t)customMom.nOwned,0.0);
+    if(dgNumericalTraceInlet(P)) for(int d=0;d<3;++d) customMom.inletRhs[d].assign((std::size_t)customMom.nOwned,0.0);
+    // SUPG-study memory hygiene: when stabilization is disabled, the three
+    // FP64 SUPG RHS vectors are provably dormant.  Release their capacity so
+    // an ON/OFF memory-scaling experiment measures actual SUPG-retained state
+    // rather than inactive compatibility storage.  This does not alter the
+    // momentum matrix, SGS, convection, pressure, or SIMPLEC paths.
+    if(!useSupg) {
+      unsigned long long localBefore=0,globalBefore=0;
+      for(auto &v:customMom.supgRhs) { localBefore += (unsigned long long)v.capacity()*sizeof(double); std::vector<double>().swap(v); }
+      PetscCallMPI(MPI_Allreduce(&localBefore,&globalBefore,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_SUPG_OFF_MEMORY_HYGIENE supgRhsReleasedMiB=%.6f vectors=3 h2RetainedInSharedPlan=1 status=PASS\n",
+        (double)globalBefore/(1024.0*1024.0)));
+    }
+    CustomDynamicAssemblyPlan DynPlan; CustomDynamicRuntimePlan DynRuntime;
+    PetscLogDouble tdp0=0,tdp1=0; PetscCall(PetscTime(&tdp0));
+    PetscCall(buildCustomDynamicAssemblyPlan(M,D,P,customMom,supgQuadPoints,DynPlan));
+    PetscCall(PetscTime(&tdp1)); PetscCall(printSetupPhase("custom_dynamic_assembly_plan",tdp1-tdp0,reportCells));
+    if(m1m2LegacyReference) PetscCall(assembleStaticDiffusionCustomLegacyQuadrature(DynPlan,customMom,1.0));
+    else PetscCall(assembleStaticDiffusionCustom(DynPlan,customMom,1.0));
+    PetscCall(assembleStaticMomentumRhsNative(M,D,P,DynPlan,customMom,D.rhsOwnedFP64));
+    if(dynPlanCompact) PetscCall(compactCustomDynamicPlan(M,D,P,DynPlan,DynRuntime));
+    if(m6bVelocityReference){
+      double worst=0.0,maxAbs=0.0;
+      for(int d=0;d<3;++d){std::vector<double> ref;PetscCall(customMomentumVecOwned(D.rhs[d],customMom,ref));CustomParityNorm q;PetscCall(customMomentumCompareArrays(D.rhsOwnedFP64[(std::size_t)d],ref,q));worst=std::max(worst,q.rel);maxAbs=std::max(maxAbs,q.maxAbs);}
+      const bool ok=worst<=customMomentumShadowTol;PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M6B_VELOCITY_STATE_REFERENCE staticRhsRel=%.3e staticRhsMaxAbs=%.3e tol=%.3e status=%s action=destroy_PETSc_velocity_rhs_before_live_solve\n",worst,maxAbs,(double)customMomentumShadowTol,ok?"PASS":"CHECK"));
+      if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6B native static momentum RHS parity failed");for(int d=0;d<3;++d)PetscCall(VecDestroy(&D.rhs[d]));
+    } else PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M6B_VELOCITY_STATE_REFERENCE status=SKIPPED_PRODUCTION PETScVelocityRhs=never_created\n"));
+    PetscCall(reindexFlatSchurRauToCustom(PSchur,G,customMom));
+
+    unsigned long long lnnz=(unsigned long long)customMom.rowPtr.back(),gnnz=0;
+    PetscCallMPI(MPI_Allreduce(&lnnz,&gnnz,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+    double kactRel=0.0,kactMax=0.0; const char *referenceStatus="SKIPPED_PRODUCTION";
+    if(D.A) {
+      MatInfo kiRef; PetscCall(MatGetInfo(D.A,MAT_GLOBAL_SUM,&kiRef));
+      CustomParityNorm kact; PetscCall(customMomentumActionParity(D.A,customMom,customMom.aRel,kact));
+      kactRel=kact.rel; kactMax=kact.maxAbs;
+      // D.A is stored in PetscScalar precision.  In the mixed FP32 backend this
+      // oracle therefore differs from the native-FP64 custom action at ordinary
+      // single-precision roundoff even when the operator is identical.  Keep the
+      // old stringent tolerance for FP64 PETSc, but make this PETSc-oracle check
+      // precision-aware.  The separate legacy-vs-M1M2 one-SIMPLE gate remains a
+      // native-FP64 numerical parity check and is intentionally not relaxed.
+      const double petscOracleTol=std::max((double)customMomentumShadowTol,
+        50.0*(double)std::numeric_limits<PetscReal>::epsilon());
+      const bool ok=(std::llround(kiRef.nz_used)==(long long)gnnz && kact.rel<=petscOracleTol);
+      referenceStatus=ok?"PASS":"CHECK";
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_M3A_STATIC_REFERENCE petscDiffusionNnz=%.0f customNnz=%llu topologyStatus=%s KActionRel=%.3e KActionMaxAbs=%.3e tol=%.3e petscRealBytes=%zu comparison=PETScScalar_oracle_vs_native_FP64 status=%s\n",
+        kiRef.nz_used,gnnz,std::llround(kiRef.nz_used)==(long long)gnnz?"PASS":"CHECK",kact.rel,kact.maxAbs,petscOracleTol,sizeof(PetscReal),referenceStatus));
+      if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M3A direct static diffusion parity failed");
+      PetscCall(MatDestroy(&D.A));
+    }
+    if(m1m2LegacyReference) {
+      customMom.kNu=customMom.aRel;
+      for(double& v:customMom.kNu) v*=nu;
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_M1M2_LEGACY_REFERENCE active=1 colGidRetained=1 kNuRetained=1 staticQuadrature=legacy_5x5x5 purpose=gate1_only\n"));
+    } else {
+      for(double& v:customMom.aRel) v*=nu;
+      // M1: colGid has served its production purposes: ghost/local mapping and
+      // dynamic rowSlot construction. Release the nnz-sized global-column array.
+      const unsigned long long localBefore=(unsigned long long)customMom.colGid.capacity()*sizeof(PetscInt);
+      unsigned long long globalBefore=0; PetscCallMPI(MPI_Allreduce(&localBefore,&globalBefore,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+      std::vector<PetscInt>().swap(customMom.colGid);
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_M1_RELEASE_COLGID releasedSummedMiB=%.3f retainedCapacity=0 rowSlotsReady=1 colLocalReady=1 status=PASS\n",
+        (double)globalBefore/(1024.0*1024.0)));
+    }
+    PetscCall(PetscTime(&tc1)); PetscCall(printSetupPhase("custom_momentum_plan",tc1-tc0,reportCells));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M3A_STATIC mode=direct_custom_owned_rows reference=%s globalNnz=%llu KActionRel=%.3e KActionMaxAbs=%.3e PETSc_DA_live=0 status=PASS\n",
+      referenceStatus,gnnz,kactRel,kactMax));
+
+    CustomPressureBPlan customPressureB;
+    PetscLogDouble tbp0=0,tbp1=0; PetscCall(PetscTime(&tbp0));
+    PetscCall(buildCustomPressureBPlan(M,D,P,rank,customPressureB));
+    const char *bReferenceStatus="SKIPPED_PRODUCTION";
+    if(m4bBReference) {
+      PetscCall(customPressureBStaticParity(D,customPressureB,(double)customPressureBShadowTol));
+      bReferenceStatus="PASS";
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_REFERENCE status=PASS action=destroy_PETSc_B_before_live_solve\n"));
+      for(int d=0;d<3;++d) PetscCall(MatDestroy(&D.B[d]));
+    } else {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M4B_B_REFERENCE status=SKIPPED_PRODUCTION PETScB=never_created\n"));
+    }
+    PetscCall(PetscTime(&tbp1)); PetscCall(printSetupPhase("custom_pressure_B_live_plan",tbp1-tbp0,reportCells));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M4B_CONFIG mode=live_custom_pressure physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI physicalSchur=custom_FP64_MPI PETScB=%s Pmat=%s reference=%s tol=%.3e\n",
+      m4bBReference?"destroyed_after_reference":"never_created",pPmatMode=="native_face"?"PETSc_PetscScalar_native_face_compact_GAMG":"PETSc_PetscScalar_full_GAMG",bReferenceStatus,(double)customPressureBShadowTol));
+
+    const double feScalarNnz=(double)gnnz;
+    const double fvmScalarNnz=(double)reportCells+2.0*(double)reportInternalFaces;
+    const double feAvgNnz=feScalarNnz/(double)D.ns;
+    const double fvmAvgNnz=fvmScalarNnz/(double)reportCells;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_COST_MODEL feScalarDofs=%" PetscInt_FMT " fvmScalarDofs=%zu dofRatio=%.6f feScalarNnz=%.0f fvmCompactScalarNnz=%.0f feAvgNnzPerRow=%.6f fvmAvgNnzPerRow=%.6f stencilRowRatio=%.6f scalarMatrixNnzRatio=%.6f\n",
+      D.ns,reportCells,(double)D.ns/(double)reportCells,feScalarNnz,fvmScalarNnz,feAvgNnz,fvmAvgNnz,feAvgNnz/fvmAvgNnz,feScalarNnz/fvmScalarNnz));
+    if(memoryAudit) {
+      PetscCall(auditCustomMomentumDetailedMemory(customMom,reportCells));
+      unsigned long long lb=0;
+      if(dynPlanCompact) lb=(unsigned long long)DynRuntime.cells.capacity()*sizeof(CustomDynamicRuntimeCellPlan)+(unsigned long long)DynRuntime.wallFaces.capacity()*sizeof(CustomDynamicRuntimeWallFace)+(unsigned long long)DynRuntime.ref.capacity()*sizeof(SupgReferencePoint)+(unsigned long long)DynRuntime.forcing.capacity()*sizeof(double);
+      else lb=(unsigned long long)DynPlan.cells.capacity()*sizeof(CustomDynamicCellPlan)+(unsigned long long)DynPlan.ref.capacity()*sizeof(SupgReferencePoint)+(unsigned long long)DynPlan.forcing.capacity()*sizeof(double);
+      unsigned long long gb=0; PetscCallMPI(MPI_Allreduce(&lb,&gb,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,PETSC_COMM_WORLD));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MEMORY_AUDIT_OBJECT stage=after_state_objects name=custom.dynamicPlan scope=distributed_row_support_halo usefulBytes=%llu retainedEstimateBytes=%llu retainedMiB=%.3f retainedBytesPerCell=%.3f note=%s\n",gb,gb,(double)gb/(1024.0*1024.0),reportCells?((double)gb/(double)reportCells):0.0,dynPlanCompact?"compact_runtime_plan_no_gid_entity_gradLambda_cell":"legacy_full_runtime_plan"));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_DYNPLAN_MEMORY_DETAIL mode=%s fullCellBytes=%zu compactCellBytes=%zu compactFields=ref32_ownedBasis8_nOwned1_rowSlot64_det8_invJ72_h2_8 removedFields=cell_gid_entity_gradLambda\n",dynPlanCompact?"compact":"full",sizeof(CustomDynamicCellPlan),sizeof(CustomDynamicRuntimeCellPlan)));
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M3A_MATRIX_LIFETIME D_A=never_created_in_production Knu=direct_custom_FP64 C=eliminated Sg=eliminated Aphys=eliminated Ar=custom_active_array liveMomentum=custom_FP64_MPI_SGS staticAssembly=direct_owned_rows dynamicAssembly=direct_owned_rows\n"));
+
+    // M6B: velocity, momentum RHS/work, diagonal metrics and rAU are all native FP64 arrays.
+    // PETSc state vectors are now pressure preconditioner bridges only.
+
+    // M6A: pressure physical state is native C++ FP64.  PETSc pressure Vecs are
+    // now only two bridge buffers used by GAMG PCApply (and the optional first
+    // reference KSPSolve); no physical p/r/dp state lives in PetscScalar.
+    Vec pcIn=nullptr,pcOut=nullptr;
+    PetscCall(VecDuplicate(D.volumes,&pcIn)); PetscCall(VecSet(pcIn,0));
+    PetscCall(VecDuplicate(D.volumes,&pcOut)); PetscCall(VecSet(pcOut,0));
+    std::vector<double> pressureState((std::size_t)customPressureB.pressureHalo.nOwned,0.0);
+    std::vector<double> pressureResidual((std::size_t)customPressureB.pressureHalo.nOwned,0.0);
+    CustomPressureAMGRuntime customAMGLive;
+    CustomPressureAMGLivePCGWorkspace customAMGLiveW;
+    CustomPressureAMGLivePCGResult customAMGLiveResult;
+    PetscBool customAMGLiveReady=PETSC_FALSE;
+    PetscBool customAMGDgDiagParityDone=PETSC_FALSE;
+    PetscInt customAMGRefreshes=0;
+
+    CustomPressurePCGWorkspace pressurePcgW;
+    pressurePcgW.x.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    pressurePcgW.r.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    pressurePcgW.z.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    pressurePcgW.p.reserve((std::size_t)customPressureB.pressureHalo.nOwned);
+    PetscBool pressurePcgReferenceDone=PETSC_FALSE;
+    M10PressurePCGProfile m10PcgTotal,m10PcgWarm; m10PcgTotal.enabled=m10PcgProfile; m10PcgWarm.enabled=m10PcgProfile;
+
+    CustomFactoredPressureContext factoredCtx;
+    Mat factoredSchur=nullptr;
+    PetscCall(createCustomFactoredPressure(customPressureB,customMom,D.volumes,factoredCtx,&factoredSchur));
+    Mat pressureOperator = (pOperatorMode=="factored") ? factoredSchur : PSchur.S;
+    PetscBool factoredBenchmarkDone=PETSC_FALSE,customPressureLiveSchurParityDone=PETSC_FALSE;
+    PetscBool gate1FgmresParityDone=PETSC_FALSE;
+
+    MatNullSpace nsp=nullptr;
+    KSP pksp=nullptr;
+    PC ppc=nullptr;
+    PC gate3MpShell=nullptr;
+    Gate3MpShellCtx *gate3MpCtx=nullptr;
+    Gate4KpCtx gate4Kp;
+    Gate9eNodalKpAudit gate9eAudit;
+    Gate9gFeFaceAudit gate9gAudit;
+    double gate9iLambdaHat=0.0,gate9iLambdaMinActive=0.0,gate9iLambdaMaxActive=0.0;
+    PetscBool gate9iEstimatePending=gate9iAutoChebyshev?PETSC_TRUE:PETSC_FALSE;
+    PetscInt gate9iEstimateCount=0,gate9iTotalPowerIts=0,gate9iTotalChebSteps=0,gate9iPressureSolves=0;
+    double gate9iPowerSeconds=0.0,gate9iChebSeconds=0.0;
+    Gate5KpGamgStats gate5KpGamg;
+    PC gate6DiffusionPcdShell=nullptr;
+    Gate6DiffusionPcdCtx *gate6DiffusionPcdCtx=nullptr;
+    Gate7CpCtx gate7Cp;
+    Gate8EswBcCtx gate8EswBc;
+    Gate9LivePcdCtx *gate9LivePcdCtx=nullptr;
+    KSPType pKspType=nullptr;
+    PCType pPcType=nullptr;
+    // The pressure preconditioning matrix object is fixed for the solve.  With
+    // a factored exact operator and p_pmat=full, the explicit Schur is a lagged
+    // GAMG snapshot: its values change only when the preconditioner is refreshed.
+    Mat pressurePmat = (pPmatMode=="full") ? PSchur.S : PSchur.Pcompact;
+    if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE9G_CONFIG enabled=1 Kp=compact_FE_face_jump_energy graph=cell_plus_face_neighbours coefficient=quarter_sum_shared_rAU_norm_Bp_minus_Bn_sq outletAnchor=FE_trace_energy traceMatch=exact_Schur_diagonal_sum exactOperator=custom_FP64_B_rAU_Bt tests=%s\n",
+      pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES_plus_GAMG_on_FE_face_energy_Pmat":(gate9iAutoChebyshev?"AUTO_Chebyshev_power_estimate_plus_one_GAMG_no_outer_Krylov":(gate9hChebyshev?"Chebyshev_plus_one_GAMG_no_outer_Krylov":(gate9gRichardson?"Richardson_plus_one_GAMG_no_outer_Krylov":"custom_PCG_plus_one_GAMG")))));
+    if(gate9gFeFace && pressureSolveMode=="petsc_fgmres") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE9G_FGMRES_PORT status=ENABLED outer=PETSc_FGMRES exactOperator=custom_FP64_B_rAU_Bt pmat=compact_FE_face_jump_energy_Gate9G pc=GAMG physicalPressureOperator=UNCHANGED customPCGPath=UNCHANGED\n"));
+    if(gate9iAutoChebyshev) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE9I_CONFIG enabled=1 pressureAlgorithm=auto_preconditioned_Chebyshev outerKrylov=NONE KSPSolve=NEVER_CALLED exactOperator=custom_FP64_B_rAU_Bt Kp=FE_face_jump_energy PC=ONE_GAMG_PCApply_per_stage spectrumEstimate=power_iteration_on_MinvS estimateCadence=%s spectrumRefresh=%" PetscInt_FMT " powerIts=%" PetscInt_FMT " lambdaMaxSafety=%.6e lambdaMinFraction=%.6e rtol=%.6e atol=%.6e mode=%s fixedSteps=%" PetscInt_FMT " requireTarget=%d initialBlock=%" PetscInt_FMT " extendBlock=%" PetscInt_FMT " maxSteps=%" PetscInt_FMT "\n",
+      gate9iSpectrumRefresh>0?"independent_SIMPLE_cadence":"PC_refresh_only",gate9iSpectrumRefresh,gate9iPowerIts,(double)gate9iSafety,(double)gate9iLambdaMinFraction,(double)gate9iRtol,(double)gate9iAtol,gate9iFixedSteps>0?"fixed":"adaptive",gate9iFixedSteps,(int)gate9iRequireTarget,gate9iInitialBlock,gate9iExtendBlock,gate9iMaxSteps));
+    if(gate9hChebyshev) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE9H_CONFIG enabled=1 pressureAlgorithm=preconditioned_Chebyshev_semiteration outerKrylov=NONE KSPSolve=NEVER_CALLED exactOperator=custom_FP64_B_rAU_Bt Kp=FE_face_jump_energy PC=ONE_GAMG_PCApply_per_step lambdaMin=%.12e lambdaMax=%.12e maxSteps=%" PetscInt_FMT " checkEvery=%" PetscInt_FMT " reductions=diagnostic_norm_checks_only\n",
+      (double)gate9hLambdaMin,(double)gate9hLambdaMax,gate9hMaxSteps,gate9hCheckEvery));
+    if(gate4KpProbe) {
+      const char* gate4GamgRole=gate9LivePcd?(gate9dGamgOnly?"LIVE_GATE9D_GAMG_ONLY_STATIONARY":"LIVE_GATE9C_ONE_GAMG_PCApply"):(gate5KpGamgProbe?"STANDALONE_GATE5_ONLY":(gate6DiffusionPcdProbe?"GATE6_KP_INVERSE_SHADOW_ONLY":"NOT_YET"));
+      const char* gate4FpRole=gate9LivePcd?(gate9dGamgOnly?"BYPASSED_GATE9D_GAMG_ONLY":"BYPASSED_GATE9C_DIRECT_KP_GAMG"):(gate8EswBcProbe?"nuKp_plus_internal_Cp_plus_ESW_BC_GATE8":(gate7CpProbe?"nuKp_plus_internal_Cp_GATE7":(gate6DiffusionPcdProbe?"nu_times_Kp_GATE6":"NONE")));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE4_KP_CONFIG enabled=1 attachment=shadow_setup_only exactPressureOperator=custom_FP64_B_rAU_Bt liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG Mp=validated_GATE3_not_applied Kp=geometric_FV_laplacian Fp=%s GAMG_on_Kp=%s pressureBC_Kp=inlet_Neumann_wall_Neumann_outlet_p0\n",gate4FpRole,gate4GamgRole));
+      if(gate9eNgfv) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE9E_CONFIG enabled=1 nodalFit=wide_affine_P1 faceGradient=mean_3_nodes rawFV=-GaussDivGrad pcgSafeKp=symmetric_Mmatrix_projection exactSchur=UNCHANGED_custom_FP64_B_rAU_Bt tests=PCG_plus_one_GAMG_and_Richardson_plus_one_GAMG\n"));
+        PetscCall(gate9eBuildNodalKp(M,D,P,rank,gate4Kp,gate9eAudit));
+        if(!gate9LivePcd) pressurePmat=gate4Kp.Kp;
+      } else PetscCall(gate4BuildKp(M,D,P,rank,gate4Kp));
+      if(gate5KpGamgProbe) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE5_CONFIG enabled=1 attachment=shadow_standalone_only Kp=validated_GATE4_geometric_FV_laplacian KpBC=inlet_Neumann_wall_Neumann_outlet_p0 pressureNullspace=OFF primarySolve=CG_plus_GAMG tightRtol=1e-10 gamgOnlyProbe=4_direct_PCApply_Vcycles_no_outer_Krylov Fp=NONE fullPCD=NOT_YET livePressureSolve=UNCHANGED\n"));
+        PetscCall(gate5StandaloneKpGamg(gate4Kp,gate5KpGamg));
+      }
+      if(gate7CpProbe) {
+        PetscCall(gate7CpSetUp(gate4Kp,gate7Cp));
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE7_CONFIG enabled=1 attachment=shadow_only Cp=internal_face_conservative_central sourceVelocity=current_Picard_P1plusBF3 exactFaceFlux=1 faceMean=P1_vertex_mean_plus_9over20_BF3 Fp=nuKp_plus_internal_Cp pressureBoundaryConvection=OFF robin=%s KpInverse=NOT_APPLIED_GATE7 liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG exactPressureOperator=custom_FP64_B_rAU_Bt fullPCD=NOT_YET\n",gate8EswBcProbe?"HANDLED_SEPARATELY_GATE8":"NOT_YET_GATE8"));
+      }
+      if(gate8EswBcProbe) {
+        PetscCall(gate8EswBcSetUp(gate4Kp,gate8EswBc));
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE8_CONFIG enabled=1 attachment=shadow_only ESW918_chain=KpInv_Fp_MpInv Fp=nuKp_plus_internal_Cp_plus_ESW_boundary_semantics inletRobinFormula=-nu_dpdn_plus_wdotn_p_eq_0 inletRobinActive=1 inletDiscretization=explicit_conservative_convection_plus_explicit_Robin_cancellation sourceVelocity=current_Picard_P1plusBF3 exactFaceMean=1 wallBC=homogeneous_Neumann_wdotn0 outletBC=p0_Dirichlet pressureNullspace=OFF KpInverse=NOT_APPLIED_GATE8 liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG exactPressureOperator=custom_FP64_B_rAU_Bt cancelTol=%.3e wallFluxTol=%.3e fullPCD=NOT_LIVE_YET\n",
+          (double)gate8CancelTol,(double)gate8WallFluxTol));
+      }
+      if(gate9LivePcd) {
+        gate9LivePcdCtx=new Gate9LivePcdCtx();
+        gate9LivePcdCtx->Kp=gate4Kp.Kp; gate9LivePcdCtx->volumes=D.volumes;
+        gate9LivePcdCtx->gamgOnlySolve=gate9dGamgOnly;
+        if(gate9dGamgOnly) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9D_CONFIG enabled=1 pressureAlgorithm=stationary_exactSchur_residual_correction outerKrylov=NONE KSPSolve=NEVER_CALLED correction=omega_times_ONE_GAMG_PCApply_on_selected_Kp omega=%.6e maxCycles=%" PetscInt_FMT " trueResidualTol=%.3e divergenceFactor=%.3e exactOperator=custom_FP64_B_rAU_Bt Mp=BYPASSED Fp=BYPASSED innerKrylov=NONE\n",
+          (double)gate9dOmega,gate9dMaxCycles,(double)gate9OuterTrueResidualTol,(double)gate9dDivergenceFactor));
+        else PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9C_CONFIG enabled=1 attachment=LIVE_PCSHELL outer=FGMRES exactOperator=custom_FP64_B_rAU_Bt preconditioner=ONE_direct_GAMG_PCApply_on_geometric_Kp Mp=BYPASSED Fp=BYPASSED innerKrylov=NONE pcSide=RIGHT nativeFaceGAMG=NOT_LIVE_PC outerTrueResidualTol=%.3e\n",
+          (double)gate9OuterTrueResidualTol));
+      }
+      if(gate6DiffusionPcdProbe) {
+        gate6DiffusionPcdCtx=new Gate6DiffusionPcdCtx();
+        gate6DiffusionPcdCtx->Kp=gate4Kp.Kp;
+        gate6DiffusionPcdCtx->volumes=D.volumes;
+        gate6DiffusionPcdCtx->nu=(PetscReal)P.nu;
+        PetscCall(PCCreate(PETSC_COMM_WORLD,&gate6DiffusionPcdShell));
+        PetscCall(PCSetType(gate6DiffusionPcdShell,PCSHELL));
+        PetscCall(PCShellSetName(gate6DiffusionPcdShell,"P1BF3_PCD_GATE6_DIFFUSION_CHAIN_SHADOW"));
+        PetscCall(PCShellSetContext(gate6DiffusionPcdShell,(void*)gate6DiffusionPcdCtx));
+        PetscCall(PCShellSetSetUp(gate6DiffusionPcdShell,gate6DiffusionPcdSetUp));
+        PetscCall(PCShellSetApply(gate6DiffusionPcdShell,gate6DiffusionPcdApply));
+        PetscCall(PCShellSetDestroy(gate6DiffusionPcdShell,gate6DiffusionPcdDestroy));
+        PetscCall(PCSetOperators(gate6DiffusionPcdShell,pressureOperator,pressurePmat));
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE6_CONFIG enabled=1 attachment=shadow_only chain=Kp_inverse_Fp_Mp_inverse Mp=P0_exact_cell_volume_diagonal Kp=validated_GATE4_geometric_FV_laplacian Fp=nu_times_Kp nu=%.12e KpBC=inlet_Neumann_wall_Neumann_outlet_p0 KpInverse=tight_CG_plus_GAMG liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG exactPressureOperator=custom_FP64_B_rAU_Bt chainTol=%.3e kpTrueResidualTol=%.3e fullPCD=NOT_YET\n",
+          P.nu,(double)gate6ChainTol,(double)gate6KpTrueResidualTol));
+      }
+    }
+    if(gate3MpProbe) {
+      gate3MpCtx=new Gate3MpShellCtx();
+      gate3MpCtx->volumes=D.volumes; // borrowed; exact P0 cell-volume mass diagonal
+      PetscCall(PCCreate(PETSC_COMM_WORLD,&gate3MpShell));
+      PetscCall(PCSetType(gate3MpShell,PCSHELL));
+      PetscCall(PCShellSetName(gate3MpShell,"P1BF3_PCD_GATE3_MP_INVERSE_SHADOW"));
+      PetscCall(PCShellSetContext(gate3MpShell,(void*)gate3MpCtx));
+      PetscCall(PCShellSetSetUp(gate3MpShell,gate3MpShellSetUp));
+      PetscCall(PCShellSetApply(gate3MpShell,gate3MpShellApply));
+      PetscCall(PCShellSetDestroy(gate3MpShell,gate3MpShellDestroy));
+      PetscCall(PCSetOperators(gate3MpShell,pressureOperator,pressurePmat));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_GATE3_MP_CONFIG enabled=1 attachment=shadow_only action=Mp_inverse mass=P0_exact_cell_volume_diagonal exactPressureOperator=custom_FP64_B_rAU_Bt liveOuter=PETSc_FGMRES livePC=existing_native_face_GAMG Kp=NONE Fp=NONE pressureBC=UNCHANGED_NOT_USED algebraTol=%.3e\n",
+        (double)gate3MpAlgebraTol));
+    }
+    const PetscBool lagFullPmat = (pOperatorMode=="factored" && pPmatMode=="full" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
+    const PetscBool lagNativeCompactPmat = (pOperatorMode=="factored" && pPmatMode=="native_face" && pPreconditionerRefresh>0) ? PETSC_TRUE : PETSC_FALSE;
+    if(lagNativeCompactPmat) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_B2_COMPACT_LAG_CONFIG enabled=1 interval=%" PetscInt_FMT " exactOperator=factored_B_rAU_Bt pmat=native_face_compact semantics=assemble_compact_only_on_GAMG_refresh\n",
+      pPreconditionerRefresh));
+    if(lagFullPmat) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_FULL_PMAT_LAG_CONFIG enabled=1 interval=%" PetscInt_FMT " exactOperator=factored_B_rAU_Bt pmat=full_explicit_Schur_snapshot semantics=assemble_Pmat_only_on_GAMG_refresh\n",
+      pPreconditionerRefresh));
+    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M4B_PRESSURE_ARCH physicalB=custom_FP64_MPI physicalBt=custom_FP64_MPI exactOperator=custom_FP64_B_rAU_Bt PETScB=none_live Pmat=PETSc_PetscScalar_full GAMG=PETSc_PetscScalar outerKrylov=custom_FP64_or_Richardson PETScKSPRole=GAMG_PC_owner_only\n"));
+    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M5A_CONFIG Bcell=eliminated schurStorage=flat_CSR_terms pmatRefresh=analytic_B_coefficients CustomOuterPCG=FP64 PETScGAMG=PetscScalar\n"));
+    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M5B_PCG_CONFIG outer=custom_FP64_MPI_PCG exactOperator=custom_FP64_B_rAU_Bt preconditioner=PETSc_PetscScalar_GAMG_PCApply PETScKSPSolve=%s referenceTol=%.3e\n",
+      m5bPcgReference?"first_solve_reference_only":"never_called_in_production",(double)customPressurePcgReferenceTol));
+    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M6A_PRESSURE_STATE_CONFIG physicalP=native_CPP_FP64 continuity=native_CPP_FP64 pressureRhs=native_CPP_FP64 correction=custom_PCG_FP64 PETScPressureVecs=pcIn_pcOut_bridge_only staticVolumeFixedDiv=native_FP64_plus_layout_bridge eventualFP32SafePressureState=1\n"));
+    if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M6B_VELOCITY_STATE_CONFIG physicalU=native_CPP_FP64 staticMomentumRhs=native_CPP_FP64 dynamicMomentumRhs=native_CPP_FP64 momentumWork=native_CPP_FP64 diagMetricRau=custom_CPP_FP64 PETScVelocityVecs=none_live PETScPhysicalState=none_live eventualFP32SafeVelocityState=1 reference=%s\n",m6bVelocityReference?"PASS":"SKIPPED_PRODUCTION"));
+    if(pPmatMode=="native_face") {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_B2_PRESSURE_ARCH exactOperator=custom_FP64_B_rAU_Bt outerKrylov=%s preconditioner=PETSc_PetscScalar_GAMG pmat=native_face_compact graph=cell_plus_face_neighbours exactFullSchur=never_materialized flatSchurPlan=eliminated Bcell=eliminated vertexCells=eliminated p1RedistributionStrength=%.6g refresh=%" PetscInt_FMT "\n",
+        pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES":(gate9iAutoChebyshev?"FP64_Chebyshev_no_outer_Krylov":"custom_FP64_PCG"),(double)feFvP1Strength,pPreconditionerRefresh));
+      if(pressureSolveMode=="custom_pcg" && !gate9iAutoChebyshev && !gate9hChebyshev && !gate9gRichardson) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_M5B_PCG_CONFIG outer=custom_FP64_MPI_PCG exactOperator=custom_FP64_B_rAU_Bt preconditioner=PETSc_PetscScalar_GAMG_PCApply PETScKSPSolve=%s referenceTol=%.3e\n",
+        m5bPcgReference?"first_solve_reference_only":"never_called_in_production",(double)customPressurePcgReferenceTol));
+    }
+
+    double localVolsum=std::accumulate(D.volumesOwnedFP64.begin(),D.volumesOwnedFP64.end(),0.0),volsum=0.0;
+    PetscCallMPI(MPI_Allreduce(&localVolsum,&volsum,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));
+    PetscCall(PetscTime(&tObjects1));
+    PetscCall(printSetupPhase("state_matrix_vector_objects",tObjects1-tObjects0,reportCells));
+    if(resourceProfile) PetscCall(printResourceMark("after_state_objects",reportCells,tObjects1-tObjects0,tTotal0));
+    if(memoryAudit) {
+      PetscCall(auditStateObjects(C,Sg,nullptr,nullptr,nullptr,D,G,reportCells));
+      const unsigned long long cpb=customPressurePlanLocalBytes(customPressureB);
+      PetscCall(printMemoryAuditBytes("after_state_objects","custom.pressureBPlan",cpb,cpb,reportCells,"distributed_owned_rows_plus_halo","live_FP64_B_Bt_geometry_and_peer_exchange_plan"));
+      const unsigned long long cgb=customPressurePCGWorkspaceBytes(pressurePcgW);
+      PetscCall(printMemoryAuditBytes("after_state_objects","custom.pressurePCGWorkspace",cgb,cgb,reportCells,"distributed_owned_pressure_rows","four_FP64_owned_vectors_x_r_z_p"));
+      const unsigned long long psb=(unsigned long long)(pressureState.capacity()+pressureResidual.capacity())*sizeof(double);
+      PetscCall(printMemoryAuditBytes("after_state_objects","custom.pressurePhysicalState",psb,psb,reportCells,"distributed_owned_pressure_rows","native_FP64_p_plus_continuity_rhs_no_PetscScalar"));
+      unsigned long long vbytes=0;for(int d=0;d<3;++d)vbytes+=(unsigned long long)(U[(std::size_t)d].capacity()+D.rhsOwnedFP64[(std::size_t)d].capacity())*sizeof(double);
+      PetscCall(printMemoryAuditBytes("after_state_objects","custom.velocityPhysicalState",vbytes,vbytes,reportCells,"distributed_owned_velocity_rows","native_FP64_U3_plus_static_rhs3; dynamic_rhs_and_metrics_already_in_custom_momentum_CSR"));
+    }
+
+    if(m10PcgProfile) PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_M10_PROFILE_CONFIG enabled=1 scope=custom_pressure_PCG exactSchurBreakdown=Bt_rAU_B pcApplyBreakdown=bridge_kernel reductions=timed_MPI_allreduce vectorOps=timed_native_loops warmDefinition=exclude_first_pressure_solve\n"));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_MIXLEN_CONFIG enabled=%d model=%s scale=%.6g strainMode=%s detailedAudit=%d auditCadence=it1to10_then_every10 auditPercentiles=volume_weighted_loghist2048 auditRawVsDev=1 auditYPlus=Blasius_reference linearization=lagged_previous_SIMPLE_state diffusion=implicit_scalar_nu_plus_nut pipeAxis=z radius=%.12g centerXY=[%.12g,%.12g] strain=selected_raw_or_deviatoric_sqrt_2SdotS wallDamping=none weakWallFunction=%d supgStrongViscosity=%s tauViscosity=molecular_nu transposeGradient=deferred_pipe_axial_exact\n",
+      (int)mixingLength,mixlenModel.c_str(),(double)mixlenScale,mixlenStrainMode.c_str(),(int)mixlenAudit,P.mode==ProblemMode::Pipe?P.pipe.R:0.0,P.mode==ProblemMode::Pipe?P.pipe.cx:0.0,P.mode==ProblemMode::Pipe?P.pipe.cy:0.0,(int)weakWallFunction,supgStrongViscosity.c_str()));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_WALLFUNC_CONFIG enabled=%d law=%s kappa=%.6g B=%.6g yFactor=%.6g betaScale=%.6g linearization=%s tangentBlend=%.6g sampleMode=%s molecularConsistency=%d offwallGeometry=tet_barycentric_parallel_plane_if_enabled wallDistance=legacy_yFactor_times_hn_or_physical_radial_sample_distance hn=3V_over_A faceQuad=Dunavant7 axialSlip=Uz tangentialPenalty=beta_eq_utau2_over_absUt transverseWall=UxUy_exact_clamp pressureBxByWallResponse=OMITTED nonlinearFixedPoint=unchanged_by_consistent_tangent lag=one_SIMPLE_state_for_wall_Jacobian\n",
+      (int)weakWallFunction,wallLaw.c_str(),(double)wallKappa,(double)wallB,(double)wallDistanceFactor,(double)wallBetaScale,wallLinearization.c_str(),(double)wallTangentBlend,wallSampleMode.c_str(),(int)wallMolecularConsistency));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_PHYSICS problem=%s equation=steady_navier_stokes Re=%.12g nu=%.12g ReConvention=%s convection=%s supg=%s tauScale=%.6g supgMagic=%.6g tauH=tet_max_edge strongViscosity=%s strongResidual=-(nuStrong)_laplacian_u_plus_a_dot_grad_u_minus_f_gradNutDeferred pressureStrongGrad=P0_zero linearization=Picard_Oseen supgTauLinearization=lagged_previous_SIMPLE_state supgForm=%s supgKernel=%s supgQuad=%" PetscInt_FMT "\n",
+      problem.c_str(),P.re,nu,P.mode==ProblemMode::Pipe?"Uchar_D_over_nu":"unit_scale_1_over_nu",centralConvection?"central":"none",useSupg?"ON":"OFF",(double)supgTauScale,(double)supgMagic,supgStrongViscosity.c_str(),supgForm.c_str(),supgKernel.c_str(),supgQuadPoints));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_SIMPLE_CONFIG ranks=%d variant=%s alphaU=%.6g alphaP=%.6g uRelaxMode=%s rauScale=%.6g rauMode=%s "
+      "simplecBlend=%.6g simplecFloorFraction=%.3e simplecFallback=%s rAU=%s simpleRtol=%.3e maxOuter=%" PetscInt_FMT
+      " velocitySolver=processorBlockJacobi+localSGS precision=FP64 uRtol=%.3e uAtol=%.3e uRelDrop=%.3g uOmega=%.3g uLocalSweeps=%" PetscInt_FMT " uCheckEvery=%" PetscInt_FMT
+      " outerGate=all_initial_residuals_Ux_Uy_Uz_plus_continuity pressureSolver=%s pressureState=native_FP64 pPcRefresh=%" PetscInt_FMT "\n",
+      size,simpleVariant.c_str(),(double)au,(double)ap,uRelaxMode.c_str(),(double)rauScale,rauMode.c_str(),
+      (double)simplecBlend,(double)simplecFloorFraction,simplecFallback.c_str(),
+      rauMode=="cell_block_diag"?"rauScale_times_mean_cell_principal_inverse_diag":"rauScale_over_correction_metric",
+      (double)simpleTol,maxOuter,
+      (double)uTol,(double)uAtol,(double)uRelDrop,(double)uOmega,uLocalSweeps,uCheck,
+      pressureSolveMode=="petsc_fgmres"?"PETSc_FGMRES_plus_GAMG":(pressureSolveMode=="gamg_richardson"?"PETSc_GAMG_Richardson":"custom_FP64_PCG_plus_PETSc_PCApply"),pPreconditionerRefresh));
+    if(rauMode=="cell_block_diag") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_RAU_CELL_BLOCK_CONFIG blend=%.6g ratioMin=%.6g ratioMax=%.6g pivotTol=%.3e fallback=%s rawConstruction=mean_diag_inverse_of_global_relaxed_tet_principal_block halo=sparse_requested_row_col_pairs ratioClampZeroMeansDisabled=1\n",
+      (double)rauCellBlockBlend,(double)rauCellBlockRatioMin,(double)rauCellBlockRatioMax,(double)rauCellBlockPivotTol,rauCellBlockFallback.c_str()));
+    if(simpleVariant=="simplec") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_SIMPLEC_CONFIG metric=relaxed_signed_row_sum formula=Dc=(1-blend)*diag(Ar)+blend*(Ar*1) standardBlend=1 "
+      "pressureUnderRelaxation=alphaP userControlled note=alphaP_1_is_typical_SIMPLEC_test positiveGuard=%s floorFraction=%.3e\n",
+      simplecFallback.c_str(),(double)simplecFloorFraction));
+    if(useSupg) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_SUPG_CONFIG tauLinearization=lagged_previous_SIMPLE_state form=%s kernel=%s quadraturePoints=%" PetscInt_FMT " tauScale=%.6g magic=%.6g affineGeometry=compact_gradLambda_cached physicalGrad=runtime_affine_reconstructed viscousStrong=runtime_affine_reconstructed strongViscosity=%s tauViscosity=molecular_nu physicalMomentumDiffusion=nu_plus_nut_unchanged gradNuT=deferred assembly=outer_product explicitFormBuildsGlobalSUPGMatrix=%d\n",
+      supgForm.c_str(),supgKernel.c_str(),supgQuadPoints,(double)supgTauScale,(double)supgMagic,supgStrongViscosity.c_str(),supgForm=="explicit"?0:1));
+
+    double r0=0.0,rel=std::numeric_limits<double>::max();
+    PetscBool converged=PETSC_FALSE;
+    PetscBool solveFailed=PETSC_FALSE;
+    PetscInt pressureFailureReason=0;
+    PetscInt finalIt=0;
+    PetscReal finalUInitRel[3]={std::numeric_limits<PetscReal>::max(),std::numeric_limits<PetscReal>::max(),std::numeric_limits<PetscReal>::max()};
+    PetscReal finalPInitRel=std::numeric_limits<PetscReal>::max();
+    long long sumU[3]={0,0,0},sumP=0;
+    PetscInt pSolves=0;
+    double operatorUpdateSeconds=0.0;
+    double convectionUpdateSeconds=0.0,supgUpdateSeconds=0.0,derivedUpdateSeconds=0.0,customMomentumLoadSeconds=0.0,diffusionRebuildSeconds=0.0,schurUpdateSeconds=0.0,kspOperatorSeconds=0.0;
+    double momentumSolveSeconds=0.0,pressureSolveSeconds=0.0,pressurePcRefreshSeconds=0.0;
+    PetscInt pressurePcRefreshes=0,pressurePcReuses=0;
+    PetscBool pressureProfileDone=PETSC_FALSE;
+    const PetscInt fvCompactPressureNnz=reportCells+2*reportInternalFaces;
+    SupgStats supgStats; MixingLengthStats mixlenStats; WallFunctionStats wallStats;
+    const bool staticPhysicalOperator=(!centralConvection && !useSupg && !mixingLength && !weakWallFunction);
+    bool operatorReady=false;
+    PetscReal minPhysDiag=0,maxPhysDiag=0,minDiag=0,maxDiag=0,minRauMetric=0,maxRauMetric=0;
+    PetscInt minIdx=-1,maxIdx=-1;
+
+    if(resourceProfile) PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_RESOURCE_PROFILE enabled=1 hostMetric=/proc/self/status_rss_hwm aggregation=sum_and_max_across_ranks gpuMetric=external_nvidia_smi_runner timestamp=epochMs\n"));
+    if(memoryAudit) {
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_MEMORY_AUDIT enabled=1 accounting=cpp_container_capacity_plus_PETSc_MatInfo note=unordered_map_and_allocator_overhead_are_estimates_or_unaccounted\n"));
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_MEMORY_AUDIT_ABI sizeofPetscInt=%zu sizeofPetscScalar=%zu sizeofVoidPtr=%zu sizeofVector=%zu sizeofCentralCellPlan=%zu sizeofSupgCellPlan=%zu sizeofSupgReferencePoint=%zu\n",
+        sizeof(PetscInt),sizeof(PetscScalar),sizeof(void*),sizeof(std::vector<int>),sizeof(CentralCellPlan),sizeof(SupgCellPlan),sizeof(SupgReferencePoint)));
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_OPTIMIZATION affineGeometryCached=1 centralTensorDegree=8 centralTensorRule=collapsed_5x5x5 staticDiffusion=nuK_reintegrated_into_active_CSR schurTopologyCached=1 physicalOperatorMode=%s supgFastPath=%s supgAffineGradCached=%d supgViscStrongCached=%d supgOuterProduct=1 supgTauLagged=1 supgForm=%s supgQuad=%" PetscInt_FMT "\n",
+      staticPhysicalOperator?"static_once":"convection_values_only",useSupg?supgKernel.c_str():"OFF_no_SUPG_work",
+      0,0,supgForm.c_str(),supgQuadPoints));
+
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_CUSTOM_MOM_CONFIG enabled=1 mode=M6B_native_FP64_velocity_state storage=custom_FP64_single_activeA_no_persistent_kNu_no_colGid mpi=peer_only_nonblocking_value_exchange rowSupport=all_incident_tets liveSolver=custom_MPI_symmetric_GS PETScMomentum=none_static_or_dynamic staticAssembly=direct_custom_owned_rows dynamicAssembly=direct_custom_owned_rows tol=%.3e\n",
+      dynPlanCompact?"compact200B":"full384B",(double)customMomentumShadowTol));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_M1M2_CONFIG mode=%s colGid=%s staticK=%s diffusionRebuild=%s sgs=unchanged_CSR_aRel expectedNumericalChange=none\n",
+      m1m2LegacyReference?"legacy_gate_reference":"production_M1M2",
+      m1m2LegacyReference?"retained_gate_only":"setup_only_released",
+      m1m2LegacyReference?"cached_gate_only":"persistent_eliminated",
+      m1m2LegacyReference?"cached_copy":"reference_tensor_direct_into_aRel"));
+
+    PetscCall(PetscTime(&tSolve0));
+    PetscCall(printSetupPhase("pre_solve_total",tSolve0-tTotal0,reportCells));
+    if(resourceProfile) PetscCall(printResourceMark("solve_begin",reportCells,tSolve0-tTotal0,tTotal0));
+    if(dgNumericalTraceInlet(P)) {
+      std::vector<double> dgInitCont=D.fixedDivOwnedFP64,dgPart;
+      for(int d=0;d<3;++d) {
+        PetscCall(customPressureBApply(customPressureB,d,U[(std::size_t)d],dgPart));
+        if(dgPart.size()!=dgInitCont.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"DG initial plug continuity ownership mismatch");
+        for(std::size_t i=0;i<dgInitCont.size();++i) dgInitCont[i]+=dgPart[i];
+      }
+      double dgNorm=0.0,fixNorm=0.0;
+      PetscCall(customPressureNorm2(dgInitCont,&dgNorm));
+      PetscCall(customPressureNorm2(D.fixedDivOwnedFP64,&fixNorm));
+      const double dgRel=dgNorm/std::max(fixNorm,1.0e-300);
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_DG_INITIAL_PLUG_CONTINUITY absNorm=%.12e fixedFluxNorm=%.12e relToFixedFlux=%.12e expected=roundoff status=%s\n",
+        dgNorm,fixNorm,dgRel,dgRel<=1.0e-10?"PASS":"FAIL"));
+      if(dgRel>1.0e-10) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"DG initialized plug is not discretely divergence-free");
+    }
+    for(PetscInt it=1; it<=maxOuter; ++it) {
+      // In the Stokes/no-convection case every object below is constant.  Build
+      // Ar, rAU and S once and reuse them for all SIMPLE corrections.  For the
+      // Oseen case only C(u^k) is physically dynamic; the derived relaxation
+      // diagonal/rAU/Schur values are refreshed from that changed C.
+      if(!operatorReady || !staticPhysicalOperator) {
+        PetscLogDouble top0,top1,ts0,ts1;
+        PetscCall(PetscTime(&top0));
+
+        // M2B: gather current velocity once through the custom peer-only halo,
+        // rebuild static diffusion directly into the sole active CSR, then
+        // assemble every dynamic element contribution into locally-owned rows.
+        PetscLogDouble tcm0=0,tcm1=0; PetscCall(PetscTime(&tcm0));
+        PetscCall(customMomentumGatherVelocityNative(customMom,U));
+        if(gate7CpProbe) PetscCall(gate7UpdateCpInterior(M,D,P,rank,customMom,gate7Cp,it));
+        if(gate8EswBcProbe) PetscCall(gate8UpdateEswBoundary(M,D,P,rank,customMom,gate8EswBc,it));
+        if(gate9LivePcd && gate9LivePcdCtx) gate9LivePcdCtx->currentSimpleIt=it;
+        PetscLogDouble tdiff0=0,tdiff1=0; PetscCall(PetscTime(&tdiff0));
+        if(dynPlanCompact) PetscCall(customMomentumResetPhysical(DynRuntime,customMom,nu,m1m2LegacyReference)); else PetscCall(customMomentumResetPhysical(DynPlan,customMom,nu,m1m2LegacyReference));
+        const PetscBool mixlenAuditThisIt=(mixlenAudit && (it<=10 || it%10==0))?PETSC_TRUE:PETSC_FALSE;
+        if(mixingLength) PetscCall(assembleNikuradseMixingLengthCustom(D,DynRuntime,customMom,P.pipe,nu,(double)mixlenScale,mixlenDeviatoric,mixlenAuditThisIt,mixlenStats));
+        if(weakWallFunction) {
+          if(!dynPlanCompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"Stage-3 weak wall function requires compact dynamic plan");
+          PetscCall(assembleSpaldingWeakWallCustom(D,DynRuntime,customMom,nu,(double)wallKappa,(double)wallB,(double)wallDistanceFactor,(double)wallBetaScale,P.pipe.cx,P.pipe.cy,wallLinearization,(double)wallTangentBlend,wallSampleMode,wallMolecularConsistency,P.pipe.bulkVelocity,P.pipe.zIn,P.pipe.L,wallStats));
+        }
+        if(dgNumericalTraceInlet(P)) {
+          if(!dynPlanCompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"dg_numerical_trace inlet requires compact dynamic plan");
+          PetscCall(assembleDgNumericalTraceInletCustom(D,DynRuntime,customMom,P.boundary,P.pipe,nu,mixingLength,(double)mixlenScale,mixlenDeviatoric));
+        }
+        PetscCall(PetscTime(&tdiff1)); diffusionRebuildSeconds += (double)(tdiff1-tdiff0);
+        PetscCall(PetscTime(&tcm1)); customMomentumLoadSeconds += (double)(tcm1-tcm0);
+
+        if(centralConvection) {
+          PetscCall(PetscTime(&ts0));
+          if(dynPlanCompact) PetscCall(assembleCentralConvectionCustom(D,DynRuntime,customMom)); else PetscCall(assembleCentralConvectionCustom(D,DynPlan,customMom));
+          PetscCall(PetscTime(&ts1)); convectionUpdateSeconds += (double)(ts1-ts0);
+        } else if(!operatorReady) for(auto& r:customMom.convRhs) std::fill(r.begin(),r.end(),0.0);
+
+        if(useSupg) {
+          if(supgKernel!="fast") SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"M2B direct dynamic assembly currently supports -supg_kernel fast only");
+          PetscCall(PetscTime(&ts0));
+          if(dynPlanCompact) PetscCall(assembleSupgCustom(D,DynRuntime,customMom,(double)supgTauScale,(double)supgMagic,supgForm,mixingLength,P.pipe,(double)mixlenScale,supgStrongMolecular,supgStats)); else PetscCall(assembleSupgCustom(D,DynPlan,customMom,(double)supgTauScale,(double)supgMagic,supgForm,mixingLength,P.pipe,(double)mixlenScale,supgStrongMolecular,supgStats));
+          PetscCall(PetscTime(&ts1)); supgUpdateSeconds += (double)(ts1-ts0);
+        } else if(!operatorReady) { for(auto& r:customMom.supgRhs) std::fill(r.begin(),r.end(),0.0); supgStats={}; }
+
+        PetscCall(PetscTime(&ts0));
+        PetscCall(customMomentumFinalizeRelaxation(customMom,uRelaxMode,(double)au,simpleVariant,rauMode,
+          (double)simplecBlend,(double)simplecFloorFraction,simplecFallback,(double)rauScale));
+        if(rauMode=="cell_block_diag")
+          PetscCall(updateRauCellBlockDiag(M,D,customMom,rauCellBlockPlan,(double)rauScale,(double)rauCellBlockBlend,
+            (double)rauCellBlockRatioMin,(double)rauCellBlockRatioMax,(double)rauCellBlockPivotTol,rauCellBlockFallback,it));
+
+        double qmin=0,qmax=0;PetscCall(customGlobalMinMax(customMom.physDiag,qmin,qmax));minPhysDiag=(PetscReal)qmin;maxPhysDiag=(PetscReal)qmax;PetscCall(customGlobalMinMax(customMom.relaxedDiag,qmin,qmax));minDiag=(PetscReal)qmin;maxDiag=(PetscReal)qmax;PetscCall(customGlobalMinMax(customMom.metric,qmin,qmax));minRauMetric=(PetscReal)qmin;maxRauMetric=(PetscReal)qmax;
+        if(it<=10 || it%10==0) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_M2B_DERIVED it=%" PetscInt_FMT " aPhysDiag=[%.6e,%.6e] aRelDiag=[%.6e,%.6e] rauMetric=[%.6e,%.6e] source=direct_custom_dynamic derive=custom_FP64\n",
+          it,(double)minPhysDiag,(double)maxPhysDiag,(double)minDiag,(double)maxDiag,(double)minRauMetric,(double)maxRauMetric));
+        if(mixingLength && (it<=10 || it%10==0)) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_MIXLEN it=%" PetscInt_FMT " strainMode=%s nuTRatio=[%.6e,%.6e,%.6e] ell=[%.6e,%.6e] strainMax=%.6e quadratureSamples=%llu model=nikuradse_pipe lag=one_SIMPLE\n",
+          it,mixlenStrainMode.c_str(),mixlenStats.nuTRatioMin,mixlenStats.nuTRatioMean,mixlenStats.nuTRatioMax,mixlenStats.ellMin,mixlenStats.ellMax,mixlenStats.strainMax,mixlenStats.quadratureSamples));
+        if(mixingLength && mixlenAuditThisIt) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_MIXLEN_AUDIT it=%" PetscInt_FMT " strainMode=%s activePct=[p95=%.6e,p99=%.6e,p99p9=%.6e] rawPct=[p95=%.6e,p99=%.6e,p99p9=%.6e] devPct=[p95=%.6e,p99=%.6e,p99p9=%.6e] maxima=[rawNuT:%.6e,devNuT:%.6e,rawStrain:%.6e,devStrain:%.6e] volFracGT=[100:%.6e,300:%.6e,1000:%.6e] activeMaxCell=%lld maxQ=%d maxRank=%d xyz=[%.9e,%.9e,%.9e] zOverL=%.9e rOverR=%.9e yPlusRefBlasius=%.6e lmOverR=%.9e active=[nuTRatio:%.9e,twoSdotS:%.9e,strain:%.9e] raw=[nuTRatio:%.9e,twoSdotS:%.9e,strain:%.9e] dev=[nuTRatio:%.9e,twoSdotS:%.9e,strain:%.9e] divU=%.9e S=[xx:%.9e,yy:%.9e,zz:%.9e,xy:%.9e,xz:%.9e,yz:%.9e]\n",
+          it,mixlenStrainMode.c_str(),mixlenStats.nuTRatioP95,mixlenStats.nuTRatioP99,mixlenStats.nuTRatioP999,
+          mixlenStats.rawP95,mixlenStats.rawP99,mixlenStats.rawP999,mixlenStats.devP95,mixlenStats.devP99,mixlenStats.devP999,
+          mixlenStats.rawMax,mixlenStats.devMax,mixlenStats.rawStrainMax,mixlenStats.devStrainMax,
+          mixlenStats.volFracGT100,mixlenStats.volFracGT300,mixlenStats.volFracGT1000,
+          mixlenStats.maxAudit.cellGid,mixlenStats.maxAudit.q,mixlenStats.maxAudit.rank,
+          mixlenStats.maxAudit.x,mixlenStats.maxAudit.y,mixlenStats.maxAudit.z,mixlenStats.maxAudit.zOverL,
+          mixlenStats.maxAudit.rOverR,mixlenStats.maxAudit.yPlusRefBlasius,mixlenStats.maxAudit.lmOverR,
+          mixlenStats.maxAudit.nuTRatio,mixlenStats.maxAudit.twoSdotS,mixlenStats.maxAudit.strain,
+          mixlenStats.maxAudit.nuTRatioRaw,mixlenStats.maxAudit.twoSdotSRaw,mixlenStats.maxAudit.strainRaw,
+          mixlenStats.maxAudit.nuTRatioDev,mixlenStats.maxAudit.twoSdotSDev,mixlenStats.maxAudit.strainDev,mixlenStats.maxAudit.divU,
+          mixlenStats.maxAudit.Sxx,mixlenStats.maxAudit.Syy,mixlenStats.maxAudit.Szz,mixlenStats.maxAudit.Sxy,mixlenStats.maxAudit.Sxz,mixlenStats.maxAudit.Syz));
+        if(weakWallFunction && (it<=10 || it%10==0)) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_WALLFUNC it=%" PetscInt_FMT " wallFaces=%llu qSamples=%llu rootFailures=%llu tangentFailures=%llu y=[%.6e,%.6e,%.6e] yPlus=[%.6e,%.6e,%.6e] slip=[%.6e,%.6e,%.6e] uTau=[%.6e,%.6e,%.6e] betaSecant=[%.6e,%.6e,%.6e] betaTangent=[%.6e,%.6e,%.6e] betaUsedJac=[%.6e,%.6e,%.6e] tangentRatio=[%.6e,%.6e,%.6e] tangentRhsAbsDensity=[%.6e,%.6e,%.6e] uTau2Mean=%.6e fWallSpalding=%.10f sampleMode=%s molecularConsistency=%d linearization=%s tangentBlend=%.6g maxAbsNormalZ=%.3e law=spalding penalty=tangential_wall_model nonlinearFixedPoint=unchanged lag=one_SIMPLE_state_for_wall_Jacobian\n",
+          it,wallStats.wallFaces,wallStats.quadratureSamples,wallStats.rootFailures,wallStats.tangentFailures,
+          wallStats.yMin,wallStats.yMean,wallStats.yMax,
+          wallStats.yPlusMin,wallStats.yPlusMean,wallStats.yPlusMax,
+          wallStats.slipMin,wallStats.slipMean,wallStats.slipMax,
+          wallStats.uTauMin,wallStats.uTauMean,wallStats.uTauMax,
+          wallStats.betaMin,wallStats.betaMean,wallStats.betaMax,
+          wallStats.tangentMin,wallStats.tangentMean,wallStats.tangentMax,
+          wallStats.usedJacMin,wallStats.usedJacMean,wallStats.usedJacMax,
+          wallStats.tangentRatioMin,wallStats.tangentRatioMean,wallStats.tangentRatioMax,
+          wallStats.tangentRhsAbsMin,wallStats.tangentRhsAbsMean,wallStats.tangentRhsAbsMax,
+          wallStats.uTau2Mean,wallStats.fWallSpalding,wallSampleMode.c_str(),(int)wallMolecularConsistency,
+          wallLinearization.c_str(),(double)wallTangentBlend,wallStats.maxAbsNormalZ));
+        PetscCall(PetscTime(&ts1));
+        derivedUpdateSeconds += (double)(ts1-ts0);
+
+        PetscCall(PetscTime(&ts0));
+        const PetscBool pcRefreshStep = customPressureBackend ? (!pksp ? PETSC_TRUE : PETSC_FALSE) : ((!pksp || (pPreconditionerRefresh>0 && (((it-1)%pPreconditionerRefresh)==0))) ? PETSC_TRUE : PETSC_FALSE);
+        const PetscBool needExplicitSchur = (pOperatorMode=="explicit" ||
+          (pPmatMode=="full" && (!lagFullPmat || pcRefreshStep)) ||
+          (factoredBenchmark && !factoredBenchmarkDone && it==factoredBenchmarkAt)) ? PETSC_TRUE : PETSC_FALSE;
+        const PetscBool needNativeCompact = (pPmatMode=="native_face" && (!lagNativeCompactPmat || pcRefreshStep)) ? PETSC_TRUE : PETSC_FALSE;
+        if(needExplicitSchur) PetscCall(updatePressureSchurFullNative(customMom,PETSC_TRUE,PSchur));
+        if(needNativeCompact) {
+          if(gate9gFeFace) PetscCall(updatePressureCompactFeFaceEnergy(M,D,P,rank,customPressureB,customMom,PSchur,gate9gAudit));
+          else PetscCall(updatePressureCompactNative(M,D,rank,customPressureB,customMom,(double)feFvP1Strength,PSchur));
+        }
+        if(pPmatMode!="full" && pPmatMode!="native_face")
+          SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"M11 native velocity path supports production pressure Pmat modes full or native_face only");
+        if(lagFullPmat && needExplicitSchur) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_FULL_PMAT_VALUE_REFRESH it=%" PetscInt_FMT " interval=%" PetscInt_FMT " pmat=full_explicit_Schur_snapshot exactOperator=factored currentRauSnapshot=1\n",
+          it,pPreconditionerRefresh));
+        if(factoredBenchmark && !factoredBenchmarkDone && it==factoredBenchmarkAt) {
+          PetscCall(benchmarkFactoredSchur(PSchur.S,factoredSchur,D,D.volumes,PSchur.globalSchurNnz,factoredBenchmarkReps));
+          factoredBenchmarkDone=PETSC_TRUE;
+        }
+        PetscCall(PetscTime(&ts1));
+        schurUpdateSeconds += (double)(ts1-ts0);
+        if(!customPressureLiveSchurParityDone && needExplicitSchur) {
+          const double fullPmatOracleTol=std::max((double)customPressureBShadowTol,
+            80.0*(double)std::numeric_limits<PetscReal>::epsilon());
+          PetscCall(customPressureLiveSchurParity(PSchur.S,D,customPressureB,customMom,fullPmatOracleTol));
+          if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_FULLFAST_FP32_ORACLE tol=%.3e petscRealBytes=%zu purpose=explicit_full_Pmat_vs_exact_FP64_action_only physicalOperator=unchanged_factored\n",
+            fullPmatOracleTol,sizeof(PetscReal)));
+          customPressureLiveSchurParityDone=PETSC_TRUE;
+        }
+        if(pPmatMode=="native_face" && it==1) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_B2_EXACT_OPERATOR_GUARD status=PASS physicalSchur=custom_FP64_B_rAU_Bt compactPmatNeverUsedForMatMult=1 previousExactParityValidated=1\n"));
+
+        PetscCall(PetscTime(&ts0));
+        if(!pksp) {
+          if(P.mode==ProblemMode::MMS) {
+            PetscCall(MatNullSpaceCreate(PETSC_COMM_WORLD,PETSC_TRUE,0,nullptr,&nsp));
+            PetscCall(MatSetNullSpace(pressureOperator,nsp));
+            PetscCall(MatSetTransposeNullSpace(pressureOperator,nsp));
+            PetscCall(MatSetNearNullSpace(pressureOperator,nsp));
+            if(pressurePmat!=PSchur.S) {
+              PetscCall(MatSetNullSpace(pressurePmat,nsp));
+              PetscCall(MatSetTransposeNullSpace(pressurePmat,nsp));
+              PetscCall(MatSetNearNullSpace(pressurePmat,nsp));
+            }
+            PetscBool nsok=PETSC_FALSE;
+            PetscCall(MatNullSpaceTest(nsp,pressureOperator,&nsok));
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_PRESSURE_NULLSPACE constantMode=%s gauge=volume_weighted_mean_zero operator=dynamic_B_rAU_Bt\n",
+              nsok?"PASS":"FAIL"));
+            if(!nsok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"pressure constant nullspace test failed");
+          } else {
+            Vec one=nullptr,act=nullptr;PetscReal an=0;
+            PetscCall(VecDuplicate(D.volumes,&one));PetscCall(VecDuplicate(D.volumes,&act));PetscCall(VecSet(one,1.0));
+            PetscCall(MatMult(pressureOperator,one,act));PetscCall(VecNorm(act,NORM_2,&an));
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_PRESSURE_GAUGE mode=physical_outlet_traction pressureNullspace=OFF constantActionNorm=%.12e operator=dynamic_B_rAU_Bt\n",(double)an));
+            PetscCall(VecDestroy(&one));PetscCall(VecDestroy(&act));
+            if(!(an>0.0)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"pipe pressure operator did not anchor constant mode");
+          }
+
+          if(dgNumericalTraceInlet(P)) {
+            // Match the verified Q1+BF2 DG donor: constant is a near-nullspace
+            // mode for GAMG even though the physical outlet anchors pressure.
+            MatNullSpace dgNear=nullptr;
+            PetscCall(MatNullSpaceCreate(PETSC_COMM_WORLD,PETSC_TRUE,0,nullptr,&dgNear));
+            PetscCall(MatSetNearNullSpace(pressurePmat,dgNear));
+            PetscCall(MatNullSpaceDestroy(&dgNear));
+          }
+          PetscCall(KSPCreate(PETSC_COMM_WORLD,&pksp));
+          PetscCall(KSPSetOperators(pksp,pressureOperator,pressurePmat));
+          PetscCall(KSPSetType(pksp,pressureSolveMode=="petsc_fgmres" ? KSPFGMRES : KSPCG));
+          if(dgNumericalTraceInlet(P) && pressureSolveMode=="petsc_fgmres") {
+            PetscCall(KSPSetPCSide(pksp,PC_RIGHT));
+            PetscCall(KSPSetNormType(pksp,KSP_NORM_UNPRECONDITIONED));
+          }
+          PetscCall(KSPGetPC(pksp,&ppc));
+          if(gate9LivePcd) {
+            if(!gate9LivePcdCtx) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9 live PCD context was not constructed");
+            PetscCall(PCSetType(ppc,PCSHELL));
+            PetscCall(PCShellSetName(ppc,"P1BF3_GATE9_LIVE_PCD"));
+            PetscCall(PCShellSetContext(ppc,(void*)gate9LivePcdCtx));
+            PetscCall(PCShellSetSetUp(ppc,gate9LivePcdSetUp));
+            PetscCall(PCShellSetApply(ppc,gate9LivePcdApply));
+            PetscCall(PCShellSetDestroy(ppc,gate9LivePcdDestroy));
+            PetscCall(KSPSetPCSide(pksp,PC_RIGHT));
+          } else PetscCall(PCSetType(ppc,PCJACOBI));
+          PetscCall(KSPSetTolerances(pksp,1e-10,PETSC_CURRENT,PETSC_CURRENT,20000));
+          PetscCall(KSPSetOptionsPrefix(pksp,"p_"));
+          PetscCall(KSPSetFromOptions(pksp));
+          MatInfo pPInfo;
+          PetscCall(MatGetInfo(pressurePmat,MAT_GLOBAL_SUM,&pPInfo));
+          const double expandedNnz=(double)PSchur.globalSchurNnz;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_PRESSURE_PMAT mode=%s pressureOperator=%s expandedEquivalentNnz=%.0f pmatNnz=%.0f pmatAllocated=%.0f allocOverUsed=%.12f pmatToExpanded=%.6f pmatAvgNnzPerRow=%.6f\n",
+            pPmatMode.c_str(),pOperatorMode.c_str(),expandedNnz,pPInfo.nz_used,pPInfo.nz_allocated,pPInfo.nz_used?pPInfo.nz_allocated/pPInfo.nz_used:0.0,expandedNnz>0.0?pPInfo.nz_used/expandedNnz:-1.0,pPInfo.nz_used/(double)reportCells));
+          if(pPmatMode=="full") PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_M3B_PMAT_ALLOCATION used=%.0f allocated=%.0f allocOverUsed=%.12f status=%s\n",
+            pPInfo.nz_used,pPInfo.nz_allocated,pPInfo.nz_used?pPInfo.nz_allocated/pPInfo.nz_used:0.0,(pPInfo.nz_used>0.0 && std::abs(pPInfo.nz_allocated-pPInfo.nz_used)<0.5)?"PASS":"CHECK"));
+          if(pPmatMode=="native_face" && !gate9eNgfv) {
+            const double compactExpected=(double)reportCells+2.0*(double)reportInternalFaces;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_B1_COMPACT_TOPOLOGY status=%s usedNnz=%.0f expectedFaceGraphNnz=%.0f avgNnzPerRow=%.6f allocationRatio=%.12f\n",
+              std::abs(pPInfo.nz_used-compactExpected)<0.5?"PASS":"FAIL",pPInfo.nz_used,compactExpected,pPInfo.nz_used/(double)reportCells,pPInfo.nz_used?pPInfo.nz_allocated/pPInfo.nz_used:0.0));
+            if(std::abs(pPInfo.nz_used-compactExpected)>=0.5) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M11 compact face topology NNZ mismatch");
+          }
+          PetscLogDouble tpc0,tpc1; PetscCall(PetscTime(&tpc0));
+          PetscCall(KSPSetUp(pksp));
+          PetscCall(PetscTime(&tpc1)); pressurePcRefreshSeconds += (double)(tpc1-tpc0);
+          PetscCall(printSetupPhase("initial_pressure_pc_gamg",tpc1-tpc0,reportCells));
+          pressurePcRefreshes++;
+          if(gate9iAutoChebyshev) gate9iEstimatePending=PETSC_TRUE;
+          if(pPreconditionerRefresh>1) PetscCall(KSPSetReusePreconditioner(pksp,PETSC_TRUE));
+          PetscCall(KSPGetType(pksp,&pKspType));
+          PetscCall(PCGetType(ppc,&pPcType));
+          if(pressureSolveMode=="petsc_fgmres" && std::string(pKspType)!=std::string(KSPFGMRES))
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate 1 requires PETSc FGMRES; remove any conflicting -p_ksp_type option");
+          if(gate9LivePcd && std::string(pPcType)!=std::string(PCSHELL)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 requires live PC type shell; remove conflicting -p_pc_type");
+          if(gate9LivePcd) { PCSide side; PetscCall(KSPGetPCSide(pksp,&side)); if(side!=PC_RIGHT) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER_INPUT,"Gate-9 requires right preconditioning"); }
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_PRESSURE_SOLVER ksp=%s pc=%s pmat=%s operator=%s pressureOperatorUpdate=%s preconditionerRefresh=%" PetscInt_FMT " refreshSemantics=0_PETSc_default_else_initial_then_every_N_SIMPLE fullPmatLagged=%d nativeCompactLagged=%d\n",
+            pKspType,pPcType,pPmatMode.c_str(),pOperatorMode.c_str(),staticPhysicalOperator?"static_once":"every_SIMPLE_iteration_values_only",pPreconditionerRefresh,(int)lagFullPmat,(int)lagNativeCompactPmat));
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE1_PRESSURE_MODE mode=%s exactOperator=custom_FP64_B_rAU_Bt pmat=%s pc=%s compareCustomPCG=%d solutionTol=%.3e trueResidualTol=%.3e\n",
+            pressureSolveMode.c_str(),pPmatMode.c_str(),pPcType,(int)gate1ComparePcg,(double)gate1SolutionTol,(double)gate1TrueResidualTol));
+          PetscReal pcgRtolSetup=0,pcgAtolSetup=0,pcgDtolSetup=0; PetscInt pcgMaxItsSetup=0;
+          PetscCall(KSPGetTolerances(pksp,&pcgRtolSetup,&pcgAtolSetup,&pcgDtolSetup,&pcgMaxItsSetup));
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_PRESSURE_OUTER_CONFIG mode=%s pc=%s configuredKsp=%s rtol=%.3e atol=%.3e dtol=%.3e maxIts=%" PetscInt_FMT "\n",
+            pressureSolveMode.c_str(),pPcType,pKspType,(double)pcgRtolSetup,(double)pcgAtolSetup,(double)pcgDtolSetup,pcgMaxItsSetup));
+          if(gate9dGamgOnly) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9D_KSP_CONTAINER_NOTE configuredKsp=%s configuredPc=%s purpose=GAMG_hierarchy_setup_only KSPSolve=NEVER_CALLED pressureAlgorithm=NO_OUTER_KRYLOV\n",pKspType,pPcType));
+        } else if(!staticPhysicalOperator && !customPressureBackend) {
+          // Same current pressure operator every SIMPLE step.  Optionally keep a
+          // stale PC/GAMG built from an older Schur matrix and refresh only every N
+          // SIMPLE iterations.  The Krylov operator is NEVER frozen.
+          PetscCall(KSPSetOperators(pksp,pressureOperator,pressurePmat));
+          if(pPreconditionerRefresh>0) {
+            const PetscBool refreshNow = (((it-1)%pPreconditionerRefresh)==0) ? PETSC_TRUE : PETSC_FALSE;
+            if(refreshNow) {
+              PetscCall(KSPSetReusePreconditioner(pksp,PETSC_FALSE));
+              PetscLogDouble tpc0,tpc1; PetscCall(PetscTime(&tpc0));
+              PetscCall(KSPSetUp(pksp));
+              PetscCall(PetscTime(&tpc1)); pressurePcRefreshSeconds += (double)(tpc1-tpc0);
+              pressurePcRefreshes++;
+              if(gate9iAutoChebyshev) gate9iEstimatePending=PETSC_TRUE;
+              PetscCall(KSPSetReusePreconditioner(pksp,PETSC_TRUE));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_PRESSURE_PC_REFRESH it=%" PetscInt_FMT " interval=%" PetscInt_FMT " refreshCount=%" PetscInt_FMT " setupSeconds=%.6f\n",
+                it,pPreconditionerRefresh,pressurePcRefreshes,(double)(tpc1-tpc0)));
+            } else {
+              PetscCall(KSPSetReusePreconditioner(pksp,PETSC_TRUE));
+              pressurePcReuses++;
+            }
+          } else {
+            // Baseline behavior: allow PETSc to refresh the PC as the matrix state changes.
+            PetscCall(KSPSetReusePreconditioner(pksp,PETSC_FALSE));
+          }
+        }
+        PetscCall(PetscTime(&ts1));
+        kspOperatorSeconds += (double)(ts1-ts0);
+
+        if(customPressureBackend) {
+          const PetscBool customRefreshNow =
+            (!customAMGLiveReady || pPreconditionerRefresh==0 ||
+             (pPreconditionerRefresh>0 && (((it-1)%pPreconditionerRefresh)==0)))
+            ? PETSC_TRUE : PETSC_FALSE;
+          if(customRefreshNow) {
+            PetscLogDouble tc0=0,tc1=0; PetscCall(PetscTime(&tc0));
+            PetscCall(customPressureAMGBuildHierarchy(
+              M,D,rank,customPressureB,customMom,reportCells,
+              P.mode==ProblemMode::MMS?PETSC_TRUE:PETSC_FALSE,
+              customAMGConfig,customAMGLive));
+            PetscCall(PetscTime(&tc1));
+            customAMGLiveReady=PETSC_TRUE;
+            ++customAMGRefreshes;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_RANS_CUSTOM_AMG_REFRESH it=%" PetscInt_FMT
+              " refresh=%" PetscInt_FMT " setupSeconds=%.6e levels=%zu"
+              " retainedMiB=%.6f smoother=%s transfer=%s chebDegree=%" PetscInt_FMT "\n",
+              it,customAMGRefreshes,(double)(tc1-tc0),
+              customAMGLive.amg.levels.size(),customAMGLive.retainedMiB,
+              customAMGSmoother.c_str(),
+              customAMGConfig.smoothedAggregation?"smoothed":"unsmoothed",
+              customAMGConfig.chebyshevDegree));
+          }
+
+          if(!customAMGDgDiagParityDone && PSchur.S) {
+            const double dgAmgDiagTol=5.0e-12;
+            PetscCall(customPressureAMGCompareFineDiagonal(
+              PSchur.S,customPressureB,customAMGLive.amg.levels[0].A.diagonal,
+              dgAmgDiagTol));
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_RANS_CUSTOM_AMG_DG_DIAG status=PASS tol=%.3e "
+              "customFineB=canonical_effective_B_plan oracle=full_Schur\n",dgAmgDiagTol));
+
+            if(customAMGLive.amg.levels.size()<2)
+              SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,
+                "RANS custom AMG requires at least one explicit coarse level for validation");
+            if(!customAMGConfig.smoothedAggregation) {
+              PetscCall(customPressureAMGGate3Validate(
+                customAMGLive.amg.fine,
+                customAMGLive.amg.levels[0],
+                customAMGLive.amg.levels[1].A));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_RANS_CUSTOM_AMG_A1_PARITY status=PASS "
+                "reference=Pt_exact_canonical_Beff_A0_P "
+                "candidate=custom_unsmoothed_A1\n"));
+            } else {
+              PetscCall(customPressureAMGGate4Validate(customAMGLive,customPressureB,customMom));
+              PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                "P1BF3_RANS_CUSTOM_AMG_SA_VCYCLE status=PASS "
+                "transfer=smoothed_R_equals_Pt fineOperator=canonical_Beff_matrix_free "
+                "smoother=chebyshev_jacobi chebDegree=%" PetscInt_FMT "\n",
+                customAMGConfig.chebyshevDegree));
+            }
+            customAMGDgDiagParityDone=PETSC_TRUE;
+          }
+        }
+
+        operatorReady=true;
+        PetscCall(PetscTime(&top1));
+        operatorUpdateSeconds += (double)(top1-top0);
+        if(it==1) {
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_INITIAL_OPERATOR_SETUP seconds=%.6f convection=%.6f supg=%.6f derived=%.6f schur=%.6f kspAndPc=%.6f cells=%zu\n",
+            (double)(top1-top0),convectionUpdateSeconds,supgUpdateSeconds,derivedUpdateSeconds,schurUpdateSeconds,kspOperatorSeconds,(std::size_t)reportCells));
+          if(resourceProfile) PetscCall(printResourceMark("after_initial_operator_gamg",reportCells,top1-top0,tTotal0));
+          if(memoryAudit) {
+            PetscCall(printMemoryAuditMat("after_initial_operator_gamg","pressure.Pmat_active",pressurePmat,reportCells));
+            PetscCall(auditGAMGMemory(pksp,reportCells));
+            PetscCall(printResourceMark("memory_audit_complete",reportCells,0.0,tTotal0));
+          }
+        }
+      }
+
+      if(pressureProfile && !pressureProfileDone && it==pressureProfileAt) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_PRESSURE_PROFILE_BEGIN it=%" PetscInt_FMT " ranks=%d fvCompactPressureNnz=%" PetscInt_FMT " semantics=frozen_current_pressure_operator_and_existing_GAMG_hierarchy\n",
+          it,size,fvCompactPressureNnz));
+        if(pPmatMode!="full") {
+          double pmatMs=0.0; PetscCall(profileMatMult(PSchur.Pcompact,pressureProfileFineReps,&pmatMs));
+          MatInfo pmi; PetscCall(MatGetInfo(PSchur.Pcompact,MAT_GLOBAL_SUM,&pmi));
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_PRESSURE_PROFILE_PMAT mode=%s rows=%" PetscInt_FMT " nnz=%.0f avgNnzPerRow=%.6f matMultMs=%.6f\n",
+            pPmatMode.c_str(),reportCells,pmi.nz_used,pmi.nz_used/(double)reportCells,1e3*pmatMs));
+        }
+        PetscCall(pressureAMGProfile(pksp,pressureOperator,pressurePmat,fvCompactPressureNnz,pressureProfileFineReps,pressureProfilePcReps,
+          pressureProfileCgIts,pressureProfileCgReps,pressureProfileLevelMatReps,pressureProfileLevelSolveReps));
+        pressureProfileDone=PETSC_TRUE;
+      }
+
+      PetscInt uits[3]={0,0,0};
+      PetscReal ur[3]={0,0,0},uInitRel[3]={0,0,0};
+      // OpenFOAM-style outer residualControl audit: record each momentum equation
+      // initial residual BEFORE its inner solve.  These are distinct from ur[],
+      // which are the final inner-solve residuals.
+      // M6B: all momentum RHS algebra and velocity iterates remain native FP64.
+      for(int d=0;d<3;++d) {
+        std::vector<double>& mb=customMom.workB; mb=D.rhsOwnedFP64[(std::size_t)d];
+        if(centralConvection) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.convRhs[(std::size_t)d][i];
+        if(useSupg) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.supgRhs[(std::size_t)d][i];
+        if(mixingLength) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.mixlenRhs[(std::size_t)d][i];
+        if(weakWallFunction) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.wallRhs[(std::size_t)d][i];
+        if(dgNumericalTraceInlet(P)) for(std::size_t i=0;i<mb.size();++i) mb[i]+=customMom.inletRhs[(std::size_t)d][i];
+        PetscCall(customPressureBtApply(customPressureB,d,pressureState,customPressureB.velocityWork));
+        if(customPressureB.velocityWork.size()!=mb.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6B B^T/velocity ownership mismatch");
+        for(std::size_t i=0;i<mb.size();++i) mb[i]+=customPressureB.velocityWork[i]+customMom.relaxDelta[i]*U[(std::size_t)d][i];
+
+        const std::vector<char>* wallClamp=(weakWallFunction && d<2)?&customMom.wallOwned:nullptr;
+        if(wallClamp) {
+          for(std::size_t i=0;i<mb.size();++i) if((*wallClamp)[i]) { mb[i]=0.0; U[(std::size_t)d][i]=0.0; }
+        }
+
+        double ubn=0.0,urn0=0.0; PetscCall(customMomentumNorm2(mb,ubn)); if(ubn==0.0) ubn=1.0;
+        PetscCall(customMomentumResidualNorm(customMom,mb,U[(std::size_t)d],urn0,wallClamp));
+        uInitRel[d]=(PetscReal)(urn0/ubn); finalUInitRel[d]=uInitRel[d];
+        PetscLogDouble tms0,tms1; PetscCall(PetscTime(&tms0)); double relu=0.0;
+        PetscCall(smoothSolveCustomMomentumNative(customMom,mb,U[(std::size_t)d],(double)uTol,(double)uAtol,(double)uRelDrop,uMax,uCheck,(double)uOmega,uLocalSweeps,&uits[d],&relu,wallClamp)); ur[d]=(PetscReal)relu;
+        PetscCall(PetscTime(&tms1)); momentumSolveSeconds += (double)(tms1-tms0); sumU[d]+=uits[d];
+        if(uRelDrop<=0.0 && ((double)ur[d]*ubn)>1.2*std::max((double)uAtol,(double)uTol*ubn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,"momentum processor-block SGS failed at SIMPLE it %" PetscInt_FMT " comp %d relres %.3e",it,d,(double)ur[d]);
+      }
+
+      pressureResidual=D.fixedDivOwnedFP64;
+      for(int d=0;d<3;++d) {
+        PetscCall(customPressureBApply(customPressureB,d,U[(std::size_t)d],customPressureB.pressureWork));
+        if(pressureResidual.size()!=customPressureB.pressureWork.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A continuity pressure size mismatch");
+        for(std::size_t i=0;i<pressureResidual.size();++i) pressureResidual[i]+=customPressureB.pressureWork[i];
+      }
+      double rn=0.0; PetscCall(customPressureNorm2(pressureResidual,&rn));
+      if(it==1) r0=rn;
+      rel=rn/std::max(r0,1e-300);
+      finalIt=it;
+      finalPInitRel=(PetscReal)rel;
+      const PetscBool allInitialResidualsMet =
+        (uInitRel[0]<(PetscReal)simpleTol && uInitRel[1]<(PetscReal)simpleTol && uInitRel[2]<(PetscReal)simpleTol && rel<(double)simpleTol)
+        ? PETSC_TRUE : PETSC_FALSE;
+      if(it<=10 || it%10==0 || allInitialResidualsMet) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_SIMPLE_INITIAL_RESIDUALS it=%" PetscInt_FMT " Ux=%.12e Uy=%.12e Uz=%.12e pEquivalentContinuity=%.12e gate=%.3e allMet=%d semantics=momentum_initial_before_inner_solve_plus_continuity_before_pressure_correction\n",
+        it,(double)uInitRel[0],(double)uInitRel[1],(double)uInitRel[2],rel,(double)simpleTol,(int)allInitialResidualsMet));
+
+      for(double& v:pressureResidual) v=-v;
+      if(nsp) PetscCall(customPressureProjectConstant(pressureResidual));
+      double prhsNorm=0.0; PetscCall(customPressureNorm2(pressureResidual,&prhsNorm));
+      if(!std::isfinite(prhsNorm)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"pressure-correction RHS became NaN/Inf at SIMPLE it %" PetscInt_FMT,it);
+      PetscReal pcgRtol=0,pcgAtol=0,pcgDtol=0; PetscInt pcgMaxIts=0;
+      PetscCall(KSPGetTolerances(pksp,&pcgRtol,&pcgAtol,&pcgDtol,&pcgMaxIts));
+
+      PetscInt petscRefIts=-1; std::vector<double> petscRefSolution;
+      if(m5bPcgReference && !pressurePcgReferenceDone) {
+        PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,pressureResidual));
+        PetscCall(VecSet(pcOut,0)); PetscCall(KSPSetInitialGuessNonzero(pksp,PETSC_FALSE));
+        PetscCall(KSPSolve(pksp,pcIn,pcOut));
+        KSPConvergedReason refReason; PetscCall(KSPGetConvergedReason(pksp,&refReason)); PetscCall(KSPGetIterationNumber(pksp,&petscRefIts));
+        if(refReason<0) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,"M6A PETSc reference CG failed");
+        PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,petscRefSolution));
+      }
+
+      CustomPressurePCGResult pcgRes;
+      M10PressurePCGProfile m10This; m10This.enabled=m10PcgProfile;
+      PetscInt pits=0;
+      std::vector<double> pressureCorrection;
+      PetscLogDouble tps0,tps1; PetscCall(PetscTime(&tps0));
+      if(gate9iAutoChebyshev) {
+        // Gate 9I production pressure path:
+        //   * Kp/GAMG is the compact FE-face-energy hierarchy from Gate 9G.
+        //   * On each PC refresh only, estimate lambda_max(M^{-1}S_exact)
+        //     with a short deterministic power iteration.
+        //   * Freeze [lambda_min,lambda_max] until the next PC refresh, with
+        //       lambda_max = safety * lambda_hat,
+        //       lambda_min = lambdaMinFraction * lambda_max.
+        //   * Each SIMPLE pressure correction uses reduction-free Chebyshev
+        //     blocks: initialBlock stages, then extendBlock stages as needed.
+        //   * Stop on the TRUE exact-Schur residual:
+        //       ||r|| <= max(atol, rtol*||r0||).
+        //
+        // The PETSc KSP object is only a container for the GAMG PC. KSPSolve is
+        // never called in this branch.
+        // Gate 9M: optional spectrum cadence independent of GAMG rebuild cadence.
+        // A value of 1 re-estimates on every SIMPLE pressure solve; 0 preserves
+        // the legacy Gate-9I behavior (estimate only when GAMG is rebuilt).
+        if(gate9iSpectrumRefresh>0 && (((it-1)%gate9iSpectrumRefresh)==0)) gate9iEstimatePending=PETSC_TRUE;
+        if(gate9iEstimatePending || !(gate9iLambdaMaxActive>0.0 && gate9iLambdaMinActive>0.0)) {
+          PetscLogDouble tp0,tp1; PetscCall(PetscTime(&tp0));
+          std::vector<double> powQ(pressureResidual.size(),0.0),powZ;
+          const PetscInt gstart=customPressureB.pressureHalo.start;
+          for(std::size_t q=0;q<powQ.size();++q) {
+            const double gi=(double)(gstart+(PetscInt)q+1);
+            // Deterministic broadband seed: reproducible across MPI counts and
+            // non-orthogonal to ordinary smooth/high-frequency pressure modes.
+            powQ[q]=std::sin(0.371*gi)+0.5*std::cos(0.113*(gi+2.0))+0.25*std::sin(0.017*gi*gi);
+          }
+          if(nsp) PetscCall(customPressureProjectConstant(powQ));
+          double qn=0.0; PetscCall(customPressureNorm2(powQ,&qn));
+          if(!(qn>0.0) || !std::isfinite(qn)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9I power seed norm invalid");
+          for(double& v:powQ) v/=qn;
+
+          double lambdaObservedMax=0.0,lambdaWindowMax=0.0,lastNorm=0.0,lastRayleigh=0.0;
+          const PetscInt windowStart=PetscMax((PetscInt)1,gate9iPowerIts-2);
+          for(PetscInt pit=1;pit<=gate9iPowerIts;++pit) {
+            PetscCall(customPressureSchurApply(customPressureB,customMom,powQ,customPressureB.pressureWork));
+            PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,customPressureB.pressureWork));
+            PetscCall(VecSet(pcOut,0.0)); PetscCall(PCApply(ppc,pcIn,pcOut));
+            PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,powZ));
+            double zn=0.0,rq=0.0;
+            PetscCall(customPressureNorm2(powZ,&zn));
+            PetscCall(customPressureDot(powQ,powZ,&rq));
+            if(!(zn>0.0) || !std::isfinite(zn) || !std::isfinite(rq))
+              SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9I power iteration produced invalid spectral estimate");
+            lastNorm=zn; lastRayleigh=std::abs(rq);
+            const double candidate=std::max(lastNorm,lastRayleigh);
+            lambdaObservedMax=std::max(lambdaObservedMax,candidate);
+            if(pit>=windowStart) lambdaWindowMax=std::max(lambdaWindowMax,candidate);
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_GATE9I_POWER it=%" PetscInt_FMT " refresh=%" PetscInt_FMT " powerIt=%" PetscInt_FMT " normEstimate=%.12e rayleighAbs=%.12e observedMax=%.12e\n",
+              it,gate9iEstimateCount+1,pit,lastNorm,lastRayleigh,lambdaObservedMax));
+            for(std::size_t q=0;q<powQ.size();++q) powQ[q]=powZ[q]/zn;
+            if(nsp) PetscCall(customPressureProjectConstant(powQ));
+            double qrenorm=0.0; PetscCall(customPressureNorm2(powQ,&qrenorm));
+            if(!(qrenorm>0.0) || !std::isfinite(qrenorm)) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9I power renormalization failed");
+            for(double& v:powQ) v/=qrenorm;
+          }
+          gate9iLambdaHat=(lambdaWindowMax>0.0)?lambdaWindowMax:std::max(lastNorm,lastRayleigh);
+          gate9iLambdaMaxActive=(double)gate9iSafety*gate9iLambdaHat;
+          gate9iLambdaMinActive=(double)gate9iLambdaMinFraction*gate9iLambdaMaxActive;
+          if(!(gate9iLambdaMinActive>0.0 && gate9iLambdaMaxActive>gate9iLambdaMinActive) ||
+             !std::isfinite(gate9iLambdaMinActive) || !std::isfinite(gate9iLambdaMaxActive))
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_FP,"Gate-9I auto Chebyshev interval invalid");
+          gate9iEstimatePending=PETSC_FALSE;
+          gate9iEstimateCount++;
+          gate9iTotalPowerIts+=gate9iPowerIts;
+          PetscCall(PetscTime(&tp1)); gate9iPowerSeconds+=(double)(tp1-tp0);
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9I_SPECTRUM_REFRESH it=%" PetscInt_FMT " refresh=%" PetscInt_FMT " powerIts=%" PetscInt_FMT " lambdaHat=%.12e lambdaMin=%.12e lambdaMax=%.12e safety=%.6e lambdaMinFraction=%.6e observedMax=%.12e estimateSeconds=%.6e spectrumCadence=%" PetscInt_FMT " pcRefresh=%" PetscInt_FMT "\n",
+            it,gate9iEstimateCount,gate9iPowerIts,gate9iLambdaHat,gate9iLambdaMinActive,gate9iLambdaMaxActive,
+            (double)gate9iSafety,(double)gate9iLambdaMinFraction,lambdaObservedMax,(double)(tp1-tp0),gate9iSpectrumRefresh,pPreconditionerRefresh));
+        }
+
+        PetscLogDouble tc0,tc1; PetscCall(PetscTime(&tc0));
+        pressureCorrection.assign(pressureResidual.size(),0.0);
+        std::vector<double> chebResidual=pressureResidual,chebZ,chebDir(pressureResidual.size(),0.0);
+        const double rhsNorm0=std::max(prhsNorm,1e-300);
+        const double targetAbs=std::max((double)gate9iAtol,(double)gate9iRtol*rhsNorm0);
+        const double lmin=gate9iLambdaMinActive,lmax=gate9iLambdaMaxActive;
+        const double theta=0.5*(lmax+lmin),delta=0.5*(lmax-lmin),sigma=theta/delta;
+        double rhoPrev=1.0/sigma;
+        const PetscBool chebFixed=(gate9iFixedSteps>0)?PETSC_TRUE:PETSC_FALSE;
+        const PetscInt chebLimit=chebFixed?gate9iFixedSteps:gate9iMaxSteps;
+        PetscBool chebConverged=(prhsNorm<=targetAbs)?PETSC_TRUE:PETSC_FALSE,chebFinite=PETSC_TRUE;
+        PetscBool chebAccepted=PETSC_FALSE;
+        PetscInt chebSteps=0; double chebAbs=prhsNorm,chebTrueRel=(rhsNorm0>0.0)?prhsNorm/rhsNorm0:0.0;
+        PetscInt nextCheck=chebFixed?chebLimit:gate9iInitialBlock;
+
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9I_CHEB_BEGIN it=%" PetscInt_FMT " rhsNorm=%.12e targetAbs=%.12e rtol=%.3e atol=%.3e lambdaMin=%.12e lambdaMax=%.12e mode=%s fixedSteps=%" PetscInt_FMT " requireTarget=%d initialBlock=%" PetscInt_FMT " extendBlock=%" PetscInt_FMT " maxSteps=%" PetscInt_FMT " spectrumRefresh=%" PetscInt_FMT " outerKrylov=NONE KSPSolve=NEVER_CALLED\n",
+          it,prhsNorm,targetAbs,(double)gate9iRtol,(double)gate9iAtol,lmin,lmax,chebFixed?"fixed":"adaptive",gate9iFixedSteps,(int)gate9iRequireTarget,gate9iInitialBlock,gate9iExtendBlock,gate9iMaxSteps,gate9iEstimateCount));
+
+        for(PetscInt k=0;k<chebLimit && (chebFixed || !chebConverged);++k) {
+          PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,chebResidual));
+          PetscCall(VecSet(pcOut,0.0)); PetscCall(PCApply(ppc,pcIn,pcOut));
+          PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,chebZ));
+          if(chebZ.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Gate-9I Chebyshev correction size mismatch");
+          if(k==0) {
+            const double alpha0=1.0/theta;
+            for(std::size_t q=0;q<chebDir.size();++q) chebDir[q]=alpha0*chebZ[q];
+          } else {
+            const double rho=1.0/(2.0*sigma-rhoPrev);
+            const double beta=rho*rhoPrev;
+            const double alpha=2.0*rho/delta;
+            for(std::size_t q=0;q<chebDir.size();++q) chebDir[q]=beta*chebDir[q]+alpha*chebZ[q];
+            rhoPrev=rho;
+          }
+          for(std::size_t q=0;q<pressureCorrection.size();++q) pressureCorrection[q]+=chebDir[q];
+          PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+          for(std::size_t q=0;q<chebResidual.size();++q) chebResidual[q]=pressureResidual[q]-customPressureB.pressureWork[q];
+          if(nsp) PetscCall(customPressureProjectConstant(chebResidual));
+          chebSteps=k+1;
+
+          const PetscBool doCheck=(chebSteps==nextCheck || chebSteps==chebLimit)?PETSC_TRUE:PETSC_FALSE;
+          if(doCheck) {
+            PetscCall(customPressureNorm2(chebResidual,&chebAbs));
+            chebTrueRel=chebAbs/rhsNorm0;
+            if(!std::isfinite(chebAbs) || !std::isfinite(chebTrueRel)) {chebFinite=PETSC_FALSE;break;}
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_GATE9I_CHEB_CHECK it=%" PetscInt_FMT " step=%" PetscInt_FMT " trueAbs=%.12e trueRel=%.12e targetAbs=%.12e targetRel=%.3e oneSchurPerStage=1 oneGamgPerStage=1 reductionsThisBlock=1 lambdaMin=%.6e lambdaMax=%.6e\n",
+              it,chebSteps,chebAbs,chebTrueRel,targetAbs,(double)gate9iRtol,lmin,lmax));
+            if(chebAbs<=targetAbs) chebConverged=PETSC_TRUE;
+            if(chebTrueRel>=(double)gate9dDivergenceFactor) break;
+            if(!chebFixed) nextCheck=PetscMin(chebLimit,chebSteps+gate9iExtendBlock);
+          }
+        }
+
+        // A final norm is needed if an adaptive nonstandard maxSteps ended
+        // between scheduled checks. Fixed mode always checks at chebLimit.
+        if(!chebFixed && !chebConverged && chebFinite && chebSteps>0 &&
+           chebSteps!=gate9iInitialBlock &&
+           ((chebSteps-gate9iInitialBlock)%gate9iExtendBlock)!=0) {
+          PetscCall(customPressureNorm2(chebResidual,&chebAbs));
+          chebTrueRel=chebAbs/rhsNorm0;
+          if(!std::isfinite(chebAbs) || !std::isfinite(chebTrueRel)) chebFinite=PETSC_FALSE;
+          if(chebFinite && chebAbs<=targetAbs) chebConverged=PETSC_TRUE;
+        }
+        chebAccepted = chebFinite && (chebConverged || !gate9iRequireTarget);
+        PetscCall(PetscTime(&tc1));
+        gate9iChebSeconds+=(double)(tc1-tc0);
+        gate9iTotalChebSteps+=chebSteps;
+        gate9iPressureSolves++;
+        pits=chebSteps;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9I_CHEB_SOLVE it=%" PetscInt_FMT " accepted=%d targetMet=%d mode=%s steps=%" PetscInt_FMT " trueAbs=%.12e trueRel=%.12e targetAbs=%.12e rtol=%.3e atol=%.3e lambdaHat=%.12e lambdaMin=%.12e lambdaMax=%.12e solveSeconds=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED Kp=FE_face_jump_energy\n",
+          it,(int)chebAccepted,(int)chebConverged,chebFixed?"fixed":"adaptive",chebSteps,chebAbs,chebTrueRel,targetAbs,(double)gate9iRtol,(double)gate9iAtol,
+          gate9iLambdaHat,lmin,lmax,(double)(tc1-tc0)));
+        if(!chebAccepted) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-911;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_SOLVE_FAILURE stage=gate9i_auto_chebyshev it=%" PetscInt_FMT " mode=%s steps=%" PetscInt_FMT " trueAbs=%.3e trueRel=%.3e targetAbs=%.3e lambdaMin=%.3e lambdaMax=%.3e requireTarget=%d action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+            it,chebFixed?"fixed":"adaptive",chebSteps,chebAbs,chebTrueRel,targetAbs,lmin,lmax,(int)gate9iRequireTarget));
+          break;
+        }
+      } else if(gate9hChebyshev) {
+        // Gate 9H: preconditioned Chebyshev semi-iteration on the unchanged
+        // exact SIMPLE Schur.  No outer Krylov and no inner Krylov.  Each
+        // stage uses exactly one exact-Schur action and one GAMG PCApply on
+        // the compact FE-face-energy Kp.  The recurrence is the classical
+        // minimax Chebyshev semi-iteration for eigenvalues in [lambdaMin,lambdaMax].
+        pressureCorrection.assign(pressureResidual.size(),0.0);
+        std::vector<double> chebResidual=pressureResidual,chebZ,chebDir(pressureResidual.size(),0.0);
+        const double rhsNorm0=std::max(prhsNorm,1e-300);
+        const double lmin=(double)gate9hLambdaMin,lmax=(double)gate9hLambdaMax;
+        const double theta=0.5*(lmax+lmin),delta=0.5*(lmax-lmin),sigma=theta/delta;
+        double rhoPrev=1.0/sigma;
+        PetscBool chebConverged=PETSC_FALSE,chebFinite=PETSC_TRUE;
+        PetscInt chebSteps=0; double chebTrueRel=1.0,prevCheckedRel=1.0;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9H_CHEB_CYCLE it=%" PetscInt_FMT " step=0 trueRel=1.000000000000e+00 lambdaMin=%.6e lambdaMax=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED\n",
+          it,lmin,lmax));
+        for(PetscInt k=0;k<gate9hMaxSteps;++k) {
+          PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,chebResidual));
+          PetscCall(VecSet(pcOut,0.0)); PetscCall(PCApply(ppc,pcIn,pcOut));
+          PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,chebZ));
+          if(chebZ.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Gate-9H Chebyshev correction size mismatch");
+          if(k==0) {
+            const double alpha0=1.0/theta;
+            for(std::size_t q=0;q<chebDir.size();++q) chebDir[q]=alpha0*chebZ[q];
+          } else {
+            const double rho=1.0/(2.0*sigma-rhoPrev);
+            const double beta=rho*rhoPrev;
+            const double alpha=2.0*rho/delta;
+            for(std::size_t q=0;q<chebDir.size();++q) chebDir[q]=beta*chebDir[q]+alpha*chebZ[q];
+            rhoPrev=rho;
+          }
+          for(std::size_t q=0;q<pressureCorrection.size();++q) pressureCorrection[q]+=chebDir[q];
+          PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+          for(std::size_t q=0;q<chebResidual.size();++q) chebResidual[q]=pressureResidual[q]-customPressureB.pressureWork[q];
+          chebSteps=k+1;
+          const PetscBool doCheck = (chebSteps<=5 || chebSteps%gate9hCheckEvery==0 || chebSteps==gate9hMaxSteps) ? PETSC_TRUE : PETSC_FALSE;
+          if(doCheck) {
+            double rr=0.0; PetscCall(customPressureNorm2(chebResidual,&rr)); chebTrueRel=rr/rhsNorm0;
+            if(!std::isfinite(chebTrueRel)) {chebFinite=PETSC_FALSE;break;}
+            const double ctr=chebTrueRel/std::max(prevCheckedRel,1e-300);
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_GATE9H_CHEB_CYCLE it=%" PetscInt_FMT " step=%" PetscInt_FMT " trueRel=%.12e checkedContraction=%.12e lambdaMin=%.6e lambdaMax=%.6e oneSchurApply=1 oneGamgPCApply=1 reductionsSinceLastCheck=1 outerKrylov=NONE\n",
+              it,chebSteps,chebTrueRel,ctr,lmin,lmax));
+            prevCheckedRel=chebTrueRel;
+            if(chebTrueRel<=gate9OuterTrueResidualTol) {chebConverged=PETSC_TRUE;break;}
+            if(chebTrueRel>=gate9dDivergenceFactor) break;
+          }
+        }
+        // Ensure the reported final true residual is current if the final step
+        // was not one of the periodic diagnostic checks.
+        if(chebSteps%gate9hCheckEvery!=0 && chebSteps>5 && !chebConverged && chebFinite) {
+          double rr=0.0; PetscCall(customPressureNorm2(chebResidual,&rr)); chebTrueRel=rr/rhsNorm0;
+          if(!std::isfinite(chebTrueRel)) chebFinite=PETSC_FALSE;
+          if(chebTrueRel<=gate9OuterTrueResidualTol) chebConverged=PETSC_TRUE;
+        }
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9H_CHEB_SOLVE it=%" PetscInt_FMT " converged=%d steps=%" PetscInt_FMT " trueRel=%.12e trueResidualTol=%.3e lambdaMin=%.6e lambdaMax=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED oneGamgPerStep=1 oneSchurPerStep=1 Kp=FE_face_jump_energy\n",
+          it,(int)chebConverged,chebSteps,chebTrueRel,(double)gate9OuterTrueResidualTol,lmin,lmax));
+        pits=chebSteps;
+        if(!chebFinite || !chebConverged) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-910;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_SOLVE_FAILURE stage=gate9h_chebyshev it=%" PetscInt_FMT " steps=%" PetscInt_FMT " trueRel=%.3e lambdaMin=%.3e lambdaMax=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+            it,chebSteps,chebTrueRel,lmin,lmax));
+          break;
+        }
+      } else if(gate9gRichardson) {
+        // Gate 9G stationary pressure solve: no outer Krylov and no inner
+        // Krylov.  Each correction is exactly one PCApply from the GAMG
+        // hierarchy built on the FE-energy face Kp.
+        pressureCorrection.assign(pressureResidual.size(),0.0);
+        std::vector<double> statResidual=pressureResidual,statCorrection;
+        const double rhsNorm0=std::max(prhsNorm,1e-300);
+        PetscBool statConverged=PETSC_FALSE,statFinite=PETSC_TRUE;
+        PetscInt statCycles=0;
+        double statTrueRel=1.0;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9G_RICHARDSON_CYCLE it=%" PetscInt_FMT " cycle=0 trueRel=1.000000000000e+00 contraction=1.000000000000e+00 omega=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED\n",it,(double)gate9dOmega));
+        double prevRel=1.0;
+        for(PetscInt cyc=1;cyc<=gate9dMaxCycles;++cyc) {
+          PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statResidual));
+          PetscCall(VecSet(pcOut,0.0)); PetscCall(PCApply(ppc,pcIn,pcOut));
+          PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statCorrection));
+          if(statCorrection.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Gate-9G Richardson correction size mismatch");
+          for(std::size_t q=0;q<pressureCorrection.size();++q) pressureCorrection[q]+=(double)gate9dOmega*statCorrection[q];
+          PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+          for(std::size_t q=0;q<statResidual.size();++q) statResidual[q]=pressureResidual[q]-customPressureB.pressureWork[q];
+          double rr=0.0; PetscCall(customPressureNorm2(statResidual,&rr)); statTrueRel=rr/rhsNorm0; statCycles=cyc;
+          if(!std::isfinite(statTrueRel)) {statFinite=PETSC_FALSE;break;}
+          const double ctr=statTrueRel/std::max(prevRel,1e-300);
+          if(cyc<=20 || cyc%10==0 || statTrueRel<=gate9OuterTrueResidualTol) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9G_RICHARDSON_CYCLE it=%" PetscInt_FMT " cycle=%" PetscInt_FMT " trueRel=%.12e contraction=%.12e omega=%.6e outerKrylov=NONE\n",
+            it,cyc,statTrueRel,ctr,(double)gate9dOmega));
+          prevRel=statTrueRel;
+          if(statTrueRel<=gate9OuterTrueResidualTol) {statConverged=PETSC_TRUE;break;}
+          if(statTrueRel>=gate9dDivergenceFactor) break;
+        }
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9G_RICHARDSON_SOLVE it=%" PetscInt_FMT " converged=%d cycles=%" PetscInt_FMT " trueRel=%.12e trueResidualTol=%.3e omega=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED Kp=FE_face_jump_energy\n",
+          it,(int)statConverged,statCycles,statTrueRel,(double)gate9OuterTrueResidualTol,(double)gate9dOmega));
+        pits=statCycles;
+        if(!statFinite || !statConverged) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-909;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_SOLVE_FAILURE stage=gate9g_richardson it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " trueRel=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",it,statCycles,statTrueRel));
+          break;
+        }
+      } else if(pressureSolveMode=="gamg_richardson") {
+        // FULLFAST-B0: old fast pressure semantics restored on the current
+        // distributed/FP32-PETSc architecture.  The exact residual always uses
+        // custom FP64 S=B rAU B^T; PETSc GAMG is only an approximate inverse of
+        // the lagged explicit full-Schur Pmat.  One PCApply is one Richardson
+        // cycle.  p_ksp_rtol/atol/max_it define the inexact pressure target.
+        pressureCorrection.assign(pressureResidual.size(),0.0);
+        std::vector<double> statResidual(pressureResidual.size(),0.0),statCorrection;
+        PetscBool statConverged=PETSC_FALSE,statFinite=PETSC_TRUE;
+        PetscInt statCycles=0; double statTrueRel=1.0,prevRel=1.0;
+        const double absTarget=std::max((double)pcgAtol,(double)pcgRtol*prhsNorm);
+        for(PetscInt cyc=0;cyc<=pcgMaxIts;++cyc) {
+          if(cyc==0) statResidual=pressureResidual;
+          else {
+            PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+            for(std::size_t q=0;q<statResidual.size();++q) statResidual[q]=pressureResidual[q]-customPressureB.pressureWork[q];
+            if(nsp) PetscCall(customPressureProjectConstant(statResidual));
+          }
+          double rr=0.0; PetscCall(customPressureNorm2(statResidual,&rr));
+          statTrueRel=rr/std::max(prhsNorm,1e-300);
+          const double contraction=(cyc==0)?1.0:statTrueRel/std::max(prevRel,1e-300);
+          statFinite=(std::isfinite(rr)&&std::isfinite(statTrueRel)&&std::isfinite(contraction))?PETSC_TRUE:PETSC_FALSE;
+          if(statFinite && rr<=absTarget) { statConverged=PETSC_TRUE; statCycles=cyc; break; }
+          if(!statFinite || cyc==pcgMaxIts || (pcgDtol>0.0 && statTrueRel>(double)pcgDtol)) { statCycles=cyc; break; }
+          prevRel=statTrueRel;
+          PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statResidual));
+          PetscCall(VecSet(pcOut,0.0));
+          PetscCall(PCApply(ppc,pcIn,pcOut));
+          PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statCorrection));
+          if(statCorrection.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"FULLFAST Richardson correction ownership mismatch");
+          for(std::size_t q=0;q<pressureCorrection.size();++q) pressureCorrection[q]+=statCorrection[q];
+          statCycles=cyc+1;
+        }
+        pits=statCycles;
+        if(it<=10 || it%10==0 || !statConverged) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_FULLFAST_PRESSURE it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " converged=%d trueRel=%.6e rtol=%.3e atol=%.3e Pmat=full_FP32_GAMG exactResidual=custom_FP64_B_rAU_Bt refresh=%" PetscInt_FMT "\n",
+          it,statCycles,(int)statConverged,statTrueRel,(double)pcgRtol,(double)pcgAtol,pPreconditionerRefresh));
+        if(!statConverged) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-920;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_SOLVE_FAILURE stage=fullfast_gamg_richardson it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " trueRel=%.3e targetRel=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+            it,statCycles,statTrueRel,(double)pcgRtol));
+          break;
+        }
+      } else if(pressureSolveMode=="custom_pcg") {
+        if(customPressureBackend) {
+          if(!customAMGLiveReady)
+            SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,
+              "RANS custom AMG hierarchy not ready before PCG");
+          const PetscInt vBefore=customAMGLive.vcycleApplyCount;
+          PetscCall(customPressureAMGLivePCGSolve(
+            customAMGLive,customPressureB,customMom,pressureResidual,
+            (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,
+            customAMGLiveW,customAMGLiveResult));
+          if(!customAMGLiveResult.converged) {
+            solveFailed=PETSC_TRUE; pressureFailureReason=-951;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_SOLVE_FAILURE stage=rans_custom_amg_pcg it=%" PetscInt_FMT
+              " its=%" PetscInt_FMT " trueRel=%.3e finite=%d "
+              "action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+              it,customAMGLiveResult.its,customAMGLiveResult.trueRel,
+              (int)customAMGLiveResult.finite));
+            break;
+          }
+          pits=customAMGLiveResult.its;
+          pressureCorrection=customAMGLiveW.x;
+          if(it<=10 || it%10==0 || allInitialResidualsMet)
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_RANS_CUSTOM_AMG_PCG it=%" PetscInt_FMT
+              " pcgIts=%" PetscInt_FMT " trueRel=%.6e rtol=%.3e"
+              " vcyclesThisSolve=%" PetscInt_FMT
+              " hierarchyRefreshes=%" PetscInt_FMT
+              " smoother=%s transfer=%s chebDegree=%" PetscInt_FMT
+              " exactOperator=canonical_matrix_free_Beff_rAU_BeffT"
+              " PETScGAMG=NOT_USED_IN_SOLVE\n",
+              it,pits,customAMGLiveResult.trueRel,(double)pcgRtol,
+              customAMGLive.vcycleApplyCount-vBefore,customAMGRefreshes,
+              customAMGSmoother.c_str(),
+              customAMGConfig.smoothedAggregation?"smoothed":"unsmoothed",
+              customAMGConfig.chebyshevDegree));
+        } else {
+        PetscCall(customPressurePCG(customPressureB,customMom,ppc,pcIn,pcOut,pressureResidual,
+          (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,nsp?PETSC_TRUE:PETSC_FALSE,pressurePcgW,pcgRes,m10PcgProfile?&m10This:nullptr));
+        if(!pcgRes.converged) {
+          solveFailed=PETSC_TRUE; pressureFailureReason=-901;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_SOLVE_FAILURE stage=custom_pressure_pcg it=%" PetscInt_FMT " its=%" PetscInt_FMT " relPrec=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+            it,pcgRes.its,pcgRes.finalPreconditionedRel));
+          break;
+        }
+        pits=pcgRes.its;
+        pressureCorrection=pressurePcgW.x;
+        if(gate9eNgfv) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9E_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_nodal_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
+          it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
+        if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9G_PCG_SOLVE it=%" PetscInt_FMT " pcgIts=%" PetscInt_FMT " converged=%d finalPreconditionedRel=%.3e pc=ONE_GAMG_PCApply_on_FE_face_energy_Kp exactSchur=custom_FP64_B_rAU_Bt\n",
+          it,pcgRes.its,(int)pcgRes.converged,pcgRes.finalPreconditionedRel));
+        }
+      } else {
+        // Gate 1 live path: PETSc FGMRES sees the exact factored Schur as A and
+        // exactly the same existing pressure Pmat/GAMG as the old custom PCG.
+        PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,pressureResidual));
+        if(gate7CpProbe) PetscCall(gate7ProbeActualPressureRhs(gate4Kp,gate7Cp,D.volumes,(PetscReal)P.nu,pcIn,it));
+        if(gate8EswBcProbe) PetscCall(gate8ProbeActualPressureRhs(gate7Cp,gate8EswBc,D.volumes,pcIn,it));
+        if(gate6DiffusionPcdProbe) {
+          if(gate6DiffusionPcdCtx->setupCount==0) PetscCall(PCSetUp(gate6DiffusionPcdShell));
+          PetscCall(VecSet(pcOut,0.0));
+          PetscCall(PCApply(gate6DiffusionPcdShell,pcIn,pcOut));
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE6_DIFFUSION_PCD_APPLY it=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " kpIts=%" PetscInt_FMT " kpReason=%d chainRel=%.3e maxChainRel=%.3e kpTrueRel=%.3e maxKpTrueRel=%.3e rhsNorm=%.3e mpInvRhsNorm=%.3e fpNorm=%.3e outNorm=%.3e liveSolveTouched=0\n",
+            it,gate6DiffusionPcdCtx->applyCount,gate6DiffusionPcdCtx->lastKpIts,(int)gate6DiffusionPcdCtx->lastKpReason,
+            (double)gate6DiffusionPcdCtx->lastChainRel,(double)gate6DiffusionPcdCtx->maxChainRel,
+            (double)gate6DiffusionPcdCtx->lastKpTrueRel,(double)gate6DiffusionPcdCtx->maxKpTrueRel,
+            (double)gate6DiffusionPcdCtx->lastRhsNorm,(double)gate6DiffusionPcdCtx->lastMassNorm,
+            (double)gate6DiffusionPcdCtx->lastFpNorm,(double)gate6DiffusionPcdCtx->lastOutNorm));
+        }
+        if(gate3MpProbe) {
+          if(gate3MpCtx->setupCount==0) PetscCall(PCSetUp(gate3MpShell));
+          PetscCall(VecSet(pcOut,0.0));
+          PetscCall(PCApply(gate3MpShell,pcIn,pcOut));
+          PetscReal mpOutNorm=0.0,rhsNormShadow=0.0;
+          PetscCall(VecNorm(pcOut,NORM_2,&mpOutNorm));
+          PetscCall(VecNorm(pcIn,NORM_2,&rhsNormShadow));
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE3_MP_APPLY it=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " algebraRel=%.3e maxAlgebraRel=%.3e rhsNorm=%.3e mpInvRhsNorm=%.3e liveSolveTouched=0\n",
+            it,gate3MpCtx->applyCount,(double)gate3MpCtx->lastAlgebraRel,(double)gate3MpCtx->maxAlgebraRel,(double)rhsNormShadow,(double)mpOutNorm));
+        }
+        const PetscInt gate9ApplyBefore=(gate9LivePcd && gate9LivePcdCtx)?gate9LivePcdCtx->applyCount:0;
+        const PetscReal gate9TimeBefore=(gate9LivePcd && gate9LivePcdCtx)?gate9LivePcdCtx->totalApplySeconds:0.0;
+        double trueRel=PETSC_MAX_REAL;
+        if(gate9dGamgOnly) {
+          // Gate 9D: NO outer Krylov.  Stationary residual correction on the
+          // unchanged exact SIMPLE Schur, using exactly one geometric-Kp GAMG
+          // PCApply per cycle:
+          //   r_m = b - S_exact x_m
+          //   x_{m+1} = x_m + omega * GAMG_Kp(r_m)
+          // The PETSc KSP object exists only to own/setup the PC hierarchy;
+          // KSPSolve is deliberately never called in this branch.
+          pressureCorrection.assign(pressureResidual.size(),0.0);
+          std::vector<double> statResidual(pressureResidual.size(),0.0),statCorrection;
+          PetscBool statConverged=PETSC_FALSE,statFinite=PETSC_TRUE;
+          PetscInt cyclesDone=0;
+          double prevRel=1.0;
+          for(PetscInt cyc=0;cyc<=gate9dMaxCycles;++cyc) {
+            PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+            for(std::size_t i=0;i<statResidual.size();++i) statResidual[i]=pressureResidual[i]-customPressureB.pressureWork[i];
+            if(nsp) PetscCall(customPressureProjectConstant(statResidual));
+            double rr=0.0; PetscCall(customPressureNorm2(statResidual,&rr));
+            trueRel=rr/std::max(prhsNorm,1e-300);
+            const double contraction=(cyc==0)?1.0:trueRel/std::max(prevRel,1e-300);
+            if(!std::isfinite(trueRel) || !std::isfinite(contraction)) statFinite=PETSC_FALSE;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_GATE9D_CYCLE simpleIt=%" PetscInt_FMT " cycle=%" PetscInt_FMT " trueRel=%.12e contraction=%.12e omega=%.6e exactResidual=1 outerKrylov=NONE\n",
+              it,cyc,trueRel,contraction,(double)gate9dOmega));
+            if(statFinite && trueRel<=(double)gate9OuterTrueResidualTol) { statConverged=PETSC_TRUE; cyclesDone=cyc; break; }
+            if(!statFinite || trueRel>(double)gate9dDivergenceFactor) { cyclesDone=cyc; break; }
+            if(cyc==gate9dMaxCycles) { cyclesDone=cyc; break; }
+            prevRel=trueRel;
+            PetscCall(customVecWriteOwnedRange(pcIn,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statResidual));
+            PetscCall(VecSet(pcOut,0.0));
+            PetscCall(PCApply(ppc,pcIn,pcOut));
+            PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,statCorrection));
+            if(statCorrection.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Gate-9D correction ownership mismatch");
+            for(std::size_t i=0;i<pressureCorrection.size();++i) pressureCorrection[i]+=(double)gate9dOmega*statCorrection[i];
+            cyclesDone=cyc+1;
+          }
+          pits=cyclesDone;
+          if(gate9LivePcdCtx) {
+            gate9LivePcdCtx->lastOuterTrueRel=(PetscReal)trueRel;
+            gate9LivePcdCtx->maxOuterTrueRel=PetscMax(gate9LivePcdCtx->maxOuterTrueRel,(PetscReal)trueRel);
+            if(statConverged) gate9LivePcdCtx->outerSolveCount++;
+            if(!statFinite) gate9LivePcdCtx->allFinite=PETSC_FALSE;
+          }
+          const PetscInt appliesThis=(gate9LivePcdCtx?gate9LivePcdCtx->applyCount:0)-gate9ApplyBefore;
+          const PetscReal gamgSecondsThis=(gate9LivePcdCtx?gate9LivePcdCtx->totalApplySeconds:0.0)-gate9TimeBefore;
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9D_SOLVE it=%" PetscInt_FMT " converged=%d cycles=%" PetscInt_FMT " trueRel=%.12e trueResidualTol=%.3e appliesThis=%" PetscInt_FMT " gamgApplySeconds=%.6e omega=%.6e outerKrylov=NONE KSPSolve=NEVER_CALLED exactSchur=UNCHANGED\n",
+            it,(int)statConverged,cyclesDone,trueRel,(double)gate9OuterTrueResidualTol,appliesThis,(double)gamgSecondsThis,(double)gate9dOmega));
+          if(!statConverged) {
+            solveFailed=PETSC_TRUE; pressureFailureReason=-904;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_SOLVE_FAILURE stage=gate9d_gamg_only it=%" PetscInt_FMT " cycles=%" PetscInt_FMT " trueRel=%.3e omega=%.6e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+              it,cyclesDone,trueRel,(double)gate9dOmega));
+            break;
+          }
+        } else {
+          PetscCall(VecSet(pcOut,0.0));
+          PetscCall(KSPSetInitialGuessNonzero(pksp,PETSC_FALSE));
+          PetscCall(KSPSolve(pksp,pcIn,pcOut));
+          KSPConvergedReason fReason; PetscReal fReported=0.0;
+          PetscCall(KSPGetConvergedReason(pksp,&fReason));
+          PetscCall(KSPGetIterationNumber(pksp,&pits));
+          PetscCall(KSPGetResidualNorm(pksp,&fReported));
+          if(fReason<0) {
+            solveFailed=PETSC_TRUE; pressureFailureReason=(PetscInt)fReason;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_SOLVE_FAILURE stage=gate1_petsc_fgmres it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e action=stop_SIMPLE_and_write_last_iterate_VTU\n",
+              it,pits,(int)fReason,(double)fReported));
+            break;
+          }
+          PetscCall(customVecOwnedRange(pcOut,customPressureB.pressureHalo.start,customPressureB.pressureHalo.end,pressureCorrection));
+
+          // Always report the TRUE residual of the unchanged custom exact Schur.
+          PetscCall(customPressureSchurApply(customPressureB,customMom,pressureCorrection,customPressureB.pressureWork));
+          std::vector<double> trueR(pressureResidual.size(),0.0);
+          for(std::size_t i=0;i<trueR.size();++i) trueR[i]=pressureResidual[i]-customPressureB.pressureWork[i];
+          if(nsp) PetscCall(customPressureProjectConstant(trueR));
+          double trueRn=0.0; PetscCall(customPressureNorm2(trueR,&trueRn));
+          trueRel=trueRn/std::max(prhsNorm,1e-300);
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE1_FGMRES it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d reportedResidual=%.3e trueRel=%.3e rhsNorm=%.3e\n",
+            it,pits,(int)fReason,(double)fReported,trueRel,prhsNorm));
+          if(gate9gFeFace) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE9G_FGMRES_SOLVE it=%" PetscInt_FMT " its=%" PetscInt_FMT " reason=%d trueRel=%.3e pc=GAMG_on_FE_face_energy_compact_Pmat exactSchur=custom_FP64_B_rAU_Bt\n",
+            it,pits,(int)fReason,trueRel));
+          if(gate9LivePcd && gate9LivePcdCtx) {
+            gate9LivePcdCtx->lastOuterTrueRel=(PetscReal)trueRel; gate9LivePcdCtx->maxOuterTrueRel=PetscMax(gate9LivePcdCtx->maxOuterTrueRel,(PetscReal)trueRel); gate9LivePcdCtx->outerSolveCount++;
+            const PetscInt appliesThis=gate9LivePcdCtx->applyCount-gate9ApplyBefore; const PetscReal pcdSecondsThis=gate9LivePcdCtx->totalApplySeconds-gate9TimeBefore;
+            PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+              "P1BF3_GATE9C_OUTER it=%" PetscInt_FMT " fgmresIts=%" PetscInt_FMT " reason=%d trueRel=%.3e appliesThis=%" PetscInt_FMT " gamgApplySeconds=%.6e maxOneCycleKpRel=%.3e livePC=ONE_direct_GAMG_PCApply_geometric_Kp innerKrylov=NONE exactSchur=UNCHANGED\n",
+              it,pits,(int)fReason,trueRel,appliesThis,(double)pcdSecondsThis,(double)gate9LivePcdCtx->maxKpCycleRel));
+            if(trueRel>(double)gate9OuterTrueResidualTol) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,"Gate-9C direct Kp-GAMG outer FGMRES true residual exceeded gate tolerance");
+          }
+        }
+
+        // First pressure solve only: solve the identical RHS with the untouched
+        // custom PCG and compare solutions.  This is a shadow check, not part of
+        // the pressure update.
+        if(!gate9dGamgOnly && gate1ComparePcg && !gate1FgmresParityDone) {
+          CustomPressurePCGResult shadow; CustomPressurePCGWorkspace shadowW;
+          PetscCall(customPressurePCG(customPressureB,customMom,ppc,pcIn,pcOut,pressureResidual,
+            (double)pcgRtol,(double)pcgAtol,(double)pcgDtol,pcgMaxIts,nsp?PETSC_TRUE:PETSC_FALSE,shadowW,shadow,nullptr));
+          if(!shadow.converged) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_NOT_CONVERGED,"Gate-1 shadow custom PCG did not converge");
+          if(shadowW.x.size()!=pressureCorrection.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"Gate-1 FGMRES/PCG solution size mismatch");
+          std::vector<double> diff(pressureCorrection.size(),0.0);
+          for(std::size_t i=0;i<diff.size();++i) diff[i]=pressureCorrection[i]-shadowW.x[i];
+          double dn=0.0,pn=0.0; PetscCall(customPressureNorm2(diff,&dn)); PetscCall(customPressureNorm2(shadowW.x,&pn));
+          const double solRel=dn/std::max(pn,1e-300);
+          const bool ok=(solRel<=(double)gate1SolutionTol && trueRel<=(double)gate1TrueResidualTol);
+          PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+            "P1BF3_GATE1_PARITY it=%" PetscInt_FMT " fgmresIts=%" PetscInt_FMT " customPcgIts=%" PetscInt_FMT " solutionRel=%.3e trueRel=%.3e solutionTol=%.3e trueResidualTol=%.3e status=%s\n",
+            it,pits,shadow.its,solRel,trueRel,(double)gate1SolutionTol,(double)gate1TrueResidualTol,ok?"PASS":"FAIL"));
+          if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-1 FGMRES/custom-PCG parity failed");
+          gate1FgmresParityDone=PETSC_TRUE;
+        }
+      }
+      PetscCall(PetscTime(&tps1)); pressureSolveSeconds += (double)(tps1-tps0);
+      if(pressureSolveMode=="custom_pcg" && m10PcgProfile) { m10This.solves=1; m10This.totalPcg=(double)(tps1-tps0); m10ProfileAdd(m10PcgTotal,m10This); if(it>1) m10ProfileAdd(m10PcgWarm,m10This); }
+      if(pressureSolveMode=="custom_pcg" && m5bPcgReference && !pressurePcgReferenceDone) {
+        if(petscRefSolution.size()!=pressurePcgW.x.size()) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_ARG_SIZ,"M6A reference solution size mismatch");
+        std::vector<double> diff(pressurePcgW.x.size()); for(std::size_t i=0;i<diff.size();++i) diff[i]=pressurePcgW.x[i]-petscRefSolution[i];
+        double dn=0.0,rnRef=0.0; PetscCall(customPressureNorm2(diff,&dn)); PetscCall(customPressureNorm2(petscRefSolution,&rnRef));
+        const double solRel=dn/std::max(rnRef,1e-300); const PetscInt itDiff=(PetscInt)std::llabs((long long)pits-(long long)petscRefIts);
+        const bool ok=(solRel<=(double)customPressurePcgReferenceTol && itDiff==0);
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_M6A_PRESSURE_STATE_REFERENCE it=%" PetscInt_FMT " customIts=%" PetscInt_FMT " petscIts=%" PetscInt_FMT " iterationDiff=%" PetscInt_FMT " solutionRel=%.3e customFinalPrecRel=%.3e tol=%.3e status=%s\n",
+          it,pits,petscRefIts,itDiff,solRel,pcgRes.finalPreconditionedRel,(double)customPressurePcgReferenceTol,ok?"PASS":"CHECK"));
+        if(!ok) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"M6A native pressure state reference parity failed");
+        pressurePcgReferenceDone=PETSC_TRUE;
+      }
+      sumP+=pits; pSolves++;
+
+      for(std::size_t i=0;i<pressureState.size();++i) pressureState[i]+=(double)ap*pressureCorrection[i];
+      if(nsp) PetscCall(customPressureVolumeMeanShift(pressureState,D.volumesOwnedFP64,volsum));
+
+      if(it<=10 || it%10==0) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_SIMPLE variant=%s it=%" PetscInt_FMT " relCont=%.12e uInitRel=[%.2e,%.2e,%.2e] uIts=[%" PetscInt_FMT ",%" PetscInt_FMT ",%" PetscInt_FMT "] uRel=[%.2e,%.2e,%.2e] aPhysDiag=[%.6e,%.6e] aRelDiag=[%.6e,%.6e] rauMetric=[%.6e,%.6e] tau=[%.3e,%.3e,%.3e] pCG=%" PetscInt_FMT " allInitialMet=%d\n",
+        simpleVariant.c_str(),it,(double)rel,(double)uInitRel[0],(double)uInitRel[1],(double)uInitRel[2],uits[0],uits[1],uits[2],(double)ur[0],(double)ur[1],(double)ur[2],(double)minPhysDiag,(double)maxPhysDiag,(double)minDiag,(double)maxDiag,(double)minRauMetric,(double)maxRauMetric,(double)supgStats.tauMin,(double)supgStats.tauMean,(double)supgStats.tauMax,pits,(int)allInitialResidualsMet));
+      if(allInitialResidualsMet) {
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_SIMPLE_ALL_INITIAL_RESIDUALS_PASS it=%" PetscInt_FMT " Ux=%.12e Uy=%.12e Uz=%.12e pEquivalentContinuity=%.12e gate=%.3e pressureSolveCompletedThisIteration=1\n",
+          it,(double)uInitRel[0],(double)uInitRel[1],(double)uInitRel[2],rel,(double)simpleTol));
+        converged=PETSC_TRUE;
+        break;
+      }
+    }
+    PetscCall(PetscTime(&tSolve1));
+    if(resourceProfile) PetscCall(printResourceMark("solve_end",reportCells,tSolve1-tSolve0,tTotal0));
+
+    // Rebuild the physical nonlinear operator with the final velocity and report
+    // the true steady Navier-Stokes momentum residual (no equation UR). M2B
+    // evaluates this with the direct custom FP64 physical matrix action.
+    PetscCall(customMomentumGatherVelocityNative(customMom,U));
+    std::vector<double> budgetMolecular,budgetAfterMix,budgetAfterWall,budgetAfterConvection,budgetFinal,budgetPressureBtZ;
+    if(dynPlanCompact) PetscCall(customMomentumResetPhysical(DynRuntime,customMom,nu,m1m2LegacyReference)); else PetscCall(customMomentumResetPhysical(DynPlan,customMom,nu,m1m2LegacyReference));
+    if(momentumBudget) PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[2],budgetMolecular));
+    if(mixingLength) PetscCall(assembleNikuradseMixingLengthCustom(D,DynRuntime,customMom,P.pipe,nu,(double)mixlenScale,mixlenDeviatoric,PETSC_FALSE,mixlenStats));
+    if(momentumBudget) PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[2],budgetAfterMix));
+    if(weakWallFunction) {
+      if(!dynPlanCompact) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_SUP,"Stage-3 weak wall function requires compact dynamic plan");
+      PetscCall(assembleSpaldingWeakWallCustom(D,DynRuntime,customMom,nu,(double)wallKappa,(double)wallB,(double)wallDistanceFactor,(double)wallBetaScale,P.pipe.cx,P.pipe.cy,wallLinearization,(double)wallTangentBlend,wallSampleMode,wallMolecularConsistency,P.pipe.bulkVelocity,P.pipe.zIn,P.pipe.L,wallStats));
+    }
+    if(momentumBudget) PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[2],budgetAfterWall));
+    if(centralConvection) { if(dynPlanCompact) PetscCall(assembleCentralConvectionCustom(D,DynRuntime,customMom)); else PetscCall(assembleCentralConvectionCustom(D,DynPlan,customMom)); }
+    if(momentumBudget) PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[2],budgetAfterConvection));
+    if(useSupg) { if(dynPlanCompact) PetscCall(assembleSupgCustom(D,DynRuntime,customMom,(double)supgTauScale,(double)supgMagic,"implicit",mixingLength,P.pipe,(double)mixlenScale,supgStrongMolecular,supgStats)); else PetscCall(assembleSupgCustom(D,DynPlan,customMom,(double)supgTauScale,(double)supgMagic,"implicit",mixingLength,P.pipe,(double)mixlenScale,supgStrongMolecular,supgStats)); }
+    if(momentumBudget) {
+      PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[2],budgetFinal));
+      PetscCall(customPressureBtApply(customPressureB,2,pressureState,budgetPressureBtZ));
+      const Mesh* budgetRootGeometry=(rank==0)?(distributedMesh?&MrootGlobal:&M):nullptr;
+      PetscCall(printAxialMomentumBudget(M,budgetRootGeometry,D,P,rank,customMom,U,budgetMolecular,budgetAfterMix,budgetAfterWall,budgetAfterConvection,budgetFinal,budgetPressureBtZ,
+        mixingLength,weakWallFunction,centralConvection,useSupg));
+    }
+    PetscReal momRelMax=0;
+    for(int d=0;d<3;++d) {
+      PetscCall(customMomentumMatVec(customMom,customMom.aRel,U[(std::size_t)d],customMom.workY));
+      PetscCall(customPressureBtApply(customPressureB,d,pressureState,customPressureB.velocityWork));
+      double lr2=0.0,lb2=0.0;
+      for(std::size_t i=0;i<customMom.workY.size();++i){
+        if(weakWallFunction && d<2 && customMom.wallOwned[i]) continue;
+        const double mixRhs=mixingLength?customMom.mixlenRhs[(std::size_t)d][i]:0.0;
+        const double wallRhs=weakWallFunction?customMom.wallRhs[(std::size_t)d][i]:0.0;
+        const double inletRhs=dgNumericalTraceInlet(P)?customMom.inletRhs[(std::size_t)d][i]:0.0;
+        const double physRhs=D.rhsOwnedFP64[(std::size_t)d][i]+(centralConvection?customMom.convRhs[(std::size_t)d][i]:0.0)+(useSupg?customMom.supgRhs[(std::size_t)d][i]:0.0)+mixRhs+wallRhs+inletRhs+customPressureB.velocityWork[i];
+        const double rr=customMom.workY[i]-physRhs;lr2+=rr*rr;
+        const double bb=D.rhsOwnedFP64[(std::size_t)d][i]+(centralConvection?customMom.convRhs[(std::size_t)d][i]:0.0)+(useSupg?customMom.supgRhs[(std::size_t)d][i]:0.0)+mixRhs+wallRhs+inletRhs;lb2+=bb*bb;
+      }
+      double gr2=0.0,gb2=0.0;PetscCallMPI(MPI_Allreduce(&lr2,&gr2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));PetscCallMPI(MPI_Allreduce(&lb2,&gb2,1,MPI_DOUBLE,MPI_SUM,PETSC_COMM_WORLD));const double rr=std::sqrt(gr2),bb=std::sqrt(gb2);momRelMax=PetscMax(momRelMax,rr/(bb>0?bb:1.0));
+    }
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_NS_FINAL variant=%s momRelMax=%.12e contRelInitial=%.12e convection=%s Re=%.12g supg=%s tauScale=%.6g supgMagic=%.6g tau=[%.3e,%.3e,%.3e] mixingLength=%s mixlenNuTRatio=[%.3e,%.3e,%.3e] weakWall=%s wallYPlus=[%.3e,%.3e,%.3e] wallUTau=[%.3e,%.3e,%.3e] wallUTau2Mean=%.6e wallFSpalding=%.10f wallSampleMode=%s wallMolecularConsistency=%d wallRootFailures=%llu wallTangentFailures=%llu wallLinearization=%s wallTangentBlend=%.6g wallTangentRatio=[%.3e,%.3e,%.3e] pressureStrongGrad=P0_zero supgTauLinearization=lagged supgForm=%s supgKernel=%s supgQuad=%" PetscInt_FMT "\n",
+      simpleVariant.c_str(),(double)momRelMax,(double)rel,centralConvection?"central":"none",P.re,useSupg?"ON":"OFF",(double)supgTauScale,(double)supgMagic,(double)supgStats.tauMin,(double)supgStats.tauMean,(double)supgStats.tauMax,mixingLength?"ON":"OFF",mixlenStats.nuTRatioMin,mixlenStats.nuTRatioMean,mixlenStats.nuTRatioMax,weakWallFunction?"ON":"OFF",wallStats.yPlusMin,wallStats.yPlusMean,wallStats.yPlusMax,wallStats.uTauMin,wallStats.uTauMean,wallStats.uTauMax,wallStats.uTau2Mean,wallStats.fWallSpalding,wallSampleMode.c_str(),(int)wallMolecularConsistency,wallStats.rootFailures,wallStats.tangentFailures,wallLinearization.c_str(),(double)wallTangentBlend,wallStats.tangentRatioMin,wallStats.tangentRatioMean,wallStats.tangentRatioMax,supgForm.c_str(),supgKernel.c_str(),supgQuadPoints));
+    if(weakWallFunction) {
+      const double LD=P.pipe.D>0.0 ? P.pipe.L/P.pipe.D : 0.0;
+      for(int b=0;b<10;++b) {
+        const double area=wallStats.axialArea[(std::size_t)b];
+        const double ut2Mean=area>0.0 ? wallStats.axialUTau2Integral[(std::size_t)b]/area : 0.0;
+        const double fBin=area>0.0 ? 8.0*(double)wallBetaScale*ut2Mean/(P.pipe.bulkVelocity*P.pipe.bulkVelocity) : 0.0;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_WALLFUNC_AXIAL_BIN bin=%d zFrac=[%.3f,%.3f] zOverD=[%.6f,%.6f] area=%.12e uTau2Mean=%.12e fWallSpalding=%.10f sampleMode=%s molecularConsistency=%d\n",
+          b,0.1*(double)b,0.1*(double)(b+1),0.1*(double)b*LD,0.1*(double)(b+1)*LD,
+          area,ut2Mean,fBin,wallSampleMode.c_str(),(int)wallMolecularConsistency));
+      }
+    }
+
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_WORK outerIts=%" PetscInt_FMT " avgUIts=[%.3f,%.3f,%.3f] avgPCG=%.3f pSolves=%" PetscInt_FMT " operatorUpdateSeconds=%.6f\n",
+      finalIt,finalIt?double(sumU[0])/finalIt:0.0,finalIt?double(sumU[1])/finalIt:0.0,finalIt?double(sumU[2])/finalIt:0.0,
+      pSolves?double(sumP)/pSolves:0.0,pSolves,operatorUpdateSeconds));
+    if(gate9iAutoChebyshev) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_GATE9I_SUMMARY pressureSolves=%" PetscInt_FMT " totalChebSteps=%" PetscInt_FMT " avgChebSteps=%.6f spectrumEstimates=%" PetscInt_FMT " totalPowerIts=%" PetscInt_FMT " finalLambdaHat=%.12e finalLambdaMin=%.12e finalLambdaMax=%.12e powerSeconds=%.6f chebSeconds=%.6f rtol=%.3e atol=%.3e pcRefresh=%" PetscInt_FMT " spectrumRefresh=%" PetscInt_FMT " fixedSteps=%" PetscInt_FMT " requireTarget=%d\n",
+      gate9iPressureSolves,gate9iTotalChebSteps,gate9iPressureSolves?double(gate9iTotalChebSteps)/gate9iPressureSolves:0.0,
+      gate9iEstimateCount,gate9iTotalPowerIts,gate9iLambdaHat,gate9iLambdaMinActive,gate9iLambdaMaxActive,
+      gate9iPowerSeconds,gate9iChebSeconds,(double)gate9iRtol,(double)gate9iAtol,pPreconditionerRefresh,gate9iSpectrumRefresh,gate9iFixedSteps,(int)gate9iRequireTarget));
+    const double simpleWall=(double)(tSolve1-tSolve0);
+    const double measuredCore=operatorUpdateSeconds+momentumSolveSeconds+pressureSolveSeconds;
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_TIMING_DETAIL convectionUpdateSeconds=%.6f supgUpdateSeconds=%.6f derivedUpdateSeconds=%.6f customMomentumFieldExchangeResetSeconds=%.6f diffusionRebuildSeconds=%.6f schurUpdateSeconds=%.6f kspOperatorSeconds=%.6f operatorUpdateSeconds=%.6f momentumSolveSeconds=%.6f pressureSolveSeconds=%.6f pressurePcRefreshSeconds=%.6f pressurePcRefreshes=%" PetscInt_FMT " pressurePcReuses=%" PetscInt_FMT " simpleOtherSeconds=%.6f staticPhysicalOperator=%d supgForm=%s supgKernel=%s supgQuad=%" PetscInt_FMT "\n",
+      convectionUpdateSeconds,supgUpdateSeconds,derivedUpdateSeconds,customMomentumLoadSeconds,diffusionRebuildSeconds,schurUpdateSeconds,kspOperatorSeconds,operatorUpdateSeconds,
+      momentumSolveSeconds,pressureSolveSeconds,pressurePcRefreshSeconds,pressurePcRefreshes,pressurePcReuses,PetscMax(0.0,simpleWall-measuredCore),staticPhysicalOperator?1:0,
+      supgForm.c_str(),supgKernel.c_str(),supgQuadPoints));
+    if(m10PcgProfile) {
+      const PetscInt mixedDof=reportCells+3*D.ns;
+      PetscCall(m10PrintPressurePCGProfile("all",m10PcgTotal,mixedDof));
+      PetscCall(m10PrintPressurePCGProfile("warm_excluding_first_solve",m10PcgWarm,mixedDof));
+    }
+    if(resourceProfile) PetscCall(printResourceMark("before_root_gather",reportCells,0.0,tTotal0));
+
+    std::array<std::vector<double>,3> Ug; PetscCall(customGatherOwnedVelocityToZero(U,D.velCount,Ug));
+    std::vector<double> pGlobal; PetscCall(customGatherOwnedPressureToZero(pressureState,D.cellCount,pGlobal));
+    if(rank==0) {
+      const Mesh& Mpost=distributedMesh?MrootGlobal:M;
+      const Discrete& Dpost=distributedMesh?DrootGlobal:D;
+      if(P.mode==ProblemMode::Pipe && P.inletBC==InletBCMode::PipeParabolic) PetscCall(computePipeDiagnosticsRoot(Mpost,Dpost,P,Ug,pGlobal));
+      else if(P.mode==ProblemMode::MMS) PetscCall(computeErrorsRoot(Mpost,Dpost,Ug,pGlobal));
+      else PetscCall(computeFlowDiagnosticsRoot(Mpost,Dpost,P,Ug,pGlobal));
+      if(writeVtu) PetscCall(writeVtuRoot(vtuOutput,Mpost,Dpost,Ug,pGlobal,converged,finalIt,vtuVelocityMode));
+    }
+    if(resourceProfile) PetscCall(printResourceMark("after_postprocess",reportCells,0.0,tTotal0));
+
+    PetscLogDouble tTotal1;
+    PetscCall(PetscTime(&tTotal1));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_TIMING ranks=%d assemblySeconds=%.6f operatorUpdateSeconds=%.6f simpleSolveSeconds=%.6f totalSeconds=%.6f\n",
+      size,(double)(tAsm1-tAsm0),operatorUpdateSeconds,(double)(tSolve1-tSolve0),(double)(tTotal1-tTotal0)));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+      "P1BF3_RESULT status=%s variant=%s ranks=%d outerIts=%" PetscInt_FMT " finalRelCont=%.12e finalUInitRel=[%.12e,%.12e,%.12e] finalMomRel=%.12e gate=%.3e gateMode=all_initial_residuals_Ux_Uy_Uz_plus_continuity maxOuter=%" PetscInt_FMT " Re=%.12g convection=%s supg=%s tauScale=%.6g supgForm=%s supgKernel=%s supgQuad=%" PetscInt_FMT " wallLinearization=%s wallTangentBlend=%.6g solveFailed=%d pressureFailureReason=%" PetscInt_FMT "\n",
+      converged?"PASS":"FAIL",simpleVariant.c_str(),size,finalIt,(double)finalPInitRel,(double)finalUInitRel[0],(double)finalUInitRel[1],(double)finalUInitRel[2],(double)momRelMax,(double)simpleTol,maxOuter,P.re,centralConvection?"central":"none",useSupg?"ON":"OFF",(double)supgTauScale,supgForm.c_str(),supgKernel.c_str(),supgQuadPoints,wallLinearization.c_str(),(double)wallTangentBlend,(int)solveFailed,pressureFailureReason));
+
+    PetscBool gate3Pass=PETSC_TRUE;
+    PetscInt gate3Setups=0,gate3Applies=0;
+    PetscReal gate3MaxRel=0.0,gate3VolumeMin=0.0,gate3VolumeMax=0.0;
+    if(gate3MpProbe) {
+      gate3Setups=gate3MpCtx ? gate3MpCtx->setupCount : 0;
+      gate3Applies=gate3MpCtx ? gate3MpCtx->applyCount : 0;
+      gate3MaxRel=gate3MpCtx ? gate3MpCtx->maxAlgebraRel : PETSC_MAX_REAL;
+      gate3VolumeMin=gate3MpCtx ? gate3MpCtx->volumeMin : 0.0;
+      gate3VolumeMax=gate3MpCtx ? gate3MpCtx->volumeMax : 0.0;
+      gate3Pass=(gate3Setups>=1 && gate3Applies>=1 && gate3MaxRel<=gate3MpAlgebraTol && gate3VolumeMin>0.0 && gate3VolumeMax>=gate3VolumeMin) ? PETSC_TRUE : PETSC_FALSE;
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+        "P1BF3_GATE3_RESULT=%s setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " maxAlgebraRel=%.3e algebraTol=%.3e volumeMin=%.12e volumeMax=%.12e shellAttachment=shadow_only livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt mass=P0_exact_cell_volume_diagonal Kp=NONE Fp=NONE\n",
+        gate3Pass?"PASS":"FAIL",gate3Setups,gate3Applies,(double)gate3MaxRel,(double)gate3MpAlgebraTol,(double)gate3VolumeMin,(double)gate3VolumeMax));
+    }
+    PetscBool gate4Pass=PETSC_TRUE;
+    PetscBool gate6Pass=PETSC_TRUE;
+    PetscBool gate7Pass=PETSC_TRUE;
+    PetscBool gate8Pass=PETSC_TRUE;
+    if(gate4KpProbe) {
+      const PetscReal negTol=1e-10*PetscMax(gate4Kp.coeffMax,(PetscReal)1.0);
+      gate4Pass=(gate4Kp.built && gate4Kp.symmetric && gate4Kp.nnz==gate4Kp.expectedNnz && gate4Kp.internalFaces==reportInternalFaces && gate4Kp.outletFaces>0 && gate4Kp.inletFaces>0 && gate4Kp.wallFaces>0 && gate4Kp.coeffMin>0.0 && gate4Kp.diagMin>0.0 && gate4Kp.constantActionNorm>0.0 && gate4Kp.constantActionMin>=-negTol && gate4Kp.testEnergy>0.0) ? PETSC_TRUE : PETSC_FALSE;
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE4_RESULT=%s built=%d symmetric=%d nnz=%" PetscInt_FMT " expectedNnz=%" PetscInt_FMT " internalFaces=%" PetscInt_FMT " expectedInternalFaces=%" PetscInt_FMT " inletFaces=%" PetscInt_FMT " wallFaces=%" PetscInt_FMT " outletFaces=%" PetscInt_FMT " coeffMin=%.12e diagMin=%.12e constantActionNorm=%.12e constantActionMin=%.12e negativeRowSumTol=%.12e testEnergy=%.12e KpBC=inlet_Neumann_wall_Neumann_outlet_p0 pressureNullspace=OFF attachment=shadow_setup_only livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt Fp=%s GAMG_on_Kp=%s\n",gate4Pass?"PASS":"FAIL",(int)gate4Kp.built,(int)gate4Kp.symmetric,gate4Kp.nnz,gate4Kp.expectedNnz,gate4Kp.internalFaces,reportInternalFaces,gate4Kp.inletFaces,gate4Kp.wallFaces,gate4Kp.outletFaces,(double)gate4Kp.coeffMin,(double)gate4Kp.diagMin,(double)gate4Kp.constantActionNorm,(double)gate4Kp.constantActionMin,(double)negTol,(double)gate4Kp.testEnergy,gate9LivePcd?(gate9dGamgOnly?"BYPASSED_GATE9D_GAMG_ONLY":"BYPASSED_GATE9C_DIRECT_KP_GAMG"):(gate8EswBcProbe?"nuKp_plus_internal_Cp_plus_ESW_BC_GATE8":(gate7CpProbe?"nuKp_plus_internal_Cp_GATE7":(gate6DiffusionPcdProbe?"nu_times_Kp_GATE6":"NONE"))),gate9LivePcd?(gate9dGamgOnly?"LIVE_GATE9D_GAMG_ONLY_STATIONARY":"LIVE_GATE9C_ONE_GAMG_PCApply"):(gate5KpGamgProbe?"STANDALONE_GATE5_ONLY":(gate6DiffusionPcdProbe?"GATE6_KP_INVERSE_SHADOW_ONLY":"NOT_YET"))));
+      if(gate5KpGamgProbe) {
+        const PetscBool g5pass=(gate5KpGamg.ran && gate5KpGamg.cgPass && gate5KpGamg.cyclesFinite) ? PETSC_TRUE : PETSC_FALSE;
+        const char* cycleTrend=(gate5KpGamg.cycleRel[3] < 1.0) ? "CONTRACTED_AFTER_4" : "NOT_CONTRACTED_AFTER_4";
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE5_RESULT=%s cgIts=%" PetscInt_FMT " cgReason=%d trueRel=%.12e solutionRel=%.12e cgTrueRelTol=1.000e-08 cgSolutionRelTol=1.000e-07 gamgOnlyCycle1=%.12e gamgOnlyCycle2=%.12e gamgOnlyCycle3=%.12e gamgOnlyCycle4=%.12e gamgOnlyTrend=%s gamgOnlyIsDiagnostic=1 livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt Fp=NONE fullPCD=NOT_YET\n",
+          g5pass?"PASS":"FAIL",gate5KpGamg.cgIts,(int)gate5KpGamg.reason,(double)gate5KpGamg.trueRel,(double)gate5KpGamg.solutionRel,(double)gate5KpGamg.cycleRel[0],(double)gate5KpGamg.cycleRel[1],(double)gate5KpGamg.cycleRel[2],(double)gate5KpGamg.cycleRel[3],cycleTrend));
+      }
+      if(gate7CpProbe) {
+        gate7Pass=(gate7Cp.setupCount==1 && gate7Cp.updateCount>=1 && gate7Cp.probeCount>=1 && gate7Cp.internalFaces==reportInternalFaces && gate7Cp.allFinite && gate7Cp.maxFluxAbs>1.0e-14 && gate7Cp.maxNonzeroFluxFaces>0 && gate7Cp.sawNonsymmetric) ? PETSC_TRUE : PETSC_FALSE;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,"P1BF3_GATE7_RESULT=%s setupCount=%" PetscInt_FMT " updateCount=%" PetscInt_FMT " probeCount=%" PetscInt_FMT " internalFaces=%" PetscInt_FMT " expectedInternalFaces=%" PetscInt_FMT " maxNonzeroFluxFaces=%" PetscInt_FMT " maxFluxAbs=%.12e maxCpMassNorm=%.12e maxConvToDiff=%.12e sawNonsymmetric=%d allFinite=%d sourceVelocity=current_Picard_P1plusBF3 exactFaceMean=1 centralPressureInterpolation=1 boundaryConvection=internal_only_component robin=%s attachment=shadow_only livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt fullPCD=NOT_LIVE_YET\n",gate7Pass?"PASS":"FAIL",gate7Cp.setupCount,gate7Cp.updateCount,gate7Cp.probeCount,gate7Cp.internalFaces,reportInternalFaces,gate7Cp.maxNonzeroFluxFaces,(double)gate7Cp.maxFluxAbs,(double)gate7Cp.maxCpMassNorm,(double)gate7Cp.maxConvToDiff,(int)gate7Cp.sawNonsymmetric,(int)gate7Cp.allFinite,gate8EswBcProbe?"HANDLED_SEPARATELY_GATE8":"NOT_YET_GATE8"));
+      }
+      if(gate8EswBcProbe) {
+        gate8Pass=(gate8EswBc.setupCount==1 && gate8EswBc.updateCount>=1 && gate8EswBc.probeCount>=1 && gate8EswBc.inletFaces==gate4Kp.inletFaces && gate8EswBc.wallFaces==gate4Kp.wallFaces && gate8EswBc.outletFaces==gate4Kp.outletFaces && gate8EswBc.inletFluxSignOkay && gate8EswBc.allFinite && gate8EswBc.maxCancelRel<=gate8CancelTol && gate8EswBc.maxFullVsInteriorRel<=gate8CancelTol && gate8EswBc.maxWallFluxAbs<=gate8WallFluxTol) ? PETSC_TRUE : PETSC_FALSE;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE8_RESULT=%s setupCount=%" PetscInt_FMT " updateCount=%" PetscInt_FMT " probeCount=%" PetscInt_FMT " inletFaces=%" PetscInt_FMT " wallFaces=%" PetscInt_FMT " outletFaces=%" PetscInt_FMT " inletFluxSignOkay=%d maxInletCancellationRel=%.12e cancelTol=%.12e maxFullVsGate7InteriorRel=%.12e maxWallFluxAbs=%.12e wallFluxTol=%.12e allFinite=%d inletRobinFormula=-nu_dpdn_plus_wdotn_p_eq_0 inletRobinActive=1 conservativeBoundaryConvectionAndRobinCancel=1 wallBC=homogeneous_Neumann_wdotn0 outletBC=p0_Dirichlet pressureNullspace=OFF attachment=shadow_only KpInverse=NOT_APPLIED_GATE8 livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt fullPCD=READY_FOR_GATE9_NOT_LIVE_YET\n",
+          gate8Pass?"PASS":"FAIL",gate8EswBc.setupCount,gate8EswBc.updateCount,gate8EswBc.probeCount,gate8EswBc.inletFaces,gate8EswBc.wallFaces,gate8EswBc.outletFaces,(int)gate8EswBc.inletFluxSignOkay,(double)gate8EswBc.maxCancelRel,(double)gate8CancelTol,(double)gate8EswBc.maxFullVsInteriorRel,(double)gate8EswBc.maxWallFluxAbs,(double)gate8WallFluxTol,(int)gate8EswBc.allFinite));
+      }
+      if(gate6DiffusionPcdProbe) {
+        gate6Pass=(gate6DiffusionPcdCtx && gate6DiffusionPcdCtx->setupCount>=1 && gate6DiffusionPcdCtx->applyCount>=1 && gate6DiffusionPcdCtx->allKpConverged && gate6DiffusionPcdCtx->maxChainRel<=gate6ChainTol && gate6DiffusionPcdCtx->maxKpTrueRel<=gate6KpTrueResidualTol) ? PETSC_TRUE : PETSC_FALSE;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE6_RESULT=%s setupCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " totalKpIts=%" PetscInt_FMT " maxChainRel=%.3e chainTol=%.3e maxKpTrueRel=%.3e kpTrueResidualTol=%.3e allKpConverged=%d chain=Kp_inverse_times_nuKp_times_Mp_inverse expected=nu_times_Mp_inverse attachment=shadow_only livePressurePC=UNCHANGED_GAMG exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt Fp=nu_times_Kp fullPCD=NOT_YET\n",
+          gate6Pass?"PASS":"FAIL",gate6DiffusionPcdCtx->setupCount,gate6DiffusionPcdCtx->applyCount,gate6DiffusionPcdCtx->totalKpIts,
+          (double)gate6DiffusionPcdCtx->maxChainRel,(double)gate6ChainTol,(double)gate6DiffusionPcdCtx->maxKpTrueRel,(double)gate6KpTrueResidualTol,(int)gate6DiffusionPcdCtx->allKpConverged));
+      }
+      if(gate9LivePcd) {
+        const PetscBool gate9Pass=(gate9LivePcdCtx && gate9LivePcdCtx->setupCount>=1 && gate9LivePcdCtx->applyCount>=1 && gate9LivePcdCtx->outerSolveCount>=1 && gate9LivePcdCtx->allFinite && gate9LivePcdCtx->maxOuterTrueRel<=gate9OuterTrueResidualTol) ? PETSC_TRUE : PETSC_FALSE;
+        if(gate9dGamgOnly) PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9D_RESULT=%s setupCount=%" PetscInt_FMT " pressureSolveCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " maxOneCycleKpRel=%.3e finalTrueRel=%.3e trueResidualTol=%.3e totalGamgApplySeconds=%.6e allFinite=%d pressureAlgorithm=stationary_exactSchur_residual_correction outerKrylov=NONE KSPSolve=NEVER_CALLED omega=%.6e Kp=Gate4_geometric_FV_laplacian exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt\n",
+          gate9Pass?"PASS":"FAIL",gate9LivePcdCtx?gate9LivePcdCtx->setupCount:0,gate9LivePcdCtx?gate9LivePcdCtx->outerSolveCount:0,gate9LivePcdCtx?gate9LivePcdCtx->applyCount:0,gate9LivePcdCtx?(double)gate9LivePcdCtx->maxKpCycleRel:PETSC_MAX_REAL,gate9LivePcdCtx?(double)gate9LivePcdCtx->lastOuterTrueRel:PETSC_MAX_REAL,(double)gate9OuterTrueResidualTol,gate9LivePcdCtx?(double)gate9LivePcdCtx->totalApplySeconds:0.0,gate9LivePcdCtx?(int)gate9LivePcdCtx->allFinite:0,(double)gate9dOmega));
+        else PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+          "P1BF3_GATE9C_RESULT=%s setupCount=%" PetscInt_FMT " outerSolveCount=%" PetscInt_FMT " applyCount=%" PetscInt_FMT " maxOneCycleKpRel=%.3e maxOuterTrueRel=%.3e outerTrueResidualTol=%.3e totalGamgApplySeconds=%.6e allFinite=%d liveOuter=FGMRES livePC=ONE_direct_GAMG_PCApply_geometric_Kp innerKrylov=NONE Fp=BYPASSED Mp=BYPASSED Kp=Gate4_geometric_FV_laplacian exactOperator=UNCHANGED_custom_FP64_B_rAU_Bt statusMeaning=M23_STYLE_GEOMETRIC_KP_GAMG\n",
+          gate9Pass?"PASS":"FAIL",gate9LivePcdCtx?gate9LivePcdCtx->setupCount:0,gate9LivePcdCtx?gate9LivePcdCtx->outerSolveCount:0,gate9LivePcdCtx?gate9LivePcdCtx->applyCount:0,gate9LivePcdCtx?(double)gate9LivePcdCtx->maxKpCycleRel:PETSC_MAX_REAL,gate9LivePcdCtx?(double)gate9LivePcdCtx->maxOuterTrueRel:PETSC_MAX_REAL,(double)gate9OuterTrueResidualTol,gate9LivePcdCtx?(double)gate9LivePcdCtx->totalApplySeconds:0.0,gate9LivePcdCtx?(int)gate9LivePcdCtx->allFinite:0));
+        if(!gate9Pass && !gate9dGamgOnly) SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-9C direct Kp-GAMG outer FGMRES did not converge");
+        // Destroy outer KSP now so its PCShell releases the Gate-9 context while
+        // Kp/Cp/Gate-8 vectors are still alive.
+        PetscCall(KSPDestroy(&pksp)); ppc=nullptr; gate9LivePcdCtx=nullptr;
+      }
+      PetscCall(PCDestroy(&gate6DiffusionPcdShell));
+      gate6DiffusionPcdCtx=nullptr;
+      if(gate8EswBcProbe) PetscCall(gate8EswBcDestroy(gate8EswBc));
+      if(gate7CpProbe) PetscCall(gate7CpDestroy(gate7Cp));
+      PetscCall(gate4DestroyKp(gate4Kp));
+      if(gate9eNgfv) PetscCall(MatDestroy(&gate9eAudit.raw));
+    }
+    PetscCall(PCDestroy(&gate3MpShell));
+    gate3MpCtx=nullptr;
+    PetscCall(VecDestroy(&pcIn));
+    PetscCall(VecDestroy(&pcOut));
+    PetscCall(KSPDestroy(&pksp));
+    if(gate3MpProbe && !gate3Pass)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-3 P0 pressure-mass inverse algebra check failed");
+    if(gate4KpProbe && !gate4Pass)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-4 geometric pressure Laplacian audit failed");
+    if(gate5KpGamgProbe && !(gate5KpGamg.ran && gate5KpGamg.cgPass && gate5KpGamg.cyclesFinite))
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-5 standalone Kp CG+GAMG solve failed");
+    if(gate6DiffusionPcdProbe && !gate6Pass)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-6 diffusion-only PCD algebra check failed");
+    if(gate7CpProbe && !gate7Pass)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-7 internal pressure convection audit failed");
+    if(gate8EswBcProbe && !gate8Pass)
+      SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_PLIB,"Gate-8 ESW pressure boundary-condition audit failed");
+    PetscCall(MatNullSpaceDestroy(&nsp));
+    PetscCall(MatDestroy(&factoredSchur));
+    PetscCall(destroyPressureAssemblyPlan(PSchur));
+    PetscCall(MatDestroy(&C));
+    PetscCall(MatDestroy(&Sg));
+    PetscCall(destroyDiscrete(D));
+  } catch(const std::exception& e) {
+    SETERRQ(PETSC_COMM_WORLD,PETSC_ERR_USER,"%s",e.what());
+  }
+  PetscCall(PetscFinalize());
+  return 0;
+}

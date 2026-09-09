@@ -1,0 +1,51 @@
+{
+  "oracle_sha256": "2d458a83e4fa4182696842edb24a0274161090e210afa33477678108753ed934",
+  "amg_include_marker": "#include \"custom_pressure_amg_DG.inc\"",
+  "main_marker": "int main(int argc,char **argv) {",
+  "modules": [
+    "src/00_core/preamble_mesh.inc",
+    "src/10_problem/problem_config.inc",
+    "src/20_discretization/discrete_boundary_fem.inc",
+    "src/30_momentum/custom_momentum_core.inc",
+    "src/40_pressure/effective_pressure.inc",
+    "src/50_runtime/dynamic_runtime_plan.inc",
+    "src/55_turbulence/mixing_length_spalding.inc",
+    "src/60_momentum_dynamic/dynamic_operators.inc",
+    "src/70_pressure_assembly/pressure_assembly.inc",
+    "src/80_app/main_solver.inc"
+  ],
+  "markers": {
+    "problem": {
+      "offset": 23461,
+      "text": "struct ProblemConfig {"
+    },
+    "discrete": {
+      "offset": 35238,
+      "text": "struct Discrete {"
+    },
+    "momentum_core": {
+      "offset": 45768,
+      "text": "struct CustomMomentumCSR {"
+    },
+    "pressure_effective": {
+      "offset": 59163,
+      "text": "struct CustomPeerHalo {"
+    },
+    "runtime": {
+      "offset": 178093,
+      "text": "struct CustomDynamicCellPlan {"
+    },
+    "turbulence": {
+      "offset": 186318,
+      "text": "struct MixingLengthMaxAudit {"
+    },
+    "momentum_dynamic": {
+      "offset": 225895,
+      "text": "static PetscErrorCode assembleCentralConvectionCustom(const Discrete& D,const CustomDynamicRuntimePlan& P,CustomMomentumCSR& A) {"
+    },
+    "pressure_assembly": {
+      "offset": 252231,
+      "text": "struct PressureAssemblyPlan {"
+    }
+  }
+}
