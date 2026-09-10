@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace nodals_gpu {
 
@@ -74,6 +78,192 @@ inline const CentralTensorG4& central_tensor_g4(){static const CentralTensorG4 T
     for(int a=0;a<8;++a)for(int m=0;m<8;++m)for(int b=0;b<8;++b)for(int j=0;j<3;++j)o.t[a][m][b][j]+=val[a]*val[m]*gr[b][j]*q.w;
   }return o;}();return T;}
 
+
+// -----------------------------------------------------------------------------
+// P5B: parallel G4CellPlanHost construction with exact current-main cp.h2.
+// -----------------------------------------------------------------------------
+
+inline int p5b_cell_threads(){
+  int n=0;
+  if(const char*e=std::getenv("NODALS_G4_CELL_THREADS"))n=std::atoi(e);
+  if(n<=0){
+    unsigned h=std::thread::hardware_concurrency();
+    n=h?std::min((int)h,16):1;
+  }
+  return std::max(1,std::min(n,64));
+}
+
+inline void p5b_build_one_cell_plan(
+    const SerialTetMesh&M,const G4SetupHost&S,std::size_t c,G4CellPlanHost&cp)
+{
+  const int nv=(int)M.points.size();
+  std::fill(std::begin(cp.rowSlot),std::end(cp.rowSlot),(std::uint8_t)255);
+
+  int ent[8];
+  for(int i=0;i<4;++i)ent[i]=M.tets[c][i];
+  for(int i=0;i<4;++i)ent[4+i]=nv+M.opp_face[c][i];
+
+  for(int a=0;a<8;++a){
+    int g=S.momMask.g2free[(std::size_t)ent[a]];
+    cp.ref[a]=(g>=0)?g:-(S.fixedSlot[(std::size_t)ent[a]]+1);
+  }
+
+  auto t=M.tets[c];
+  const Vec3d X[4]={
+    M.points[(std::size_t)t[0]],M.points[(std::size_t)t[1]],
+    M.points[(std::size_t)t[2]],M.points[(std::size_t)t[3]]
+  };
+
+  double J[3][3]={
+    {X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},
+    {X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},
+    {X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}
+  },I[3][3];
+
+  cp.det=det3(J);
+  if(!(cp.det>0.0))throw std::runtime_error("P5B G4 non-positive tet");
+
+  cp.h2=0.0;
+  for(int aa=0;aa<4;++aa)
+    for(int bb=aa+1;bb<4;++bb){
+      const double dx=X[aa].x-X[bb].x;
+      const double dy=X[aa].y-X[bb].y;
+      const double dz=X[aa].z-X[bb].z;
+      cp.h2=std::max(cp.h2,dx*dx+dy*dy+dz*dz);
+    }
+  if(!(cp.h2>0.0))throw std::runtime_error("P5B G4 zero tet diameter");
+
+  inv3(J,I);
+  for(int j=0;j<3;++j)
+    for(int d=0;d<3;++d)
+      cp.invJ[3*j+d]=I[j][d];
+
+  for(int a=0;a<8;++a)if(cp.ref[a]>=0){
+    int r=cp.ref[a];
+    for(int b=0;b<8;++b)if(cp.ref[b]>=0){
+      auto first=S.topo.col.begin()+S.topo.row[(std::size_t)r];
+      auto last=S.topo.col.begin()+S.topo.row[(std::size_t)r+1];
+      auto it=std::lower_bound(first,last,cp.ref[b]);
+      if(it==last||*it!=cp.ref[b])throw std::runtime_error("P5B G4 row slot missing");
+      auto slot=(std::int64_t)(it-first);
+      if(slot>=255)throw std::runtime_error("P5B G4 row slot overflow");
+      cp.rowSlot[8*a+b]=(std::uint8_t)slot;
+    }
+  }
+}
+
+inline std::vector<G4CellPlanHost> p5b_build_cell_plans_reference(
+    const SerialTetMesh&M,const G4SetupHost&S)
+{
+  const auto t0=std::chrono::steady_clock::now();
+  std::vector<G4CellPlanHost>C(M.tets.size());
+  for(std::size_t c=0;c<M.tets.size();++c)
+    p5b_build_one_cell_plan(M,S,c,C[c]);
+  const auto t1=std::chrono::steady_clock::now();
+  std::printf(
+    "NODALS_GPU_P5B_CELLPLAN_REFERENCE_DONE status=PASS cells=%zu seconds=%.6f rssMiB=%.3f hwmMiB=%.3f\n",
+    C.size(),std::chrono::duration<double>(t1-t0).count(),
+    g4a_status_mib("VmRSS"),g4a_status_mib("VmHWM"));
+  return C;
+}
+
+inline std::vector<G4CellPlanHost> p5b_build_cell_plans_parallel(
+    const SerialTetMesh&M,const G4SetupHost&S)
+{
+  const auto t0=std::chrono::steady_clock::now();
+  const int nth=p5b_cell_threads();
+  std::vector<G4CellPlanHost>C(M.tets.size());
+
+  g4a_parallel_chunks((int)M.tets.size(),nth,256,[&](int,int cb,int ce){
+    for(int c=cb;c<ce;++c)
+      p5b_build_one_cell_plan(M,S,(std::size_t)c,C[(std::size_t)c]);
+  });
+
+  const auto t1=std::chrono::steady_clock::now();
+  std::printf(
+    "NODALS_GPU_P5B_CELLPLAN_NEW status=PASS cells=%zu threads=%d seconds=%.6f bytes=%zu scratchExtraMiB=0.000 rssMiB=%.3f hwmMiB=%.3f\n",
+    C.size(),nth,std::chrono::duration<double>(t1-t0).count(),
+    C.size()*sizeof(G4CellPlanHost),
+    g4a_status_mib("VmRSS"),g4a_status_mib("VmHWM"));
+  return C;
+}
+
+inline void p5b_validate_cell_plans(
+    const std::vector<G4CellPlanHost>&R,
+    const std::vector<G4CellPlanHost>&N,
+    double refSeconds,double newSeconds)
+{
+  const bool sizeExact=R.size()==N.size();
+  bool refExact=sizeExact,rowExact=sizeExact,detExact=sizeExact,h2Exact=sizeExact,invExact=sizeExact;
+  double detMaxAbs=0.0,h2MaxAbs=0.0,invMaxAbs=0.0;
+  std::size_t firstBad=std::numeric_limits<std::size_t>::max();
+
+  if(sizeExact){
+    for(std::size_t c=0;c<R.size();++c){
+      for(int a=0;a<8;++a)if(R[c].ref[a]!=N[c].ref[a]){
+        refExact=false;
+        if(firstBad==std::numeric_limits<std::size_t>::max())firstBad=c;
+      }
+      for(int k=0;k<64;++k)if(R[c].rowSlot[k]!=N[c].rowSlot[k]){
+        rowExact=false;
+        if(firstBad==std::numeric_limits<std::size_t>::max())firstBad=c;
+      }
+      if(R[c].det!=N[c].det){
+        detExact=false; detMaxAbs=std::max(detMaxAbs,std::abs(R[c].det-N[c].det));
+        if(firstBad==std::numeric_limits<std::size_t>::max())firstBad=c;
+      }
+      if(R[c].h2!=N[c].h2){
+        h2Exact=false; h2MaxAbs=std::max(h2MaxAbs,std::abs(R[c].h2-N[c].h2));
+        if(firstBad==std::numeric_limits<std::size_t>::max())firstBad=c;
+      }
+      for(int k=0;k<9;++k)if(R[c].invJ[k]!=N[c].invJ[k]){
+        invExact=false; invMaxAbs=std::max(invMaxAbs,std::abs(R[c].invJ[k]-N[c].invJ[k]));
+        if(firstBad==std::numeric_limits<std::size_t>::max())firstBad=c;
+      }
+    }
+  }
+
+  const bool pass=sizeExact&&refExact&&rowExact&&detExact&&h2Exact&&invExact;
+  std::printf(
+    "NODALS_GPU_P5B_CELLPLAN_PARITY status=%s sizeExact=%d refExact=%d rowSlotExact=%d "
+    "detBitwiseExact=%d h2BitwiseExact=%d invJBitwiseExact=%d cellsRef=%zu cellsNew=%zu "
+    "detMaxAbs=%.12e h2MaxAbs=%.12e invJMaxAbs=%.12e firstBadCell=%lld "
+    "refSeconds=%.6f newSeconds=%.6f speedup=%.6f compareHoldsTwoCellPlans=1 productionPeakMustUseModeParallel=1\n",
+    pass?"PASS":"FAIL",(int)sizeExact,(int)refExact,(int)rowExact,
+    (int)detExact,(int)h2Exact,(int)invExact,R.size(),N.size(),
+    detMaxAbs,h2MaxAbs,invMaxAbs,
+    firstBad==std::numeric_limits<std::size_t>::max()?-1LL:(long long)firstBad,
+    refSeconds,newSeconds,refSeconds/std::max(newSeconds,1e-300));
+
+  if(!pass)throw std::runtime_error("P5B cell-plan parity failed");
+}
+
+inline std::vector<G4CellPlanHost> p5b_build_cell_plans_dispatch(
+    const SerialTetMesh&M,const G4SetupHost&S)
+{
+  const char*e=std::getenv("NODALS_G4_CELL_MODE");
+  const char*mode=(e&&*e)?e:"parallel";
+
+  if(std::strcmp(mode,"reference")==0)
+    return p5b_build_cell_plans_reference(M,S);
+  if(std::strcmp(mode,"parallel")==0)
+    return p5b_build_cell_plans_parallel(M,S);
+  if(std::strcmp(mode,"compare")==0){
+    const auto r0=std::chrono::steady_clock::now();
+    auto R=p5b_build_cell_plans_reference(M,S);
+    const auto r1=std::chrono::steady_clock::now();
+    const auto n0=std::chrono::steady_clock::now();
+    auto N=p5b_build_cell_plans_parallel(M,S);
+    const auto n1=std::chrono::steady_clock::now();
+    p5b_validate_cell_plans(
+      R,N,
+      std::chrono::duration<double>(r1-r0).count(),
+      std::chrono::duration<double>(n1-n0).count());
+    return N;
+  }
+  throw std::runtime_error("NODALS_G4_CELL_MODE must be reference, compare, or parallel");
+}
+
 inline G4SetupHost build_g4_setup(const SerialTetMesh&M,double re=20,double bulk=1.0,const std::string&wall="patch_0_0",const std::string&inlet="patch_2_0",const std::string&outlet="patch_1_0"){
   G4SetupHost S;S.pipe=make_pipe_g4(M,re,bulk,wall,inlet,outlet);S.momMask=build_momentum_setup(M,S.pipe.outlet);
   const int nv=(int)M.points.size(),nf=(int)M.faces.size(),ni=(int)M.neighbour.size();
@@ -84,11 +274,7 @@ inline G4SetupHost build_g4_setup(const SerialTetMesh&M,double re=20,double bulk
   for(int v=0;v<nv;++v)if(onInlet[(std::size_t)v]&&!onWall[(std::size_t)v]){int s=S.fixedSlot[(std::size_t)v];S.fixedValue[(std::size_t)s][2]=S.pipe.profileScale*pipe_ideal_uz_g4(S.pipe,M.points[(std::size_t)v].x,M.points[(std::size_t)v].y);}
   auto pin=M.patches[(std::size_t)S.pipe.inlet];for(int f=pin.start_face;f<pin.start_face+pin.n_faces;++f){const auto&F=M.faces[(std::size_t)f];Vec3d X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};double exact=S.pipe.profileScale*triangle_avg_pipe_uz_g4(S.pipe,X);double vm=0;for(int j=0;j<3;++j){int sl=S.fixedSlot[(std::size_t)F.v[j]];vm+=S.fixedValue[(std::size_t)sl][2]/3.0;}int fs=S.fixedSlot[(std::size_t)nv+f];S.fixedValue[(std::size_t)fs][2]=(20.0/9.0)*(exact-vm);}
   S.topo=build_static_relaxed_momentum_csr(M,S.momMask,S.pipe.nu,1.0);S.coloring=greedy_csr_coloring(S.topo);
-  S.cells.resize(M.tets.size());
-  for(std::size_t c=0;c<M.tets.size();++c){auto&cp=S.cells[c];std::fill(std::begin(cp.rowSlot),std::end(cp.rowSlot),(std::uint8_t)255);int ent[8];for(int i=0;i<4;++i)ent[i]=M.tets[c][i];for(int i=0;i<4;++i)ent[4+i]=nv+M.opp_face[c][i];for(int a=0;a<8;++a){int g=S.momMask.g2free[(std::size_t)ent[a]];cp.ref[a]=(g>=0)?g:-(S.fixedSlot[(std::size_t)ent[a]]+1);}
-    auto t=M.tets[c];const Vec3d X[4]={M.points[(std::size_t)t[0]],M.points[(std::size_t)t[1]],M.points[(std::size_t)t[2]],M.points[(std::size_t)t[3]]};double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},I[3][3];cp.det=det3(J);if(!(cp.det>0))throw std::runtime_error("G4 non-positive tet");cp.h2=0.0;for(int aa=0;aa<4;++aa)for(int bb=aa+1;bb<4;++bb){const double dx=X[aa].x-X[bb].x,dy=X[aa].y-X[bb].y,dz=X[aa].z-X[bb].z;cp.h2=std::max(cp.h2,dx*dx+dy*dy+dz*dz);}if(!(cp.h2>0.0))throw std::runtime_error("G4 zero tet diameter");inv3(J,I);for(int j=0;j<3;++j)for(int d=0;d<3;++d)cp.invJ[3*j+d]=I[j][d];
-    for(int a=0;a<8;++a)if(cp.ref[a]>=0){int r=cp.ref[a];for(int b=0;b<8;++b)if(cp.ref[b]>=0){auto first=S.topo.col.begin()+S.topo.row[(std::size_t)r],last=S.topo.col.begin()+S.topo.row[(std::size_t)r+1];auto it=std::lower_bound(first,last,cp.ref[b]);if(it==last||*it!=cp.ref[b])throw std::runtime_error("G4 row slot missing");auto slot=(std::int64_t)(it-first);if(slot>=255)throw std::runtime_error("G4 row slot overflow");cp.rowSlot[8*a+b]=(std::uint8_t)slot;}}
-  }
+  S.cells=p5b_build_cell_plans_dispatch(M,S);
   for(auto&r:S.staticRhs)r.assign((std::size_t)S.topo.n,0.0);const auto&D=diffusion_tensor_g3();
   for(const auto&cp:S.cells){double I[3][3];for(int j=0;j<3;++j)for(int d=0;d<3;++d)I[j][d]=cp.invJ[3*j+d];double metric[3][3]={{0}};for(int j=0;j<3;++j)for(int k=0;k<3;++k)for(int d=0;d<3;++d)metric[j][k]+=I[j][d]*I[k][d];double K[8][8]={{0}};for(int a=0;a<8;++a)for(int b=0;b<8;++b){double v=0;for(int j=0;j<3;++j)for(int k=0;k<3;++k)v+=D.t[a][b][j][k]*metric[j][k];K[a][b]=S.pipe.nu*cp.det*v;}for(int a=0;a<8;++a)if(cp.ref[a]>=0){int r=cp.ref[a];for(int b=0;b<8;++b)if(cp.ref[b]<0){auto fv=S.fixedValue[(std::size_t)fixed_slot_from_ref_g4(cp.ref[b])];for(int d=0;d<3;++d)S.staticRhs[(std::size_t)d][(std::size_t)r]-=K[a][b]*fv[(std::size_t)d];}}}
   S.pressure=build_pressure_setup(M,S.pipe.outlet);if(S.pressure.g2free!=S.momMask.g2free)throw std::runtime_error("G4 velocity numbering mismatch G2/G3");

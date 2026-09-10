@@ -33,6 +33,22 @@
 
 using namespace nodals_gpu;
 
+#include "h8_hp_diagnostics.inc"
+
+// PM2: production uses previously validated setup policies.
+// Set NODALS_SETUP_AUTOTUNE=1 to execute the legacy benchmark/parity selectors.
+static bool gate6_setup_autotune_enabled()
+{
+  const char*e=std::getenv("NODALS_SETUP_AUTOTUNE");
+  return e && *e &&
+         std::strcmp(e,"0")!=0 &&
+         std::strcmp(e,"false")!=0 &&
+         std::strcmp(e,"FALSE")!=0 &&
+         std::strcmp(e,"off")!=0 &&
+         std::strcmp(e,"OFF")!=0;
+}
+
+
 enum H0Cat {
   H0_FINE_LIVE_TOTAL=0,H0_FINE_LIVE_ZERO,H0_FINE_LIVE_BT,H0_FINE_LIVE_RAU,H0_FINE_LIVE_B,
   H0_FINE_PC_TOTAL,H0_FINE_PC_ZERO,H0_FINE_PC_BT,H0_FINE_PC_RAU,H0_FINE_PC_B,
@@ -86,12 +102,127 @@ static std::vector<G4CellPlanDevice> g5e_cast_cells(const std::vector<G4CellPlan
   return d;
 }
 
+
+// P7D_MCGS_IMPLEMENTATION
+struct G4ColoringHost {
+  int ncolors=0;
+  int maxColorSize=0;
+  std::vector<std::int32_t> rows;
+  std::vector<std::int32_t> off;
+};
+
+struct G4ColoringDevice {
+  int ncolors=0;
+  int maxColorSize=0;
+  DeviceBuffer<std::int32_t> rows;
+  std::vector<std::int32_t> offHost;
+  std::size_t bytes()const{return rows.bytes();}
+};
+
+template<class RowVec,class ColVec>
+static G4ColoringHost g4_build_greedy_coloring(
+    int n,const RowVec&row,const ColVec&col,const char*label)
+{
+  if(n<1 || row.size()!=(std::size_t)n+1)
+    throw std::runtime_error("P7D MCGS coloring invalid CSR dimensions");
+
+  std::size_t maxWidth=0;
+  for(int i=0;i<n;++i){
+    const auto a=(std::int64_t)row[(std::size_t)i];
+    const auto b=(std::int64_t)row[(std::size_t)i+1];
+    if(a<0 || b<a || (std::size_t)b>col.size())
+      throw std::runtime_error("P7D MCGS coloring invalid CSR row");
+    maxWidth=std::max(maxWidth,(std::size_t)(b-a));
+  }
+
+  std::vector<std::int32_t> color((std::size_t)n,-1);
+  std::vector<int> mark(maxWidth+2,-1);
+  int ncolors=0;
+
+  for(int i=0;i<n;++i){
+    const auto a=(std::int64_t)row[(std::size_t)i];
+    const auto b=(std::int64_t)row[(std::size_t)i+1];
+    for(std::int64_t k=a;k<b;++k){
+      const int j=(int)col[(std::size_t)k];
+      if(j<0 || j>=n)throw std::runtime_error("P7D MCGS column out of range");
+      if(j==i)continue;
+      const int cj=color[(std::size_t)j];
+      if(cj>=0){
+        if((std::size_t)cj>=mark.size())mark.resize((std::size_t)cj+2,-1);
+        mark[(std::size_t)cj]=i;
+      }
+    }
+    int c=0;
+    while((std::size_t)c<mark.size() && mark[(std::size_t)c]==i)++c;
+    if((std::size_t)c>=mark.size())mark.resize((std::size_t)c+2,-1);
+    color[(std::size_t)i]=(std::int32_t)c;
+    ncolors=std::max(ncolors,c+1);
+  }
+
+  for(int i=0;i<n;++i){
+    const auto a=(std::int64_t)row[(std::size_t)i];
+    const auto b=(std::int64_t)row[(std::size_t)i+1];
+    for(std::int64_t k=a;k<b;++k){
+      const int j=(int)col[(std::size_t)k];
+      if(j!=i && color[(std::size_t)j]==color[(std::size_t)i]){
+        std::fprintf(stderr,
+          "P7D_MCGS_COLOR_CONFLICT label=%s row=%d col=%d color=%d\n",
+          label?label:"unknown",i,j,(int)color[(std::size_t)i]);
+        throw std::runtime_error("P7D MCGS coloring conflict");
+      }
+    }
+  }
+
+  G4ColoringHost C;
+  C.ncolors=ncolors;
+  C.off.assign((std::size_t)ncolors+1,0);
+  for(int i=0;i<n;++i)++C.off[(std::size_t)color[(std::size_t)i]+1];
+  for(int c=0;c<ncolors;++c)C.off[(std::size_t)c+1]+=C.off[(std::size_t)c];
+  C.rows.resize((std::size_t)n);
+  auto next=C.off;
+  for(int i=0;i<n;++i)
+    C.rows[(std::size_t)next[(std::size_t)color[(std::size_t)i]]++]=(std::int32_t)i;
+  for(int c=0;c<ncolors;++c)
+    C.maxColorSize=std::max(C.maxColorSize,
+      (int)(C.off[(std::size_t)c+1]-C.off[(std::size_t)c]));
+  return C;
+}
+
+static void g4_upload_coloring(G4ColoringDevice&D,const G4ColoringHost&H){
+  D.ncolors=H.ncolors;
+  D.maxColorSize=H.maxColorSize;
+  D.offHost=H.off;
+  D.rows.allocate(H.rows.size());
+  D.rows.upload(H.rows.data(),H.rows.size());
+}
+
+template<class RowT>
+__global__ void g4_mcgs_color_kernel(
+    int begin,int count,const std::int32_t*colorRows,
+    const RowT*row,const std::int32_t*col,const AMGReal*val,
+    const AMGReal*diag,const AMGReal*b,AMGReal*x,double omega)
+{
+  const int q=(int)(blockIdx.x*blockDim.x+threadIdx.x);
+  if(q>=count)return;
+  const int i=(int)colorRows[(std::size_t)begin+(std::size_t)q];
+  AMGReal off=AMGReal(0);
+  const RowT a=row[(std::size_t)i],e=row[(std::size_t)i+1];
+  for(RowT k=a;k<e;++k){
+    const int j=(int)col[(std::size_t)k];
+    if(j!=i)off+=val[(std::size_t)k]*x[(std::size_t)j];
+  }
+  const AMGReal old=x[(std::size_t)i];
+  const AMGReal gs=(b[(std::size_t)i]-off)/diag[(std::size_t)i];
+  x[(std::size_t)i]=old+AMGReal(omega)*(gs-old);
+}
+
 struct G4GpuCSR {
   int n=0;
   bool useWarp=false;
   DeviceBuffer<std::int64_t> row;
   DeviceBuffer<std::int32_t> col,diagPos;
   DeviceBuffer<AMGReal> val,diag,l1,b,x,r,tmp,corr;
+  G4ColoringDevice mcgs;
 
   void apply_scalar_raw(const AMGReal*a,AMGReal*y)const{
     g4_csr_spmv_kernel<<<g4grid(n),G4B>>>(
@@ -111,7 +242,7 @@ struct G4GpuCSR {
   }
   std::size_t bytes()const{
     return row.bytes()+col.bytes()+diagPos.bytes()+val.bytes()+diag.bytes()+l1.bytes()+
-           b.bytes()+x.bytes()+r.bytes()+tmp.bytes()+corr.bytes();
+           b.bytes()+x.bytes()+r.bytes()+tmp.bytes()+corr.bytes()+mcgs.bytes();
   }
 };
 static std::vector<std::int32_t> g4_csr_diag_positions(const CSRHost&A){std::vector<std::int32_t>d((std::size_t)A.n,-1);for(int i=0;i<A.n;++i){auto first=A.col.begin()+A.row[(std::size_t)i],last=A.col.begin()+A.row[(std::size_t)i+1];auto it=std::lower_bound(first,last,i);if(it==last||*it!=i)throw std::runtime_error("G4B coarse diagonal absent");auto k=(std::int64_t)(it-A.col.begin());if(k>INT32_MAX)throw std::runtime_error("G4B coarse diagonal slot exceeds int32");d[(std::size_t)i]=(std::int32_t)k;}return d;}
@@ -126,6 +257,7 @@ struct H2FineCSRDevice {
   DeviceBuffer<std::uint32_t> packed;
   DeviceBuffer<std::uint8_t> slot;
   DeviceBuffer<AMGReal> val;
+  G4ColoringDevice mcgs;
 
   void refresh_dynamic_raw(
       const G4CellPlanDevice*cells,const OperatorReal*rau,AMGReal*diag){
@@ -165,7 +297,7 @@ struct H2FineCSRDevice {
   }
   std::size_t bytes()const{
     return row.bytes()+col.bytes()+diagPos.bytes()+incOff.bytes()+packed.bytes()+
-           contribOff.bytes()+slot.bytes()+val.bytes();
+           contribOff.bytes()+slot.bytes()+val.bytes()+mcgs.bytes();
   }
 };
 static H2FineCSRDevice upload_h2_fine_csr(const H2FineCSRHost&H){
@@ -278,6 +410,9 @@ struct G4AMG {
   double lambdaSafety=1.5,lambdaLowFraction=.05;
   std::string smoother="cheb2";
   double jacobiOmega=.7;
+  int mcgsFineSweeps=1,mcgsCoarseSweeps=1;
+  double mcgsOmega=1.0;
+  std::string mcgsOrder="symmetric";
   int spectrumRefreshes=0;
 
   static double cheb_root(double hi,double lo,int k,int degree){
@@ -305,11 +440,70 @@ struct G4AMG {
       fine->nc,jacobiOmega,b,(smoother=="l1jacobi"?fine_l1.data():fine->diag_pc.data()),x);
     NODALS_CUDA(cudaGetLastError());
   }
+
+  template<class RowT>
+  void mcgs_color_pass(
+      const RowT*row,const std::int32_t*col,const AMGReal*val,
+      const AMGReal*diag,const AMGReal*b,AMGReal*x,
+      const G4ColoringDevice&C,bool reverse)
+  {
+    if(C.ncolors<1 || C.offHost.size()!=(std::size_t)C.ncolors+1)
+      throw std::runtime_error("P7D MCGS coloring unavailable");
+    constexpr int B=256;
+    for(int qq=0;qq<C.ncolors;++qq){
+      const int c=reverse?(C.ncolors-1-qq):qq;
+      const int begin=(int)C.offHost[(std::size_t)c];
+      const int end=(int)C.offHost[(std::size_t)c+1];
+      const int count=end-begin;
+      if(count<=0)continue;
+      const int grid=(count+B-1)/B;
+      g4_mcgs_color_kernel<RowT><<<grid,B>>>(
+        begin,count,C.rows.data(),row,col,val,diag,b,x,mcgsOmega);
+      NODALS_CUDA(cudaGetLastError());
+    }
+  }
+
+  template<class RowT>
+  void mcgs_apply(
+      int n,const RowT*row,const std::int32_t*col,const AMGReal*val,
+      const AMGReal*diag,const AMGReal*b,AMGReal*x,
+      const G4ColoringDevice&C,int sweeps)
+  {
+    if(sweeps<1)throw std::runtime_error("P7D MCGS sweeps must be positive");
+    NODALS_CUDA(cudaMemset(x,0,(std::size_t)n*sizeof(AMGReal)));
+    for(int s=0;s<sweeps;++s){
+      if(mcgsOrder=="forward"){
+        mcgs_color_pass(row,col,val,diag,b,x,C,false);
+      }else if(mcgsOrder=="backward"){
+        mcgs_color_pass(row,col,val,diag,b,x,C,true);
+      }else if(mcgsOrder=="symmetric"){
+        mcgs_color_pass(row,col,val,diag,b,x,C,false);
+        mcgs_color_pass(row,col,val,diag,b,x,C,true);
+      }else{
+        throw std::runtime_error("P7D unknown MCGS order");
+      }
+    }
+  }
+
+  void mcgs_explicit(G4GpuCSR&A,const AMGReal*b,AMGReal*x){
+    mcgs_apply(A.n,A.row.data(),A.col.data(),A.val.data(),A.diag.data(),
+               b,x,A.mcgs,mcgsCoarseSweeps);
+  }
+
+  void mcgs_fine(const AMGReal*b,AMGReal*x){
+    if(!fine || !fine->csr_pc)throw std::runtime_error("P7D fine MCGS CSR unavailable");
+    auto&C=*fine->csr_pc;
+    mcgs_apply(fine->nc,C.row.data(),C.col.data(),C.val.data(),fine->diag_pc.data(),
+               b,x,C.mcgs,mcgsFineSweeps);
+  }
+
   void smooth_explicit(G4GpuCSR&A,const AMGReal*b,AMGReal*x,double lambda,int level){
     if(smoother=="cheb2"){
       cheb_explicit(A,b,x,lambda,level);
     }else if((smoother=="jacobi"||smoother=="l1jacobi")){
       jacobi_explicit(A,b,x);
+    }else if(smoother=="mcgs"){
+      mcgs_explicit(A,b,x);
     }else{
       throw std::runtime_error("H8 unknown AMG smoother");
     }
@@ -319,6 +513,8 @@ struct G4AMG {
       cheb_fine(b,x);
     }else if((smoother=="jacobi"||smoother=="l1jacobi")){
       jacobi_fine(b,x);
+    }else if(smoother=="mcgs"){
+      mcgs_fine(b,x);
     }else{
       throw std::runtime_error("H8 unknown AMG smoother");
     }
@@ -586,6 +782,16 @@ static double g5_rau_snapshot_rel(G4Gpu&G){
 
 
 static void h2_action_parity_and_bench(G4Gpu&G,const char*tag,int reps=24){
+
+  if(!gate6_setup_autotune_enabled()){
+    std::printf(
+      "NODALS_GPU_PM2_SETUP_POLICY component=H2_ACTION "
+      "source=FROZEN_VALIDATED physical=EXACT_CURRENT_CSR "
+      "finePc=CSR_WARP setupParityBenchmark=0 "
+      "diagnosticEnv=NODALS_SETUP_AUTOTUNE status=PASS\n");
+    return;
+  }
+
   auto&x=G.amg.fine_rhs;auto&ymf=G.amg.fine_tmp;auto&ycsr=G.amg.fine_r;auto&diff=G.amg.fine_corr;
   g5_power_init_kernel<<<g4grid(G.nc),G4B>>>(G.nc,x.data());NODALS_CUDA(cudaGetLastError());
   G.pf.apply_pc_mf(x.data(),ymf.data());G.fineCsr.apply(x.data(),ycsr.data());
@@ -620,7 +826,7 @@ static void h2b_refresh_bench(G4Gpu&G,const char*tag,int reps=12){
   // One final current warp refresh for deterministic post-benchmark state.
   G.fineCsr.refresh(G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
   NODALS_CUDA(cudaDeviceSynchronize());
-  std::printf("NODALS_GPU_H8_REFRESH_BENCH tag=%s reps=%d serialRowMs=%.6f warpRowMs=%.6f speedup=%.6f savedMsPerRefresh=%.6f status=PASS\\n",
+  std::printf("NODALS_GPU_H8_REFRESH_BENCH tag=%s reps=%d serialRowMs=%.6f warpRowMs=%.6f speedup=%.6f savedMsPerRefresh=%.6f status=PASS\n",
     tag,reps,serialMs,warpMs,serialMs/warpMs,serialMs-warpMs);
 }
 
@@ -635,6 +841,32 @@ static int h6_host_row_max(const CSRHost&A){
 static void h6_select_coarse_spmv(
     G4Gpu&G,const SAHierarchyHost&H,const char*tag,int reps=200)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    if(G.amg.L.size()!=H.csr.size())
+      throw std::runtime_error("PM2 host/device AMG level mismatch");
+
+    std::printf(
+      "NODALS_GPU_PM2_SETUP_POLICY component=H6_COARSE_SPMV "
+      "source=FROZEN_VALIDATED explicitLevels=%zu policy=WARP_ROW "
+      "terminal=DENSE setupBenchmarkOnly=0 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "status=PASS\n",
+      G.amg.L.empty()?0:G.amg.L.size()-1);
+
+    for(std::size_t l=0;l<G.amg.L.size();++l){
+      const bool terminal=(l+1==G.amg.L.size());
+      G.amg.L[l].useWarp=!terminal;
+      std::printf(
+        "NODALS_GPU_PM2_COARSE_SPMV level=%zu rows=%d nnz=%zu role=%s "
+        "selected=%s status=PASS\n",
+        l+1,G.amg.L[l].n,
+        l<H.csr.size()?H.csr[l].val.size():0,
+        terminal?"TERMINAL_DENSE":"EXPLICIT_CSR",
+        terminal?"TERMINAL_DENSE":"WARP_ROW");
+    }
+    return;
+  }
+
   if(G.amg.L.size()!=H.csr.size())
     throw std::runtime_error("H8 host/device AMG level mismatch");
 
@@ -819,6 +1051,27 @@ static double h7_time_finalize_warp(
 static void h7_select_momentum_assembly(
     G4Gpu&G,double alphaU,int smCount,const char*tag)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    constexpr bool pm2fp32=std::is_same<OperatorReal,float>::value;
+    G.h7WarpConvection=pm2fp32;
+    G.h7ConvectionBlocks=
+      pm2fp32?h7_blocks_for_sm_factor(smCount,4):0;
+    G.h7WarpFinalize=false;
+    G.h7FinalizeBlocks=0;
+
+    std::printf(
+      "NODALS_GPU_PM2_SETUP_POLICY component=H7_MOMENTUM "
+      "source=FROZEN_VALIDATED precision=%s convection=%s "
+      "convectionSmFactor=%d convectionBlocks=%d "
+      "finalize=SCALAR_THREAD_ROW finalizeBlocks=0 "
+      "setupBenchmarkOnly=0 diagnosticEnv=NODALS_SETUP_AUTOTUNE status=PASS\n",
+      kPrecisionName,
+      G.h7WarpConvection?"WARP_CELL":"SCALAR_THREAD_CELL",
+      G.h7WarpConvection?4:0,G.h7ConvectionBlocks);
+    return;
+  }
+
   constexpr int reps=8;
   const int factors[4]={4,8,16,32};
 
@@ -1067,6 +1320,34 @@ static double h8_time_cont_precomputed(
 
 static void h8_select_precomputed_b(G4Gpu&G,const char*tag)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    G.fineCsr.usePrecomputedB=true;
+    G.pf.usePrecomputedBT=true;
+    G.pf.usePrecomputedBAction=true;
+    G.h8PrecomputedContinuity=true;
+
+    G.fineCsr.refresh_precomputed_raw(
+      G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+    NODALS_CUDA(cudaDeviceSynchronize());
+
+    std::printf(
+      "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu "
+      "totalMiB=%.3f build=SETUP_ONCE storage=OperatorReal precision=%s "
+      "status=PASS\n",
+      tag,H8_BCOEFF_PER_CELL,
+      (std::size_t)H8_BCOEFF_PER_CELL*sizeof(OperatorReal),
+      (double)G.bcoeff.bytes()/(1024.0*1024.0),kPrecisionName);
+    std::printf(
+      "NODALS_GPU_PM2_SETUP_POLICY component=H8_B_GEOMETRY "
+      "source=FROZEN_VALIDATED refresh=PRECOMPUTED_B bt=PRECOMPUTED_B "
+      "bAction=PRECOMPUTED_B continuity=PRECOMPUTED_B persistentBytes=%zu "
+      "setupBenchmarkOnly=0 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "numericalOperator=UNCHANGED status=PASS\n",
+      G.bcoeff.bytes());
+    return;
+  }
+
   constexpr int reps=8;
   std::printf(
     "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu totalMiB=%.3f "
@@ -1450,11 +1731,18 @@ int main(int argc,char**argv){try{
     tag.c_str(),pressureSolver.c_str(),pressureRichardsonOmega,
     pressureChebDegree,pressurePowerIts,pressureChebLowFraction,
     pressurePowerSafety,pressureChebLambdaMax);
-  {
+  if(gate6_setup_autotune_enabled()){
     std::vector<AMGReal> g6FineVal(G.fineCsr.val.size());
     G.fineCsr.val.download(g6FineVal.data(),g6FineVal.size());
     g6_strength_sweep(FH.n,FH.row,FH.col,g6FineVal,tag.c_str());
     g7_pmis_diagnostics(FH.n,FH.row,FH.col,g6FineVal,0.25,tag.c_str());
+  }else{
+    std::printf(
+      "NODALS_GPU_PM2_AUX_DIAGNOSTICS tag=%s "
+      "g6StrengthSweep=SKIP g7PmisDuplicate=SKIP "
+      "setupOnly=1 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "solverHierarchy=UNCHANGED status=PASS\n",
+      tag.c_str());
   }
   h6_select_coarse_spmv(G,H,tag.c_str(),200);
   if(effectiveAmgPowerIts>0){
@@ -1551,8 +1839,36 @@ int main(int argc,char**argv){try{
   }
   NODALS_CUDA(cudaDeviceSynchronize());auto wall1=std::chrono::steady_clock::now();const auto memEnd=device_memory_info();
 
-  std::vector<StateReal>pf((std::size_t)G.nc);G.p.download(pf.data(),pf.size());std::vector<double>pd(pf.size());for(std::size_t i=0;i<pf.size();++i)pd[i]=(double)pf[i];
-  double dp=pressure_drop_fit_g4(M,pd),exact=S.pipe.hpDrop,dpErr=std::abs(dp-exact)/std::max(std::abs(exact),1e-300);
+  std::vector<StateReal>pf((std::size_t)G.nc);
+  G.p.download(pf.data(),pf.size());
+  std::vector<double>pd(pf.size());
+  for(std::size_t i=0;i<pf.size();++i)pd[i]=(double)pf[i];
+
+  std::array<std::vector<double>,3> finalU;
+  for(int d=0;d<3;++d)
+    finalU[(std::size_t)d].resize((std::size_t)G.nv);
+  std::vector<StateReal>uf((std::size_t)G.nv);
+  G.u0.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[0][i]=(double)uf[i];
+  G.u1.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[1][i]=(double)uf[i];
+  G.u2.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[2][i]=(double)uf[i];
+
+  const auto hpErr=h8_compute_hp_errors(M,S,finalU,pd);
+  double dp=pressure_drop_fit_g4(M,pd),exact=S.pipe.hpDrop,
+         dpErr=std::abs(dp-exact)/std::max(std::abs(exact),1e-300);
+
+  std::printf(
+    "NODALS_GPU_H8_HP_ERROR tag=%s cells=%zu hEff=%.12e "
+    "U_L2=%.12e U_relL2=%.12e "
+    "P_shifted_L2=%.12e P_shifted_relL2=%.12e pressureShift=%.12e "
+    "pressureDropFit=%.12e exactPressureDrop=%.12e "
+    "pressureDropRelErr=%.12e quadrature=duffy5_125 "
+    "finalStateD2H=AFTER_LOOP status=%s\n",
+    tag.c_str(),M.tets.size(),hpErr.hEff,hpErr.uL2,hpErr.uRelL2,
+    hpErr.pShiftedL2,hpErr.pShiftedRelL2,hpErr.pressureShift,
+    dp,exact,dpErr,converged?"PASS":"UNCONVERGED");
   double wallMs=std::chrono::duration<double,std::milli>(wall1-wall0).count();
   double usedEnd=g5_used_mib(memEnd);
 

@@ -42,14 +42,52 @@ static void h8_fill_device_h2(G4Gpu&G,const G4SetupHost&S)
   G.cells.upload(d.data(),d.size());
 }
 
+// P7B_R2_SUPG_KERNEL_DISPATCH
+static const char* h8_supg_kernel_mode()
+{
+  const char*e=std::getenv("NODALS_GPU_SUPG_KERNEL");
+  return (e&&*e)?e:"mixed64_8";
+}
+
 static void h8_apply_supg_warp(
     G4Gpu&G,int blocks,double nu,double tauScale,double magic)
 {
-  h7_supg64_warp_cell_kernel<<<blocks,H7_BLOCK>>>(
-    G.cells.data(),G.nc,G.row.data(),G.fixed.data(),
-    G.u0.data(),G.u1.data(),G.u2.data(),
-    OperatorReal(nu),OperatorReal(tauScale),OperatorReal(magic),
-    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
+  const std::string mode=h8_supg_kernel_mode();
+  static bool printed=false;
+  if(!printed){
+    std::printf(
+      "NODALS_GPU_P7B_R2_KERNEL mode=%s globalOperator=%s "
+      "laggedTau=1 affineTet=1 pmisUnchanged=1 persistentExtraBytes=0 status=PASS\n",
+      mode.c_str(),kPrecisionName);
+    printed=true;
+  }
+
+#define P7B_R2_LAUNCH(W,CF,AF) \
+  h7_supg64_r2_kernel<W,CF,AF><<<blocks,32*(W)>>>( \
+    G.cells.data(),G.nc,G.row.data(),G.fixed.data(), \
+    G.u0.data(),G.u1.data(),G.u2.data(), \
+    OperatorReal(nu),OperatorReal(tauScale),OperatorReal(magic), \
+    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data())
+
+  if(mode=="reference"){
+    h7_supg64_warp_cell_kernel<<<blocks,H7_BLOCK>>>(
+      G.cells.data(),G.nc,G.row.data(),G.fixed.data(),
+      G.u0.data(),G.u1.data(),G.u2.data(),
+      OperatorReal(nu),OperatorReal(tauScale),OperatorReal(magic),
+      G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
+  }
+  else if(mode=="exact8")      P7B_R2_LAUNCH(8,false,false);
+  else if(mode=="exact16")     P7B_R2_LAUNCH(16,false,false);
+  else if(mode=="exact32")     P7B_R2_LAUNCH(32,false,false);
+  else if(mode=="mixed64_8")   P7B_R2_LAUNCH(8,true,false);
+  else if(mode=="mixed64_16")  P7B_R2_LAUNCH(16,true,false);
+  else if(mode=="mixed64_32")  P7B_R2_LAUNCH(32,true,false);
+  else if(mode=="mixed32_8")   P7B_R2_LAUNCH(8,true,true);
+  else if(mode=="mixed32_16")  P7B_R2_LAUNCH(16,true,true);
+  else if(mode=="mixed32_32")  P7B_R2_LAUNCH(32,true,true);
+  else throw std::runtime_error("invalid NODALS_GPU_SUPG_KERNEL");
+
+#undef P7B_R2_LAUNCH
   NODALS_CUDA(cudaGetLastError());
 }
 

@@ -1,6 +1,6 @@
 NVCC ?= nvcc
 ARCH ?= sm_86
-NVCCFLAGS ?= -O3 -std=c++17 -lineinfo -Xcompiler=-Wall,-Wextra
+NVCCFLAGS ?= -O3 -std=c++17 -lineinfo -Xcompiler=-Wall,-Wextra -Xcompiler=-pthread
 
 H8_DEPS = h8_main.cu h8_main_base.cu \
           h8_supg_support.inc h8_hp_diagnostics.inc h8_supg_main_cli.inc \
