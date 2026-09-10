@@ -27,7 +27,21 @@
 #include <type_traits>
 #include <vector>
 
+
 using namespace nodals_gpu;
+
+#include "h8_hp_diagnostics.inc"
+
+// Gate 6: production uses previously validated setup policies.
+// Set NODALS_SETUP_AUTOTUNE=1 to execute the complete legacy setup-time
+// benchmark/parity selection path.
+static bool gate6_setup_autotune_enabled(){
+  const char*e=std::getenv("NODALS_SETUP_AUTOTUNE");
+  return e && *e && std::strcmp(e,"0")!=0 &&
+         std::strcmp(e,"false")!=0 && std::strcmp(e,"FALSE")!=0 &&
+         std::strcmp(e,"off")!=0 && std::strcmp(e,"OFF")!=0;
+}
+
 
 enum H0Cat {
   H0_FINE_LIVE_TOTAL=0,H0_FINE_LIVE_ZERO,H0_FINE_LIVE_BT,H0_FINE_LIVE_RAU,H0_FINE_LIVE_B,
@@ -396,6 +410,16 @@ static double g5_rau_snapshot_rel(G4Gpu&G){
 
 
 static void h2_action_parity_and_bench(G4Gpu&G,const char*tag,int reps=24){
+
+  if(!gate6_setup_autotune_enabled()){
+    std::printf(
+      "NODALS_GPU_GATE6_POLICY component=H2_ACTION "
+      "source=FROZEN_VALIDATED physical=EXACT_CURRENT_CSR "
+      "finePc=CSR_WARP setupParityBenchmark=0 "
+      "diagnosticEnv=NODALS_SETUP_AUTOTUNE status=PASS\n");
+    return;
+  }
+
   auto&x=G.amg.fine_rhs;auto&ymf=G.amg.fine_tmp;auto&ycsr=G.amg.fine_r;auto&diff=G.amg.fine_corr;
   g5_power_init_kernel<<<g4grid(G.nc),G4B>>>(G.nc,x.data());NODALS_CUDA(cudaGetLastError());
   G.pf.apply_pc_mf(x.data(),ymf.data());G.fineCsr.apply(x.data(),ycsr.data());
@@ -445,6 +469,32 @@ static int h6_host_row_max(const CSRHost&A){
 static void h6_select_coarse_spmv(
     G4Gpu&G,const SAHierarchyHost&H,const char*tag,int reps=200)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    if(G.amg.L.size()!=H.csr.size())
+      throw std::runtime_error("H8 host/device AMG level mismatch");
+
+    std::printf(
+      "NODALS_GPU_GATE6_POLICY component=H6_COARSE_SPMV "
+      "source=FROZEN_VALIDATED explicitLevels=%zu policy=WARP_ROW "
+      "terminal=DENSE setupBenchmarkOnly=0 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "status=PASS\n",
+      G.amg.L.empty()?0:G.amg.L.size()-1);
+
+    for(std::size_t l=0;l<G.amg.L.size();++l){
+      const bool terminal=(l+1==G.amg.L.size());
+      G.amg.L[l].useWarp=!terminal;
+      std::printf(
+        "NODALS_GPU_GATE6_COARSE_SPMV level=%zu rows=%d nnz=%zu role=%s "
+        "selected=%s status=PASS\n",
+        l+1,G.amg.L[l].n,
+        l<H.csr.size()?H.csr[l].val.size():0,
+        terminal?"TERMINAL_DENSE":"EXPLICIT_CSR",
+        terminal?"TERMINAL_DENSE":"WARP_ROW");
+    }
+    return;
+  }
+
   if(G.amg.L.size()!=H.csr.size())
     throw std::runtime_error("H8 host/device AMG level mismatch");
 
@@ -629,6 +679,26 @@ static double h7_time_finalize_warp(
 static void h7_select_momentum_assembly(
     G4Gpu&G,double alphaU,int smCount,const char*tag)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    constexpr bool gate6fp32=std::is_same<OperatorReal,float>::value;
+    G.h7WarpConvection=gate6fp32;
+    G.h7ConvectionBlocks=
+      gate6fp32?h7_blocks_for_sm_factor(smCount,4):0;
+    G.h7WarpFinalize=false;
+    G.h7FinalizeBlocks=0;
+
+    std::printf(
+      "NODALS_GPU_GATE6_POLICY component=H7_MOMENTUM source=FROZEN_VALIDATED "
+      "precision=%s convection=%s convectionSmFactor=%d convectionBlocks=%d "
+      "finalize=SCALAR_THREAD_ROW finalizeBlocks=0 setupBenchmarkOnly=0 "
+      "diagnosticEnv=NODALS_SETUP_AUTOTUNE status=PASS\n",
+      kPrecisionName,
+      G.h7WarpConvection?"WARP_CELL":"SCALAR_THREAD_CELL",
+      G.h7WarpConvection?4:0,G.h7ConvectionBlocks);
+    return;
+  }
+
   constexpr int reps=8;
   const int factors[4]={4,8,16,32};
 
@@ -877,6 +947,34 @@ static double h8_time_cont_precomputed(
 
 static void h8_select_precomputed_b(G4Gpu&G,const char*tag)
 {
+
+  if(!gate6_setup_autotune_enabled()){
+    G.fineCsr.usePrecomputedB=true;
+    G.pf.usePrecomputedBT=true;
+    G.pf.usePrecomputedBAction=true;
+    G.h8PrecomputedContinuity=true;
+
+    G.fineCsr.refresh_precomputed_raw(
+      G.cells.data(),G.rau.data(),G.pf.diag_pc.data());
+    NODALS_CUDA(cudaDeviceSynchronize());
+
+    std::printf(
+      "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu "
+      "totalMiB=%.3f build=SETUP_ONCE storage=OperatorReal precision=%s "
+      "status=PASS\n",
+      tag,H8_BCOEFF_PER_CELL,
+      (std::size_t)H8_BCOEFF_PER_CELL*sizeof(OperatorReal),
+      (double)G.bcoeff.bytes()/(1024.0*1024.0),kPrecisionName);
+    std::printf(
+      "NODALS_GPU_GATE6_POLICY component=H8_B_GEOMETRY "
+      "source=FROZEN_VALIDATED refresh=PRECOMPUTED_B bt=PRECOMPUTED_B "
+      "bAction=PRECOMPUTED_B continuity=PRECOMPUTED_B persistentBytes=%zu "
+      "setupBenchmarkOnly=0 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "numericalOperator=UNCHANGED status=PASS\n",
+      G.bcoeff.bytes());
+    return;
+  }
+
   constexpr int reps=8;
   std::printf(
     "NODALS_GPU_H8_BCOEFF tag=%s valuesPerCell=%d bytesPerCell=%zu totalMiB=%.3f "
@@ -1087,6 +1185,17 @@ static void h0_print_profile(const char*tag,int outer,double pressureStageMs,dou
   }}
 }
 
+
+// Gate 7 production cleanup: setup-only execution is diagnostic-only.
+// Normal production runs enter SIMPLE.  To intentionally stop after setup,
+// set NODALS_H8_SETUP_ONLY_EXPLICIT=1.
+static bool gate7_explicit_setup_only_enabled(){
+  const char*e=std::getenv("NODALS_H8_SETUP_ONLY_EXPLICIT");
+  return e && *e && std::strcmp(e,"0")!=0 &&
+         std::strcmp(e,"false")!=0 && std::strcmp(e,"FALSE")!=0 &&
+         std::strcmp(e,"off")!=0 && std::strcmp(e,"OFF")!=0;
+}
+
 int main(int argc,char**argv){try{
   std::string mesh,tag="h8",wall="patch_0_0",inlet="patch_2_0",outlet="patch_1_0";
   double re=20,bulk=1,simpleTol=1e-6;
@@ -1133,16 +1242,40 @@ int main(int argc,char**argv){try{
   if(runMode=="fixed10"&&maxOuter!=10)throw std::runtime_error("H8 fixed10 requires maxOuter=10");
   const bool physicalUseCurrentCSR=true;
 
+  const auto h8SetupEpoch=std::chrono::steady_clock::now();
+  auto h8SetupStage=h8SetupEpoch;
+  auto h8SetupPrint=[&](const char*stage,const std::chrono::steady_clock::time_point&begin){
+    const auto now=std::chrono::steady_clock::now();
+    const double sec=std::chrono::duration<double>(now-begin).count();
+    std::printf("NODALS_GPU_H8_SETUP_PROFILE tag=%s precision=%s stage=%s seconds=%.9f status=PASS\n",
+                tag.c_str(),kPrecisionName,stage,sec);
+    return now;
+  };
+
   NODALS_CUDA(cudaSetDevice(0));cudaDeviceProp prop{};NODALS_CUDA(cudaGetDeviceProperties(&prop,0));upload_tensors();NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("cuda_init",h8SetupStage);
   const auto memBaseline=device_memory_info();
-  auto M=load_foam_tet_mesh(mesh);auto S=build_g4_setup(M,re,bulk,wall,inlet,outlet);
+
+  auto M=load_foam_tet_mesh(mesh);
+  h8SetupStage=h8SetupPrint("mesh_load_reconstruct",h8SetupStage);
+
+  auto S=build_g4_setup(M,re,bulk,wall,inlet,outlet);
+  h8SetupStage=h8SetupPrint("g4_setup_total",h8SetupStage);
+
   std::array<std::vector<double>,3>U0;for(auto&u:U0)u.assign((std::size_t)S.topo.n,0.0);
   std::vector<double>hostA,initDelta;std::array<std::vector<double>,3>hostConv;
   host_assemble_central_g4(S,U0,hostA,hostConv);auto initRau=host_finalize_relax_g4(S,hostA,alphaU,&initDelta);S.pressure.rAU=initRau;
-  auto H=build_sa_hierarchy(M,S.pressure,16,6,18,1000,8,16,1.5,0.05,4.0/3.0);
-  auto FH=build_h2_fine_csr_host(S);
+  h8SetupStage=h8SetupPrint("initial_host_momentum_assembly",h8SetupStage);
 
-  std::printf("NODALS_GPU_H8_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_%s_CSR_warp coarseAMGSpMV=per_level_scalar_vs_warp_hybrid fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ momentumAssemblyExec=SETUP_SELECT_SCALAR_VS_WARP BGeometry=SETUP_PRECOMPUTED_24_%s_PER_CELL_AUTOSELECT alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=%s operator=%s amg=%s\n",
+  std::printf("NODALS_GPU_H8_SETUP_START tag=%s precision=%s stage=sa_hierarchy_total\\n",tag.c_str(),kPrecisionName);std::fflush(stdout);
+  auto H=build_sa_hierarchy(M,S.pressure,16,6,18,1000,8,16,1.5,0.05,4.0/3.0);
+  h8SetupStage=h8SetupPrint("sa_hierarchy_total",h8SetupStage);
+
+  std::printf("NODALS_GPU_H8_SETUP_START tag=%s precision=%s stage=fine_csr_topology\\n",tag.c_str(),kPrecisionName);std::fflush(stdout);
+  auto FH=build_h2_fine_csr_host(S);
+  h8SetupStage=h8SetupPrint("fine_csr_topology",h8SetupStage);
+
+  std::printf("NODALS_GPU_H8_CONFIG tag=%s precision=%s device=%s cc=%d.%d petsc=NONE mpi=NONE cells=%zu runMode=%s momentumWork=%s momentumResidualPolicy=%s physicalOperator=exact_current_CSR fineAMG=explicit_%s_CSR_warp coarseAMGSpMV=gate6_frozen_warp_or_autotune fineCsrNumericRefreshEvery=1 refreshKernel=warp_per_row spectrumRefresh=setup_only coarseHierarchyNumeric=setup_snapshot coarseSpMV=GATE6_FROZEN_WARP_OR_AUTOTUNE momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_SHARED_XYZ momentumAssemblyExec=GATE6_FROZEN_OR_AUTOTUNE BGeometry=SETUP_PRECOMPUTED_24_%s_PER_CELL_GATE6_FROZEN_OR_AUTOTUNE alphaU=%.8g alphaP=%.8g simpleTol=%.3e maxOuter=%d momentumOmega=%.8g pressureRtol=%.3e pressureAtol=%.3e pressureMaxIts=%d reductions=FP64 state=%s operator=%s amg=%s\n",
     tag.c_str(),kPrecisionName,prop.name,prop.major,prop.minor,M.tets.size(),runMode.c_str(),momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP",
     kPrecisionName,kPrecisionName,alphaU,alphaP,simpleTol,maxOuter,momOmega,pRtol,pAtol,pMax,kPrecisionName,kPrecisionName,kPrecisionName);
   std::printf("NODALS_GPU_H8_TUNING alphaU=%.8g alphaP=%.8g momentumWork=%s momentumOmega=%.8g momentumAdaptiveTol=DISABLED momentumResidualPolicy=%s pRtol=%.3e pAtol=%.3e pMax=%d simpleTol=%.3e maxOuter=%d snapshotTol=%.3e fineCsrRefreshEvery=1 status=PASS\n",
@@ -1155,16 +1288,48 @@ int main(int argc,char**argv){try{
   std::printf("NODALS_GPU_H8_MOMENTUM_ASSEMBLY_DESIGN tag=%s diffusionCSR=BUILT_ONCE_HOST_UPLOADED_ONCE_DEVICE_PERSISTENT convectionCSRTopology=STATIC convectionNumeric=REFRESH_EACH_OUTER commonOperatorXYZ=YES pressureGradientBTopology=STATIC pressureGradientAction=APPLY_CURRENT_P fixedDiffusionDirichletRHS=PERSISTENT variableViscosityDesign=REFRESH_DIFFUSION_NUMERICS_ONLY_NO_TOPOLOGY_REBUILD status=PASS\n",tag.c_str());
 
   G4Gpu G=upload_all(S,H,initRau,FH);G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("upload_all",h8SetupStage);
+
   h7_select_momentum_assembly(G,alphaU,prop.multiProcessorCount,tag.c_str());
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("h7_momentum_select",h8SetupStage);
+
   h8_select_precomputed_b(G,tag.c_str());
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("h8_precomputed_b_select",h8SetupStage);
+
   h6_select_coarse_spmv(G,H,tag.c_str(),200);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("h6_coarse_spmv_select",h8SetupStage);
+
   g5_gpu_spectrum_refresh(G,H);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("gpu_spectrum_refresh",h8SetupStage);
+
   h2_action_parity_and_bench(G,tag.c_str(),24);
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("h2_action_parity_bench",h8SetupStage);
+
   H0Profiler H0P;g_h0=&H0P;
-  NODALS_CUDA(cudaDeviceSynchronize());const auto memUpload=device_memory_info();
+  NODALS_CUDA(cudaDeviceSynchronize());
+  h8SetupStage=h8SetupPrint("runtime_profiler_init",h8SetupStage);
+  const auto memUpload=device_memory_info();
+  const double h8PreSimpleSeconds=std::chrono::duration<double>(
+      std::chrono::steady_clock::now()-h8SetupEpoch).count();
+  std::printf("NODALS_GPU_H8_SETUP_PROFILE tag=%s precision=%s stage=pre_simple_total seconds=%.9f status=PASS\n",
+              tag.c_str(),kPrecisionName,h8PreSimpleSeconds);
   const double baselineUsed=g5_used_mib(memBaseline),uploadUsed=g5_used_mib(memUpload),explicitMiB=g5_mib(G.bytes());
   std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_upload cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f explicitBytesPerCell=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),baselineUsed,uploadUsed,uploadUsed-baselineUsed,explicitMiB,(double)G.bytes()/std::max<std::size_t>(M.tets.size(),1));
+
+  if(gate7_explicit_setup_only_enabled()){
+    std::printf("NODALS_GPU_H8_SETUP_ONLY_RESULT tag=%s precision=%s cells=%zu status=PASS\n",
+                tag.c_str(),kPrecisionName,M.tets.size());
+    std::fflush(stdout);
+    return 0;
+  }
+
 
   bool converged=false,pressureAll=true,finiteAll=true;double cont0=-1.0,contRel=1.0;
   long long sumP=0;int convergenceAuditCalls=0;std::array<double,3>lastAuditRel{{NAN,NAN,NAN}};
@@ -1228,8 +1393,35 @@ int main(int argc,char**argv){try{
   }
   NODALS_CUDA(cudaDeviceSynchronize());auto wall1=std::chrono::steady_clock::now();const auto memEnd=device_memory_info();
 
-  std::vector<StateReal>pf((std::size_t)G.nc);G.p.download(pf.data(),pf.size());std::vector<double>pd(pf.size());for(std::size_t i=0;i<pf.size();++i)pd[i]=(double)pf[i];
-  double dp=pressure_drop_fit_g4(M,pd),exact=S.pipe.hpDrop,dpErr=std::abs(dp-exact)/std::max(std::abs(exact),1e-300);
+  std::vector<StateReal>pf((std::size_t)G.nc);
+  G.p.download(pf.data(),pf.size());
+  std::vector<double>pd(pf.size());
+  for(std::size_t i=0;i<pf.size();++i)pd[i]=(double)pf[i];
+
+  std::array<std::vector<double>,3> finalU;
+  for(int d=0;d<3;++d)finalU[(std::size_t)d].resize((std::size_t)G.nv);
+  std::vector<StateReal>uf((std::size_t)G.nv);
+  G.u0.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[0][i]=(double)uf[i];
+  G.u1.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[1][i]=(double)uf[i];
+  G.u2.download(uf.data(),uf.size());
+  for(std::size_t i=0;i<uf.size();++i)finalU[2][i]=(double)uf[i];
+
+  const auto hpErr=h8_compute_hp_errors(M,S,finalU,pd);
+  double dp=pressure_drop_fit_g4(M,pd),exact=S.pipe.hpDrop,
+         dpErr=std::abs(dp-exact)/std::max(std::abs(exact),1e-300);
+
+  std::printf(
+    "NODALS_GPU_H8_HP_ERROR tag=%s cells=%zu hEff=%.12e "
+    "U_L2=%.12e U_relL2=%.12e "
+    "P_shifted_L2=%.12e P_shifted_relL2=%.12e pressureShift=%.12e "
+    "pressureDropFit=%.12e exactPressureDrop=%.12e "
+    "pressureDropRelErr=%.12e quadrature=duffy5_125 "
+    "finalStateD2H=AFTER_LOOP status=%s\n",
+    tag.c_str(),M.tets.size(),hpErr.hEff,hpErr.uL2,hpErr.uRelL2,
+    hpErr.pShiftedL2,hpErr.pShiftedRelL2,hpErr.pressureShift,
+    dp,exact,dpErr,converged?"PASS":"UNCONVERGED");
   double wallMs=std::chrono::duration<double,std::milli>(wall1-wall0).count();
   double usedEnd=g5_used_mib(memEnd);
 
@@ -1244,7 +1436,7 @@ int main(int argc,char**argv){try{
   h0_print_profile(tag.c_str(),finalIt,tPressure,tMomentum,H0P);
   std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_convergence cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f runtimeDriftMiB=%.3f totalMiB=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),baselineUsed,usedEnd,usedEnd-baselineUsed,explicitMiB,usedEnd-uploadUsed,(double)memEnd.total_bytes/(1024.0*1024.0));
-  std::printf("NODALS_GPU_H8_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=%s physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT coarseSpMV=PER_LEVEL_SCALAR_WARP_HYBRID H8_scope=PRECOMPUTED_B_GEOMETRY status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",kPrecisionName,momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
+  std::printf("NODALS_GPU_H8_RESIDENCY tag=%s O_N_H2D_inside_SIMPLE=0 O_N_D2H_inside_SIMPLE=%s finalPressureD2H=AFTER_LOOP reductions=FP64 deviceNumericStorage=%s physicalOperator=CURRENT_EXACT_CSR fineCsrNumericRefreshEvery=1 refreshKernel=WARP_PER_ROW momentumWork=%s momentumResidualPolicy=%s momentumDiffusion=PERSISTENT_NUMERIC_CSR momentumConvection=NUMERIC_ONLY_EACH_OUTER spectrumRefresh=SETUP_ONLY coarseSANumeric=SETUP_SNAPSHOT coarseSpMV=GATE6_FROZEN_WARP_OR_AUTOTUNE H8_scope=PRECOMPUTED_B_GEOMETRY status=PASS\n",tag.c_str(),runMode=="fixed10"?"0":"SCALAR_CONVERGENCE_AUDITS_ONLY",kPrecisionName,momentumWork.c_str(),runMode=="fixed10"?"NONE":"CONVERGENCE_ONLY_PRE_SWEEP");
   const bool finalPass=(runMode=="fixed10")?(finalIt==10&&pressureAll&&finiteAll):converged;
   std::printf("NODALS_GPU_RESULT gate=H8 tag=%s cells=%zu precision=%s runMode=%s momentumWork=%s outer=%d simpleTol=%.3e fineCsrRefreshEvery=1 physicalOperator=current_exact_CSR pressureAll=%s finite=%s noPetsc=1 noMPI=1 status=%s\n",
     tag.c_str(),M.tets.size(),kPrecisionName,runMode.c_str(),momentumWork.c_str(),finalIt,simpleTol,pressureAll?"PASS":"FAIL",finiteAll?"PASS":"FAIL",finalPass?"PASS":"FAIL");
