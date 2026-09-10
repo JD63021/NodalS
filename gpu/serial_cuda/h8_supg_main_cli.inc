@@ -14,6 +14,9 @@ try{
   int fineCsrRefreshEvery=1;
   std::string momentumWork="fgs1",runMode="fixed10",amgSmoother="cheb2",amgHierarchy="sa",cfInterp="direct",pressureSolver="pcg",cfCoarsening="pmis",cfStrength="classical-negative",amgSpectrumPolicy="auto";
   double amgJacobiOmega=.7;
+  double amgMcgsOmega=1.0;
+  int amgMcgsFineSweeps=1,amgMcgsCoarseSweeps=1;
+  std::string amgMcgsOrder="symmetric"; // P7D_MCGS_CLI
   double pressureRichardsonOmega=1.0;
   double pressureChebLowFraction=.05;
   double pressurePowerSafety=1.15;
@@ -73,6 +76,10 @@ try{
     else if(a=="--pressure-power-safety"&&i+1<argc)pressurePowerSafety=std::atof(argv[++i]);
     else if(a=="--amg-smoother"&&i+1<argc)amgSmoother=argv[++i];
     else if(a=="--amg-jacobi-omega"&&i+1<argc)amgJacobiOmega=std::atof(argv[++i]);
+    else if(a=="--amg-mcgs-omega"&&i+1<argc)amgMcgsOmega=std::atof(argv[++i]);
+    else if(a=="--amg-mcgs-fine-sweeps"&&i+1<argc)amgMcgsFineSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-mcgs-coarse-sweeps"&&i+1<argc)amgMcgsCoarseSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-mcgs-order"&&i+1<argc)amgMcgsOrder=argv[++i];
     else if(a=="--momentum-work"&&i+1<argc)momentumWork=argv[++i];
     else if(a=="--run-mode"&&i+1<argc)runMode=argv[++i];
     else throw std::runtime_error("H8 usage error");
@@ -105,8 +112,12 @@ try{
   if(pressurePowerIts<1||pressurePowerIts>64)throw std::runtime_error("G12 pressure power its must be in [1,64]");
   if(!(pressureChebLowFraction>0.0&&pressureChebLowFraction<1.0))throw std::runtime_error("G12 Cheb low fraction must be in (0,1)");
   if(!(pressurePowerSafety>1.0&&pressurePowerSafety<=2.0))throw std::runtime_error("G12 pressure power safety must be in (1,2]");
-  if(amgSmoother!="cheb2"&&amgSmoother!="jacobi"&&amgSmoother!="l1jacobi")throw std::runtime_error("H8 amg-smoother must be cheb2, jacobi or l1jacobi");
+  if(amgSmoother!="cheb2"&&amgSmoother!="jacobi"&&amgSmoother!="l1jacobi"&&amgSmoother!="mcgs")throw std::runtime_error("H8 amg-smoother must be cheb2, jacobi, l1jacobi or mcgs");
   if(!(amgJacobiOmega>0.0&&amgJacobiOmega<=2.0))throw std::runtime_error("H8 amg-jacobi-omega must be in (0,2]");
+  if(!(amgMcgsOmega>0.0&&amgMcgsOmega<2.0))throw std::runtime_error("P7D amg-mcgs-omega must be in (0,2)");
+  if(amgMcgsFineSweeps<1||amgMcgsFineSweeps>16||amgMcgsCoarseSweeps<1||amgMcgsCoarseSweeps>16)throw std::runtime_error("P7D MCGS sweeps must be in [1,16]");
+  if(amgMcgsOrder!="symmetric"&&amgMcgsOrder!="forward"&&amgMcgsOrder!="backward")throw std::runtime_error("P7D amg-mcgs-order must be symmetric, forward or backward");
+  if(pressureSolver=="pcg"&&amgSmoother=="mcgs"&&amgMcgsOrder!="symmetric")throw std::runtime_error("P7D PCG requires symmetric MCGS");
   if(!(snapshotTol>0.0))throw std::runtime_error("H8 snapshot tolerance must be positive");
   if(fineCsrRefreshEvery!=1)throw std::runtime_error("H8 requires fine CSR refreshEvery=1");
   if(momentumWork!="fgs1")throw std::runtime_error("H8 requires momentum-work=fgs1");

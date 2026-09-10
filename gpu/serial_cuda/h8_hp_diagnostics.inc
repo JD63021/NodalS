@@ -1,3 +1,4 @@
+#pragma once
 struct H8HpErrors {
   double hEff=0.0;
   double uL2=0.0,uRelL2=0.0;
@@ -88,7 +89,8 @@ static H8HpErrors h8_compute_hp_errors(
   H8HpErrors E;
   const double idealVol=3.141592653589793238462643383279502884*
                         S.pipe.R*S.pipe.R*S.pipe.L;
-  E.hEff=std::cbrt(idealVol/std::max<std::size_t>(M.tets.size(),1));
+  const std::size_t ncSafe=M.tets.empty()?std::size_t(1):M.tets.size();
+  E.hEff=std::cbrt(idealVol/(double)ncSafe);
   E.uL2=std::sqrt((double)ue2);
   E.uRelL2=std::sqrt((double)(ue2/std::max(un2,(long double)1e-300L)));
   E.pShiftedL2=std::sqrt((double)pe2);

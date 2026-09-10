@@ -8,9 +8,12 @@
   auto initRau=host_finalize_relax_g4(S,hostA,alphaU,&initDelta);S.pressure.rAU=initRau;
   auto FH=build_h2_fine_csr_host(S);
   int effectiveAmgPowerIts=0;
+  const bool hierarchyNeedsSpectrum=(amgHierarchy=="sa");
+  const bool smootherNeedsSpectrum=(amgSmoother=="cheb2");
   if(amgSpectrumPolicy=="always") effectiveAmgPowerIts=amgPowerIts;
-  else if(amgSpectrumPolicy=="auto" && amgSmoother=="cheb2") effectiveAmgPowerIts=amgPowerIts;
-  if(amgSmoother=="cheb2" && effectiveAmgPowerIts<=0)throw std::runtime_error("H8 Chebyshev AMG smoother requires spectrum estimation");
+  else if(amgSpectrumPolicy=="auto" && (hierarchyNeedsSpectrum||smootherNeedsSpectrum)) effectiveAmgPowerIts=amgPowerIts;
+  if(smootherNeedsSpectrum && effectiveAmgPowerIts<=0)throw std::runtime_error("H8 Chebyshev AMG smoother requires spectrum estimation");
+  if(hierarchyNeedsSpectrum && effectiveAmgPowerIts<=0)throw std::runtime_error("P7D smoothed aggregation requires spectrum estimation to smooth interpolation");
   SAHierarchyHost H;
   if(amgHierarchy=="sa")H=build_sa_hierarchy(M,S.pressure,16,6,18,amgTerminal,8,effectiveAmgPowerIts,amgLambdaSafety,amgLambdaLowFraction,4.0/3.0);
   else H=build_cf_hierarchy(S,FH,cfTheta,cfPmax,cfInterp,cfAggressiveFirst!=0,amgTerminal,effectiveAmgPowerIts,amgLambdaSafety,amgLambdaLowFraction);
@@ -25,6 +28,26 @@
 
   G4Gpu G=upload_all(S,H,initRau,FH);h8_fill_device_h2(G,S);
   G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;G.amg.smoother=amgSmoother;G.amg.jacobiOmega=amgJacobiOmega;G.amg.chebDegree=amgChebDegree;G.amg.powerIts=effectiveAmgPowerIts;G.amg.lambdaSafety=amgLambdaSafety;G.amg.lambdaLowFraction=amgLambdaLowFraction;
+  G.amg.mcgsFineSweeps=amgMcgsFineSweeps;
+  G.amg.mcgsCoarseSweeps=amgMcgsCoarseSweeps;
+  G.amg.mcgsOmega=amgMcgsOmega;
+  G.amg.mcgsOrder=amgMcgsOrder;
+  if(amgSmoother=="mcgs"){
+    auto C0=g4_build_greedy_coloring(FH.n,FH.row,FH.col,"fine");
+    g4_upload_coloring(G.fineCsr.mcgs,C0);
+    std::printf("NODALS_GPU_P7D_MCGS_COLOR level=0 role=FINE_CURRENT rows=%d colors=%d maxColorSize=%d bytes=%zu status=PASS\n",
+      FH.n,C0.ncolors,C0.maxColorSize,G.fineCsr.mcgs.bytes());
+    if(H.csr.size()!=G.amg.L.size())throw std::runtime_error("P7D host/device coarse level mismatch");
+    for(std::size_t l=0;l+1<H.csr.size();++l){
+      auto CL=g4_build_greedy_coloring(H.csr[l].n,H.csr[l].row,H.csr[l].col,"coarse");
+      g4_upload_coloring(G.amg.L[l].mcgs,CL);
+      std::printf("NODALS_GPU_P7D_MCGS_COLOR level=%zu role=COARSE_SNAPSHOT rows=%d colors=%d maxColorSize=%d bytes=%zu status=PASS\n",
+        l+1,H.csr[l].n,CL.ncolors,CL.maxColorSize,G.amg.L[l].mcgs.bytes());
+    }
+    std::printf("NODALS_GPU_P7D_MCGS_CONFIG tag=%s hierarchy=%s fineSweeps=%d coarseSweeps=%d omega=%.8g order=%s fineValues=CURRENT_EVERY_OUTER coarseValues=SETUP_SNAPSHOT coloring=SETUP_ONCE status=PASS\n",
+      tag.c_str(),amgHierarchy.c_str(),G.amg.mcgsFineSweeps,G.amg.mcgsCoarseSweeps,
+      G.amg.mcgsOmega,G.amg.mcgsOrder.c_str());
+  }
   std::printf("NODALS_GPU_G9_L1_CONFIG tag=%s smoother=%s denominator=%s relaxWeight=%.8g fineL1Refresh=%s coarseL1=SETUP_SNAPSHOT definition=SUM_ABS_ROW status=PASS\n",tag.c_str(),amgSmoother.c_str(),amgSmoother=="l1jacobi"?"L1_ROW_ABS_SUM":"DIAGONAL",amgJacobiOmega,amgSmoother=="l1jacobi"?"EVERY_FINE_CSR_REFRESH":"OFF");
   std::printf("NODALS_GPU_H8_AMG_SMOOTHER tag=%s hierarchy=%s smoother=%s jacobiOmega=%.8g chebDegree=%d powerIts=%d hierarchyConstruction=SELECTED_BY_AMG_HIERARCHY spectrumSetup=SETUP_ONLY status=PASS\n",tag.c_str(),amgHierarchy.c_str(),amgSmoother.c_str(),amgJacobiOmega,G.amg.chebDegree,G.amg.powerIts);
   h7_select_momentum_assembly(G,alphaU,prop.multiProcessorCount,tag.c_str());
@@ -43,10 +66,18 @@
   double pressureChebLambdaMax=1.0;
   if(pressureSolver=="cheb")pressureChebLambdaMax=pressure_precond_power(G.pf,G.amg,pressurePowerIts,pressurePowerSafety,G.pcg,G.dotScratch,tag.c_str());
   std::printf("NODALS_GPU_G12_PRESSURE_SOLVER tag=%s solver=%s richardsonOmega=%.8g chebDegree=%d powerIts=%d chebLowFraction=%.8g powerSafety=%.8g lambdaMax=%.12e preconditioner=SELECTED_AMG_CONFIGURATION stoppingTolerance=UNCHANGED status=PASS\n",tag.c_str(),pressureSolver.c_str(),pressureRichardsonOmega,pressureChebDegree,pressurePowerIts,pressureChebLowFraction,pressurePowerSafety,pressureChebLambdaMax);
-  {
-    std::vector<AMGReal> g6FineVal(G.fineCsr.val.size());G.fineCsr.val.download(g6FineVal.data(),g6FineVal.size());
+  if(gate6_setup_autotune_enabled()){
+    std::vector<AMGReal> g6FineVal(G.fineCsr.val.size());
+    G.fineCsr.val.download(g6FineVal.data(),g6FineVal.size());
     g6_strength_sweep(FH.n,FH.row,FH.col,g6FineVal,tag.c_str());
     g7_pmis_diagnostics(FH.n,FH.row,FH.col,g6FineVal,0.25,tag.c_str());
+  }else{
+    std::printf(
+      "NODALS_GPU_PM2_AUX_DIAGNOSTICS tag=%s "
+      "g6StrengthSweep=SKIP g7PmisDuplicate=SKIP "
+      "setupOnly=1 diagnosticEnv=NODALS_SETUP_AUTOTUNE "
+      "solverHierarchy=UNCHANGED status=PASS\n",
+      tag.c_str());
   }
   h6_select_coarse_spmv(G,H,tag.c_str(),200);
   if(effectiveAmgPowerIts>0){g5_gpu_spectrum_refresh(G,H);std::printf("NODALS_GPU_G10_CF_SPECTRUM_POLICY tag=%s hierarchy=%s smoother=%s policy=%s hostPower=COMPUTE gpuPower=COMPUTE powerIts=%d status=PASS\n",tag.c_str(),amgHierarchy.c_str(),amgSmoother.c_str(),amgSpectrumPolicy.c_str(),effectiveAmgPowerIts);}
