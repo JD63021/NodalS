@@ -31,16 +31,25 @@ struct G4CellPlanDevice {
   OperatorReal det;
   OperatorReal h2;
   OperatorReal invJ[9];
+  std::int8_t inletOpp;
+  OperatorReal inletSf[3];
+  std::uint8_t wallBasis[8];
 };
 
 __constant__ OperatorReal g4_diffT[8*8*3*3];
 __constant__ OperatorReal g4_centT[8*8*8*3];
 
 __device__ inline OperatorReal g4_coeff_cell(const G4CellPlanDevice&cp,int a,int d){
+  if(d<2 && cp.wallBasis[a])return OperatorReal(0);
   const OperatorReal g1=cp.invJ[d],g2=cp.invJ[3+d],g3=cp.invJ[6+d];
   const OperatorReal gl=(a%4)==0?-(g1+g2+g3):((a%4)==1?g1:((a%4)==2?g2:g3));
   const OperatorReal base=(cp.det/OperatorReal(6))*gl;
-  return (a<4)?base:OperatorReal(-27.0/20.0)*base;
+  OperatorReal v=(a<4)?base:OperatorReal(-27.0/20.0)*base;
+  if(cp.inletOpp>=0){
+    if(a<4 && a!=(int)cp.inletOpp)v-=cp.inletSf[d]/OperatorReal(3);
+    else if(a==4+(int)cp.inletOpp)v-=OperatorReal(9.0/20.0)*cp.inletSf[d];
+  }
+  return v;
 }
 __device__ inline StateReal g4_ref_value(const G4CellPlanDevice&cp,int a,int d,
                                          const StateReal*u0,const StateReal*u1,const StateReal*u2,

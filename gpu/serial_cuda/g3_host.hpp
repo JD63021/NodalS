@@ -26,7 +26,7 @@ struct MomentumSetupHost {
   int outlet_patch=-1;
 };
 
-inline MomentumSetupHost build_momentum_setup(const SerialTetMesh& M,int outlet_patch) {
+inline MomentumSetupHost build_momentum_setup(const SerialTetMesh& M,int outlet_patch,int inlet_patch=-1,bool dg_inlet=false,int wall_patch=-1,bool weak_wall=false) {
   MomentumSetupHost S; S.outlet_patch=outlet_patch;
   const std::int32_t nv=(std::int32_t)M.points.size(), nf=(std::int32_t)M.faces.size(), ni=(std::int32_t)M.neighbour.size();
   S.fixed.assign((std::size_t)nv+nf,0);
@@ -34,7 +34,8 @@ inline MomentumSetupHost build_momentum_setup(const SerialTetMesh& M,int outlet_
   // all wall/inlet boundary velocity entities are fixed; outlet entities remain free.
   for(std::int32_t f=ni;f<nf;++f) {
     const int p=M.face_patch[(std::size_t)f];
-    if(p!=outlet_patch) {
+    const bool freeBoundary=(p==outlet_patch)||(dg_inlet&&p==inlet_patch)||(weak_wall&&p==wall_patch);
+    if(!freeBoundary) {
       S.fixed[(std::size_t)nv+f]=1;
       for(auto v:M.faces[(std::size_t)f].v) S.fixed[(std::size_t)v]=1;
     }
