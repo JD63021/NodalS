@@ -1,0 +1,123 @@
+Gate 5E — 100D extreme-aspect-ratio solver/stabilization knobs
+
+This overlay does NOT change the mesh or the RANS model.
+
+RANS SUPG
+---------
+SUPG=0/1
+SUPG_TAU_SCALE=0.05
+SUPG_MAGIC=9.0
+SUPG_FORM=implicit
+SUPG_QUAD_POINTS=64
+SUPG_KERNEL=mixed64_8
+
+When SUPG=1 in a RANS run, SUPG is added to the current RANS momentum
+operator after central convection and before relaxation. The SUPG tau uses
+molecular nu only in this gate; lagged nu_t is not included in tau.
+
+Pressure AMG hierarchy
+----------------------
+AMG_HIERARCHY=cf|sa
+For CF, current coarsening support is PMIS only:
+  CF_COARSENING=pmis
+  CF_STRENGTH=classical-negative
+  CF_THETA=0.25
+  CF_INTERP=direct|exti
+  CF_PMAX=1..16
+  CF_AGGRESSIVE_FIRST=0|1
+  AMG_TERMINAL=1000
+
+Pressure AMG smoother
+---------------------
+AMG_SMOOTHER=jacobi|l1jacobi|cheb2|mcgs
+
+Jacobi:
+  AMG_JACOBI_OMEGA=0.7
+  AMG_JACOBI_FINE_SWEEPS=1..16
+  AMG_JACOBI_COARSE_SWEEPS=1..16
+
+Chebyshev:
+  AMG_CHEB_DEGREE=1..16
+  AMG_POWER_ITS=1..64
+  AMG_LAMBDA_SAFETY=1.5
+  AMG_LAMBDA_LOW_FRACTION=0.05
+  AMG_SPECTRUM_POLICY=auto|always|off
+  Chebyshev requires spectrum estimation, so do not use OFF with cheb2.
+
+MCGS:
+  AMG_MCGS_OMEGA=1.0
+  AMG_MCGS_FINE_SWEEPS=1..16
+  AMG_MCGS_COARSE_SWEEPS=1..16
+  AMG_MCGS_ORDER=symmetric|forward|backward
+  With PRESSURE_SOLVER=pcg, MCGS must be symmetric.
+
+Pressure Krylov / polynomial solver
+-----------------------------------
+PRESSURE_SOLVER=pcg|richardson|cheb
+P_RTOL=0.90
+P_ATOL=1e-12
+P_MAX=50
+
+Richardson:
+  PRESSURE_RICHARDSON_OMEGA=1.0
+
+Standalone pressure Chebyshev:
+  PRESSURE_CHEB_DEGREE=3
+  PRESSURE_POWER_ITS=6
+  PRESSURE_CHEB_LOW_FRACTION=0.05
+  PRESSURE_POWER_SAFETY=1.15
+
+Momentum fixed-work smoother
+----------------------------
+MOM_WORK=fgs1|altgs1|sgs1
+MOM_OMEGA=1.0
+
+fgs1   = one forward multicolor GS pass / SIMPLE iteration
+altgs1 = alternates forward and backward between SIMPLE iterations
+sgs1   = forward + backward pass every SIMPLE iteration
+
+MOM_RTOL/MOM_ATOL/MOM_DROP/MOM_MAX remain parsed but do not terminate an
+inner solve in these fixed-work modes.
+
+SIMPLE coupling
+---------------
+ALPHA_U=0.7
+ALPHA_P=1.0
+RAU_SCALE=2.0
+SIMPLE_TOL=1e-3
+MAX_OUTER=3000
+
+Suggested experiments
+---------------------
+
+A. SUPG only, otherwise successful 20D-style settings:
+  SUPG=1 ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+B. SUPG + stronger Jacobi smoothing:
+  SUPG=1 AMG_SMOOTHER=jacobi \
+  AMG_JACOBI_FINE_SWEEPS=2 AMG_JACOBI_COARSE_SWEEPS=2 \
+  ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+C. SUPG + Chebyshev degree 4:
+  SUPG=1 AMG_SMOOTHER=cheb2 AMG_CHEB_DEGREE=4 AMG_POWER_ITS=16 \
+  ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+D. SUPG + symmetric MCGS pressure AMG:
+  SUPG=1 AMG_SMOOTHER=mcgs \
+  AMG_MCGS_FINE_SWEEPS=1 AMG_MCGS_COARSE_SWEEPS=1 \
+  AMG_MCGS_ORDER=symmetric AMG_MCGS_OMEGA=1.0 \
+  ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+E. SUPG + SGS momentum, baseline Jacobi pressure AMG:
+  SUPG=1 MOM_WORK=sgs1 \
+  ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+F. Most robust first stress test:
+  SUPG=1 MOM_WORK=sgs1 \
+  AMG_SMOOTHER=mcgs AMG_MCGS_ORDER=symmetric \
+  AMG_MCGS_FINE_SWEEPS=1 AMG_MCGS_COARSE_SWEEPS=1 \
+  P_RTOL=0.5 P_MAX=100 \
+  ./RUN_RANS_GATE5D_100D_20DFINE_DLONG_FP32.sh
+
+All environment settings are printed before launch and the important active
+solver controls are also echoed by NODALS_GPU_RANS_SOLVER_CONTROLS.

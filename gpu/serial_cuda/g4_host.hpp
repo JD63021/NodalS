@@ -19,7 +19,9 @@ namespace nodals_gpu {
 struct PipeHost {
   int wall=-1,inlet=-1,outlet=-1;
   double cx=0,cy=0,zIn=0,zOut=0,R=0,D=0,L=0;
-  double bulk=1,profileScale=1,nu=0,re=20,inletArea=0,circleArea=0,hpGradient=0,hpDrop=0;
+  double bulk=1,profileScale=1,nu=0,re=20,inletArea=0,inletProjectedArea=0,circleArea=0,hpGradient=0,hpDrop=0;
+  double inletNormal[3]={0.0,0.0,-1.0};
+  double inletVelocity[3]={0.0,0.0,1.0};
 };
 inline Vec3d cross_g4(const Vec3d&a,const Vec3d&b){return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};}
 inline Vec3d sub_g4(const Vec3d&a,const Vec3d&b){return {a.x-b.x,a.y-b.y,a.z-b.z};}
@@ -40,8 +42,9 @@ inline PipeHost make_pipe_g4(const SerialTetMesh&M,double re,double bulk,const s
   P.cx=.5*(xmin+xmax);P.cy=.5*(ymin+ymax);P.zIn=zmin;P.zOut=zmax;P.L=zmax-zmin;P.R=.5*std::max(xmax-xmin,ymax-ymin);P.D=2*P.R;
   if(!(P.R>0&&P.L>0&&re>0&&bulk>0))throw std::runtime_error("G4 invalid pipe geometry");
   P.nu=bulk*P.D/re;P.circleArea=3.14159265358979323846*P.R*P.R;
-  auto pin=M.patches[(std::size_t)P.inlet];double raw=0;
-  for(int f=pin.start_face;f<pin.start_face+pin.n_faces;++f){const auto&F=M.faces[(std::size_t)f];Vec3d X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};double a=tri_area_g4(X[0],X[1],X[2]);P.inletArea+=a;raw+=a*triangle_avg_pipe_uz_g4(P,X);}
+  auto pin=M.patches[(std::size_t)P.inlet];double raw=0;Vec3d inletSf{};
+  for(int f=pin.start_face;f<pin.start_face+pin.n_faces;++f){const auto&F=M.faces[(std::size_t)f];Vec3d X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};double a=tri_area_g4(X[0],X[1],X[2]);P.inletArea+=a;raw+=a*triangle_avg_pipe_uz_g4(P,X);const Vec3d sf=face_outward_area_vector_g2(M,f);inletSf.x+=sf.x;inletSf.y+=sf.y;inletSf.z+=sf.z;}
+  P.inletProjectedArea=norm_g4(inletSf);if(!(P.inletProjectedArea>0.0))throw std::runtime_error("G4 degenerate inlet projected area");P.inletNormal[0]=inletSf.x/P.inletProjectedArea;P.inletNormal[1]=inletSf.y/P.inletProjectedArea;P.inletNormal[2]=inletSf.z/P.inletProjectedArea;for(int d=0;d<3;++d)P.inletVelocity[d]=-bulk*P.inletNormal[d];
   if(!(raw>0))throw std::runtime_error("G4 non-positive inlet flux");P.profileScale=bulk*P.inletArea/raw;P.hpGradient=32.0*P.nu*bulk/(P.D*P.D);P.hpDrop=P.hpGradient*P.L;return P;
 }
 
@@ -51,6 +54,9 @@ struct G4CellPlanHost {
   double det;
   double h2; // squared tetrahedron diameter; retained for SUPG tau(u)
   double invJ[9];
+  std::int8_t inletOpp=-1;
+  double inletSf[3]={0.0,0.0,0.0};
+  std::uint8_t wallBasis[8]={0,0,0,0,0,0,0,0};
 };
 struct G4SetupHost {
   MomentumSetupHost momMask;
@@ -58,6 +64,9 @@ struct G4SetupHost {
   ColoringHost coloring;
   PressureSetupHost pressure;
   PipeHost pipe;
+  bool dgInlet=false;
+  bool weakWall=false;
+  std::vector<unsigned char> wallEntity;
   std::vector<std::int32_t> fixedSlot;
   std::vector<std::array<double,3>> fixedValue;
   std::vector<G4CellPlanHost> cells;
@@ -65,6 +74,16 @@ struct G4SetupHost {
   std::vector<double> fixedDiv,volumes;
 };
 inline int fixed_slot_from_ref_g4(std::int32_t r){return -r-1;}
+inline double g4_effective_bcoeff_host(const G4CellPlanHost&cp,int a,int d){
+  if(d<2 && cp.wallBasis[a])return 0.0;
+  const double g1=cp.invJ[d],g2=cp.invJ[3+d],g3=cp.invJ[6+d];
+  const int i=(a<4)?a:a-4;
+  const double gl=i==0?-(g1+g2+g3):(i==1?g1:(i==2?g2:g3));
+  const double base=(cp.det/6.0)*gl;
+  double v=(a<4)?base:-(27.0/20.0)*base;
+  if(cp.inletOpp>=0){if(a<4 && a!=(int)cp.inletOpp)v-=cp.inletSf[d]/3.0;else if(a==4+(int)cp.inletOpp)v-=(9.0/20.0)*cp.inletSf[d];}
+  return v;
+}
 inline std::array<double,3> ref_value_host_g4(const G4SetupHost&S,std::int32_t r,const std::array<std::vector<double>,3>&U){
   if(r>=0)return {U[0][(std::size_t)r],U[1][(std::size_t)r],U[2][(std::size_t)r]};
   return S.fixedValue[(std::size_t)fixed_slot_from_ref_g4(r)];
@@ -106,6 +125,7 @@ inline void p5b_build_one_cell_plan(
   for(int a=0;a<8;++a){
     int g=S.momMask.g2free[(std::size_t)ent[a]];
     cp.ref[a]=(g>=0)?g:-(S.fixedSlot[(std::size_t)ent[a]]+1);
+    cp.wallBasis[a]=(!S.wallEntity.empty() && S.wallEntity[(std::size_t)ent[a]])?1:0;
   }
 
   auto t=M.tets[c];
@@ -137,6 +157,8 @@ inline void p5b_build_one_cell_plan(
   for(int j=0;j<3;++j)
     for(int d=0;d<3;++d)
       cp.invJ[3*j+d]=I[j][d];
+  cp.inletOpp=-1;cp.inletSf[0]=cp.inletSf[1]=cp.inletSf[2]=0.0;
+  if(S.dgInlet){int io=-1;Vec3d sf{};if(cell_inlet_face_g2(M,S.pipe.inlet,(int)c,io,sf)){cp.inletOpp=(std::int8_t)io;cp.inletSf[0]=sf.x;cp.inletSf[1]=sf.y;cp.inletSf[2]=sf.z;}}
 
   for(int a=0;a<8;++a)if(cp.ref[a]>=0){
     int r=cp.ref[a];
@@ -264,22 +286,31 @@ inline std::vector<G4CellPlanHost> p5b_build_cell_plans_dispatch(
   throw std::runtime_error("NODALS_G4_CELL_MODE must be reference, compare, or parallel");
 }
 
-inline G4SetupHost build_g4_setup(const SerialTetMesh&M,double re=20,double bulk=1.0,const std::string&wall="patch_0_0",const std::string&inlet="patch_2_0",const std::string&outlet="patch_1_0"){
-  G4SetupHost S;S.pipe=make_pipe_g4(M,re,bulk,wall,inlet,outlet);S.momMask=build_momentum_setup(M,S.pipe.outlet);
+inline G4SetupHost build_g4_setup(const SerialTetMesh&M,double re=20,double bulk=1.0,const std::string&wall="patch_0_0",const std::string&inlet="patch_2_0",const std::string&outlet="patch_1_0",bool dgInlet=false,bool weakWall=false){
+  G4SetupHost S;S.dgInlet=dgInlet;S.weakWall=weakWall;S.pipe=make_pipe_g4(M,re,bulk,wall,inlet,outlet);S.momMask=build_momentum_setup(M,S.pipe.outlet,S.pipe.inlet,dgInlet,S.pipe.wall,weakWall);
   const int nv=(int)M.points.size(),nf=(int)M.faces.size(),ni=(int)M.neighbour.size();
+  if(weakWall){
+    S.wallEntity.assign((std::size_t)nv+nf,0);
+    for(int f=ni;f<nf;++f)if(M.face_patch[(std::size_t)f]==S.pipe.wall){
+      S.wallEntity[(std::size_t)nv+f]=1;
+      for(int v:M.faces[(std::size_t)f].v)S.wallEntity[(std::size_t)v]=1;
+    }
+  }
   S.fixedSlot.assign((std::size_t)nv+nf,-1);int ns=0;for(std::size_t e=0;e<S.momMask.fixed.size();++e)if(S.momMask.fixed[e])S.fixedSlot[e]=ns++;
   S.fixedValue.assign((std::size_t)ns,{0.0,0.0,0.0});
   std::vector<unsigned char> onWall((std::size_t)nv,0),onInlet((std::size_t)nv,0);
   for(int f=ni;f<nf;++f){int p=M.face_patch[(std::size_t)f];if(p==S.pipe.wall)for(int v:M.faces[(std::size_t)f].v)onWall[(std::size_t)v]=1;if(p==S.pipe.inlet)for(int v:M.faces[(std::size_t)f].v)onInlet[(std::size_t)v]=1;}
-  for(int v=0;v<nv;++v)if(onInlet[(std::size_t)v]&&!onWall[(std::size_t)v]){int s=S.fixedSlot[(std::size_t)v];S.fixedValue[(std::size_t)s][2]=S.pipe.profileScale*pipe_ideal_uz_g4(S.pipe,M.points[(std::size_t)v].x,M.points[(std::size_t)v].y);}
-  auto pin=M.patches[(std::size_t)S.pipe.inlet];for(int f=pin.start_face;f<pin.start_face+pin.n_faces;++f){const auto&F=M.faces[(std::size_t)f];Vec3d X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};double exact=S.pipe.profileScale*triangle_avg_pipe_uz_g4(S.pipe,X);double vm=0;for(int j=0;j<3;++j){int sl=S.fixedSlot[(std::size_t)F.v[j]];vm+=S.fixedValue[(std::size_t)sl][2]/3.0;}int fs=S.fixedSlot[(std::size_t)nv+f];S.fixedValue[(std::size_t)fs][2]=(20.0/9.0)*(exact-vm);}
+  if(!dgInlet){
+    for(int v=0;v<nv;++v)if(onInlet[(std::size_t)v]&&!onWall[(std::size_t)v]){int s=S.fixedSlot[(std::size_t)v];S.fixedValue[(std::size_t)s][2]=S.pipe.profileScale*pipe_ideal_uz_g4(S.pipe,M.points[(std::size_t)v].x,M.points[(std::size_t)v].y);}
+    auto pin=M.patches[(std::size_t)S.pipe.inlet];for(int f=pin.start_face;f<pin.start_face+pin.n_faces;++f){const auto&F=M.faces[(std::size_t)f];Vec3d X[3]={M.points[(std::size_t)F.v[0]],M.points[(std::size_t)F.v[1]],M.points[(std::size_t)F.v[2]]};double exact=S.pipe.profileScale*triangle_avg_pipe_uz_g4(S.pipe,X);double vm=0;for(int j=0;j<3;++j){int sl=S.fixedSlot[(std::size_t)F.v[j]];vm+=S.fixedValue[(std::size_t)sl][2]/3.0;}int fs=S.fixedSlot[(std::size_t)nv+f];S.fixedValue[(std::size_t)fs][2]=(20.0/9.0)*(exact-vm);}
+  }
   S.topo=build_static_relaxed_momentum_csr(M,S.momMask,S.pipe.nu,1.0);S.coloring=greedy_csr_coloring(S.topo);
   S.cells=p5b_build_cell_plans_dispatch(M,S);
   for(auto&r:S.staticRhs)r.assign((std::size_t)S.topo.n,0.0);const auto&D=diffusion_tensor_g3();
   for(const auto&cp:S.cells){double I[3][3];for(int j=0;j<3;++j)for(int d=0;d<3;++d)I[j][d]=cp.invJ[3*j+d];double metric[3][3]={{0}};for(int j=0;j<3;++j)for(int k=0;k<3;++k)for(int d=0;d<3;++d)metric[j][k]+=I[j][d]*I[k][d];double K[8][8]={{0}};for(int a=0;a<8;++a)for(int b=0;b<8;++b){double v=0;for(int j=0;j<3;++j)for(int k=0;k<3;++k)v+=D.t[a][b][j][k]*metric[j][k];K[a][b]=S.pipe.nu*cp.det*v;}for(int a=0;a<8;++a)if(cp.ref[a]>=0){int r=cp.ref[a];for(int b=0;b<8;++b)if(cp.ref[b]<0){auto fv=S.fixedValue[(std::size_t)fixed_slot_from_ref_g4(cp.ref[b])];for(int d=0;d<3;++d)S.staticRhs[(std::size_t)d][(std::size_t)r]-=K[a][b]*fv[(std::size_t)d];}}}
-  S.pressure=build_pressure_setup(M,S.pipe.outlet);if(S.pressure.g2free!=S.momMask.g2free)throw std::runtime_error("G4 velocity numbering mismatch G2/G3");
+  S.pressure=build_pressure_setup(M,S.pipe.outlet,S.pipe.inlet,dgInlet,S.pipe.wall,weakWall);if(S.pressure.g2free!=S.momMask.g2free)throw std::runtime_error("G4 velocity numbering mismatch G2/G3");
   S.fixedDiv.assign(M.tets.size(),0.0);S.volumes.assign(M.tets.size(),0.0);
-  for(std::size_t c=0;c<M.tets.size();++c){const auto&bp=S.pressure.cells[c];S.volumes[c]=S.cells[c].det/6.0;double q=0;for(int a=0;a<8;++a)if(S.cells[c].ref[a]<0){auto fv=S.fixedValue[(std::size_t)fixed_slot_from_ref_g4(S.cells[c].ref[a])];for(int d=0;d<3;++d)q+=coeff(bp,a,d)*fv[(std::size_t)d];}S.fixedDiv[c]=q;}
+  for(std::size_t c=0;c<M.tets.size();++c){const auto&bp=S.pressure.cells[c];S.volumes[c]=S.cells[c].det/6.0;double q=0;if(dgInlet && bp.inletOpp>=0)q+=S.pipe.inletVelocity[0]*bp.inletSf[0]+S.pipe.inletVelocity[1]*bp.inletSf[1]+S.pipe.inletVelocity[2]*bp.inletSf[2];for(int a=0;a<8;++a)if(S.cells[c].ref[a]<0){auto fv=S.fixedValue[(std::size_t)fixed_slot_from_ref_g4(S.cells[c].ref[a])];for(int d=0;d<3;++d)q+=coeff(bp,a,d)*fv[(std::size_t)d];}S.fixedDiv[c]=q;}
   return S;
 }
 

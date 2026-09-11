@@ -14,7 +14,13 @@
 
 namespace nodals_gpu {
 
-struct CellBPlanHost { std::int32_t vel[8]; double base[12]; };
+struct CellBPlanHost {
+  std::int32_t vel[8];
+  double base[12];
+  std::int8_t inletOpp=-1;
+  double inletSf[3]={0.0,0.0,0.0};
+  std::uint8_t wallBasis[8]={0,0,0,0,0,0,0,0};
+};
 struct PressureSetupHost {
   std::vector<std::int32_t> g2free;
   std::vector<unsigned char> fixed;
@@ -24,16 +30,50 @@ struct PressureSetupHost {
   int outlet_patch=-1;
 };
 
-inline PressureSetupHost build_pressure_setup(const SerialTetMesh& M,int outlet_patch){
+inline Vec3d face_outward_area_vector_g2(const SerialTetMesh& M,int f){
+  const auto&F=M.faces[(std::size_t)f];
+  const Vec3d&a=M.points[(std::size_t)F.v[0]],&b=M.points[(std::size_t)F.v[1]],&c=M.points[(std::size_t)F.v[2]];
+  Vec3d u{b.x-a.x,b.y-a.y,b.z-a.z},v{c.x-a.x,c.y-a.y,c.z-a.z};
+  Vec3d sf{0.5*(u.y*v.z-u.z*v.y),0.5*(u.z*v.x-u.x*v.z),0.5*(u.x*v.y-u.y*v.x)};
+  const int cell=M.owner[(std::size_t)f];
+  Vec3d fc{(a.x+b.x+c.x)/3.0,(a.y+b.y+c.y)/3.0,(a.z+b.z+c.z)/3.0},cc{};
+  for(int i=0;i<4;++i){const auto&x=M.points[(std::size_t)M.tets[(std::size_t)cell][i]];cc.x+=0.25*x.x;cc.y+=0.25*x.y;cc.z+=0.25*x.z;}
+  const double dot=sf.x*(fc.x-cc.x)+sf.y*(fc.y-cc.y)+sf.z*(fc.z-cc.z);
+  if(dot<0.0){sf.x=-sf.x;sf.y=-sf.y;sf.z=-sf.z;}
+  return sf;
+}
+inline bool cell_inlet_face_g2(const SerialTetMesh&M,int inlet_patch,int c,int&opp,Vec3d&sf){
+  opp=-1;sf={};
+  if(inlet_patch<0)return false;
+  for(int i=0;i<4;++i){const int f=M.opp_face[(std::size_t)c][i];if(f<(int)M.neighbour.size())continue;if(M.face_patch[(std::size_t)f]!=inlet_patch)continue;if(opp>=0)throw std::runtime_error("tet has multiple DG inlet faces");opp=i;sf=face_outward_area_vector_g2(M,f);}
+  return opp>=0;
+}
+
+inline PressureSetupHost build_pressure_setup(const SerialTetMesh& M,int outlet_patch,int inlet_patch=-1,bool dg_inlet=false,int wall_patch=-1,bool weak_wall=false){
   PressureSetupHost S;S.outlet_patch=outlet_patch;const std::int32_t nv=(std::int32_t)M.points.size(),nf=(std::int32_t)M.faces.size(),ni=(std::int32_t)M.neighbour.size();S.fixed.assign((std::size_t)nv+nf,0);
-  for(std::int32_t f=ni;f<nf;++f){const int p=M.face_patch[f];if(p!=outlet_patch){S.fixed[(std::size_t)nv+f]=1;for(auto v:M.faces[f].v)S.fixed[(std::size_t)v]=1;}}
+  std::vector<unsigned char> wallEntity((std::size_t)nv+nf,0);
+  for(std::int32_t f=ni;f<nf;++f){
+    const int p=M.face_patch[(std::size_t)f];
+    if(weak_wall&&p==wall_patch){wallEntity[(std::size_t)nv+f]=1;for(auto v:M.faces[(std::size_t)f].v)wallEntity[(std::size_t)v]=1;}
+    const bool freeBoundary=(p==outlet_patch)||(dg_inlet&&p==inlet_patch)||(weak_wall&&p==wall_patch);
+    if(!freeBoundary){S.fixed[(std::size_t)nv+f]=1;for(auto v:M.faces[(std::size_t)f].v)S.fixed[(std::size_t)v]=1;}
+  }
   S.g2free.assign(S.fixed.size(),-1);std::int32_t next=0;for(std::int32_t v=0;v<nv;++v){if(S.fixed[v])++S.fixed_vertices;else{S.g2free[v]=next++;++S.free_vertices;}}for(std::int32_t f=0;f<nf;++f){if(S.fixed[(std::size_t)nv+f])++S.fixed_faces;else{S.g2free[(std::size_t)nv+f]=next++;++S.free_faces;}}S.free_vel=next;
   S.cells.resize(M.tets.size());
-  for(std::size_t c=0;c<M.tets.size();++c){auto &cp=S.cells[c];for(int i=0;i<4;++i)cp.vel[i]=S.g2free[(std::size_t)M.tets[c][i]];for(int i=0;i<4;++i)cp.vel[4+i]=S.g2free[(std::size_t)nv+M.opp_face[c][i]];auto t=M.tets[c];const Vec3d X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},I[3][3];double det=det3(J);if(!(det>0))throw std::runtime_error("non-positive tet orientation");inv3(J,I);double vol=det/6.0;const double gr[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};for(int i=0;i<4;++i)for(int d=0;d<3;++d){double g=0;for(int j=0;j<3;++j)g+=gr[i][j]*I[j][d];cp.base[3*i+d]=vol*g;}}
+  for(std::size_t c=0;c<M.tets.size();++c){auto &cp=S.cells[c];for(int i=0;i<4;++i){cp.vel[i]=S.g2free[(std::size_t)M.tets[c][i]];cp.wallBasis[i]=wallEntity[(std::size_t)M.tets[c][i]]?1:0;}for(int i=0;i<4;++i){const std::size_t e=(std::size_t)nv+M.opp_face[c][i];cp.vel[4+i]=S.g2free[e];cp.wallBasis[4+i]=wallEntity[e]?1:0;}auto t=M.tets[c];const Vec3d X[4]={M.points[t[0]],M.points[t[1]],M.points[t[2]],M.points[t[3]]};double J[3][3]={{X[1].x-X[0].x,X[2].x-X[0].x,X[3].x-X[0].x},{X[1].y-X[0].y,X[2].y-X[0].y,X[3].y-X[0].y},{X[1].z-X[0].z,X[2].z-X[0].z,X[3].z-X[0].z}},I[3][3];double det=det3(J);if(!(det>0))throw std::runtime_error("non-positive tet orientation");inv3(J,I);double vol=det/6.0;const double gr[4][3]={{-1,-1,-1},{1,0,0},{0,1,0},{0,0,1}};for(int i=0;i<4;++i)for(int d=0;d<3;++d){double g=0;for(int j=0;j<3;++j)g+=gr[i][j]*I[j][d];cp.base[3*i+d]=vol*g;}if(dg_inlet){int io=-1;Vec3d sf{};if(cell_inlet_face_g2(M,inlet_patch,(int)c,io,sf)){cp.inletOpp=(std::int8_t)io;cp.inletSf[0]=sf.x;cp.inletSf[1]=sf.y;cp.inletSf[2]=sf.z;}}}
   S.rAU.resize((std::size_t)S.free_vel);for(std::int32_t g=0;g<S.free_vel;++g){double q=(double)(g+1);S.rAU[g]=0.85+0.15*(0.5+0.5*std::sin(0.000731*q+0.2*std::cos(0.000113*q)));}
   return S;
 }
-inline double coeff(const CellBPlanHost& cp,int a,int d){const int i=(a<4)?a:a-4;return cp.base[3*i+d]*((a<4)?1.0:-(27.0/20.0));}
+inline double coeff(const CellBPlanHost& cp,int a,int d){
+  if(d<2 && cp.wallBasis[a])return 0.0;
+  const int i=(a<4)?a:a-4;
+  double v=cp.base[3*i+d]*((a<4)?1.0:-(27.0/20.0));
+  if(cp.inletOpp>=0){
+    if(a<4 && a!=(int)cp.inletOpp)v-=cp.inletSf[d]/3.0;
+    else if(a==4+(int)cp.inletOpp)v-=(9.0/20.0)*cp.inletSf[d];
+  }
+  return v;
+}
 inline void cpu_schur_apply(const PressureSetupHost& S,const std::vector<double>& x,std::vector<double>& y){if(x.size()!=S.cells.size())throw std::runtime_error("cpu schur x size");std::vector<double>v0(S.free_vel,0),v1(S.free_vel,0),v2(S.free_vel,0);for(std::size_t c=0;c<S.cells.size();++c){const auto&cp=S.cells[c];double p=x[c];for(int a=0;a<8;++a){int g=cp.vel[a];if(g<0)continue;v0[g]+=coeff(cp,a,0)*p;v1[g]+=coeff(cp,a,1)*p;v2[g]+=coeff(cp,a,2)*p;}}for(int g=0;g<S.free_vel;++g){v0[g]*=S.rAU[g];v1[g]*=S.rAU[g];v2[g]*=S.rAU[g];}y.assign(S.cells.size(),0);for(std::size_t c=0;c<S.cells.size();++c){auto&cp=S.cells[c];double s=0;for(int a=0;a<8;++a){int g=cp.vel[a];if(g<0)continue;s+=coeff(cp,a,0)*v0[g]+coeff(cp,a,1)*v1[g]+coeff(cp,a,2)*v2[g];}y[c]=s;}}
 inline std::vector<double> cpu_fine_diag(const PressureSetupHost& S){std::vector<double>d(S.cells.size(),0);for(std::size_t c=0;c<S.cells.size();++c){auto&cp=S.cells[c];double s=0;for(int a=0;a<8;++a){int g=cp.vel[a];if(g<0)continue;for(int k=0;k<3;++k){double b=coeff(cp,a,k);s+=S.rAU[g]*b*b;}}d[c]=s;}return d;}
 

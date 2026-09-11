@@ -12,6 +12,11 @@
 #include "h4_kernels.cuh"
 #include "h6_coarse_spmv.cuh"
 #include "h7_momentum_assembly.cuh"
+#include "h9_rans_mixlen.cuh"
+#include "h11_spalding_wall.cuh"
+#include "h11_wall_final_diag.hpp"
+#include "h13_convection_form_diag.hpp"
+#include "h10_dg_inlet.cuh"
 #include "h8_precomputed_b.cuh"
 #include "g6_cf_host.hpp"
 #include "g6_pmis_host.hpp"
@@ -34,6 +39,7 @@
 using namespace nodals_gpu;
 
 #include "h8_hp_diagnostics.inc"
+#include "h12_vtu_output.hpp"
 
 // PM2: production uses previously validated setup policies.
 // Set NODALS_SETUP_AUTOTUNE=1 to execute the legacy benchmark/parity selectors.
@@ -98,7 +104,7 @@ static std::vector<T> g5e_cast_vec(const std::vector<double>&v){
 }
 static std::vector<G4CellPlanDevice> g5e_cast_cells(const std::vector<G4CellPlanHost>&h){
   std::vector<G4CellPlanDevice>d(h.size());
-  for(std::size_t i=0;i<h.size();++i){for(int a=0;a<8;++a)d[i].ref[a]=h[i].ref[a];for(int a=0;a<64;++a)d[i].rowSlot[a]=h[i].rowSlot[a];d[i].det=(OperatorReal)h[i].det;for(int q=0;q<9;++q)d[i].invJ[q]=(OperatorReal)h[i].invJ[q];}
+  for(std::size_t i=0;i<h.size();++i){for(int a=0;a<8;++a){d[i].ref[a]=h[i].ref[a];d[i].wallBasis[a]=h[i].wallBasis[a];}for(int a=0;a<64;++a)d[i].rowSlot[a]=h[i].rowSlot[a];d[i].det=(OperatorReal)h[i].det;d[i].h2=(OperatorReal)h[i].h2;for(int q=0;q<9;++q)d[i].invJ[q]=(OperatorReal)h[i].invJ[q];d[i].inletOpp=h[i].inletOpp;for(int q=0;q<3;++q)d[i].inletSf[q]=(OperatorReal)h[i].inletSf[q];}
   return d;
 }
 
@@ -410,6 +416,7 @@ struct G4AMG {
   double lambdaSafety=1.5,lambdaLowFraction=.05;
   std::string smoother="cheb2";
   double jacobiOmega=.7;
+  int jacobiFineSweeps=1,jacobiCoarseSweeps=1;
   int mcgsFineSweeps=1,mcgsCoarseSweeps=1;
   double mcgsOmega=1.0;
   std::string mcgsOrder="symmetric";
@@ -431,14 +438,28 @@ struct G4AMG {
     for(int k=1;k<chebDegree;++k){fine->apply_pc(x,fine_tmp.data());g4_residual_kernel<<<g4grid(fine->nc),G4B>>>(fine->nc,b,fine_tmp.data(),fine_r.data());NODALS_CUDA(cudaGetLastError());double w=1.0/cheb_root(fineLambda,lo,k,chebDegree);g4_jacobi_add_kernel<<<g4grid(fine->nc),G4B>>>(fine->nc,w,fine_r.data(),fine->diag_pc.data(),x);NODALS_CUDA(cudaGetLastError());}
   }
   void jacobi_explicit(G4GpuCSR&A,const AMGReal*b,AMGReal*x){
-    g4_jacobi_zero_kernel<<<g4grid(A.n),G4B>>>(
-      A.n,jacobiOmega,b,(smoother=="l1jacobi"?A.l1.data():A.diag.data()),x);
+    const AMGReal*den=(smoother=="l1jacobi"?A.l1.data():A.diag.data());
+    g4_jacobi_zero_kernel<<<g4grid(A.n),G4B>>>(A.n,jacobiOmega,b,den,x);
     NODALS_CUDA(cudaGetLastError());
+    for(int sweep=1;sweep<jacobiCoarseSweeps;++sweep){
+      A.apply(x,A.tmp.data());
+      g4_residual_kernel<<<g4grid(A.n),G4B>>>(A.n,b,A.tmp.data(),A.r.data());
+      NODALS_CUDA(cudaGetLastError());
+      g4_jacobi_add_kernel<<<g4grid(A.n),G4B>>>(A.n,jacobiOmega,A.r.data(),den,x);
+      NODALS_CUDA(cudaGetLastError());
+    }
   }
   void jacobi_fine(const AMGReal*b,AMGReal*x){
-    g4_jacobi_zero_kernel<<<g4grid(fine->nc),G4B>>>(
-      fine->nc,jacobiOmega,b,(smoother=="l1jacobi"?fine_l1.data():fine->diag_pc.data()),x);
+    const AMGReal*den=(smoother=="l1jacobi"?fine_l1.data():fine->diag_pc.data());
+    g4_jacobi_zero_kernel<<<g4grid(fine->nc),G4B>>>(fine->nc,jacobiOmega,b,den,x);
     NODALS_CUDA(cudaGetLastError());
+    for(int sweep=1;sweep<jacobiFineSweeps;++sweep){
+      fine->apply_pc(x,fine_tmp.data());
+      g4_residual_kernel<<<g4grid(fine->nc),G4B>>>(fine->nc,b,fine_tmp.data(),fine_r.data());
+      NODALS_CUDA(cudaGetLastError());
+      g4_jacobi_add_kernel<<<g4grid(fine->nc),G4B>>>(fine->nc,jacobiOmega,fine_r.data(),den,x);
+      NODALS_CUDA(cudaGetLastError());
+    }
   }
 
   template<class RowT>
@@ -714,10 +735,17 @@ struct G4Gpu {
   bool h8PrecomputedContinuity=false;
   DeviceBuffer<G4CellPlanDevice> cells;
   DeviceBuffer<OperatorReal> bcoeff;DeviceBuffer<StateReal>fixed;
+  // Optional Gate-1 RANS state. mixXY stores [x0,y0,...,x3,y3] per cell.
+  // mixStats is four FP64 scalars: weighted ratio sum, weight, max nu_t/nu, max strain.
+  DeviceBuffer<OperatorReal> mixXY;DeviceBuffer<double>mixStats;
+  DeviceBuffer<H10DgInletFaceDevice> dgInletFaces;
+  DeviceBuffer<H11WallFaceDevice> wallFaces;
+  DeviceBuffer<std::uint8_t> wallMask;
+  DeviceBuffer<double> wallStats;
   DeviceBuffer<std::int64_t> row;DeviceBuffer<std::int32_t>col,diagPos,colorOffset,colorRows;DeviceBuffer<OperatorReal>diffusion,av,delta,diag,rau;
   DeviceBuffer<StateReal>u0,u1,u2,p,s0,s1,s2,c0,c1,c2,b0,b1,b2,fixedDiv,cont;
   DeviceBuffer<double>momSums;H2FineCSRDevice fineCsr;G4PressureFine pf;G4AMG amg;G4PCGWorkspace pcg;DeviceBuffer<double>dotScratch;
-  std::size_t bytes()const{return cells.bytes()+bcoeff.bytes()+fixed.bytes()+row.bytes()+col.bytes()+diagPos.bytes()+colorOffset.bytes()+colorRows.bytes()+diffusion.bytes()+av.bytes()+delta.bytes()+diag.bytes()+rau.bytes()+u0.bytes()+u1.bytes()+u2.bytes()+p.bytes()+s0.bytes()+s1.bytes()+s2.bytes()+c0.bytes()+c1.bytes()+c2.bytes()+b0.bytes()+b1.bytes()+b2.bytes()+fixedDiv.bytes()+cont.bytes()+momSums.bytes()+fineCsr.bytes()+pf.bytes()+amg.bytes()+pcg.x.bytes()+pcg.r.bytes()+pcg.z.bytes()+pcg.p.bytes()+pcg.q.bytes()+dotScratch.bytes();}
+  std::size_t bytes()const{return cells.bytes()+bcoeff.bytes()+fixed.bytes()+mixXY.bytes()+mixStats.bytes()+dgInletFaces.bytes()+wallFaces.bytes()+wallMask.bytes()+wallStats.bytes()+row.bytes()+col.bytes()+diagPos.bytes()+colorOffset.bytes()+colorRows.bytes()+diffusion.bytes()+av.bytes()+delta.bytes()+diag.bytes()+rau.bytes()+u0.bytes()+u1.bytes()+u2.bytes()+p.bytes()+s0.bytes()+s1.bytes()+s2.bytes()+c0.bytes()+c1.bytes()+c2.bytes()+b0.bytes()+b1.bytes()+b2.bytes()+fixedDiv.bytes()+cont.bytes()+momSums.bytes()+fineCsr.bytes()+pf.bytes()+amg.bytes()+pcg.x.bytes()+pcg.r.bytes()+pcg.z.bytes()+pcg.p.bytes()+pcg.q.bytes()+dotScratch.bytes();}
 };
 
 static std::vector<std::int32_t> diag_positions(const MomentumCSRHost&A){std::vector<std::int32_t>d((std::size_t)A.n,-1);for(int i=0;i<A.n;++i){auto first=A.col.begin()+A.row[(std::size_t)i],last=A.col.begin()+A.row[(std::size_t)i+1];auto it=std::lower_bound(first,last,i);if(it==last||*it!=i)throw std::runtime_error("G4 diag position absent");auto k=(std::int64_t)(it-A.col.begin());if(k>INT32_MAX)throw std::runtime_error("G4 diag position exceeds int32");d[(std::size_t)i]=(std::int32_t)k;}return d;}
@@ -757,6 +785,106 @@ static G4Gpu upload_all(const G4SetupHost&S,const SAHierarchyHost&H,const std::v
   auto tinv=g5e_cast_vec<AMGReal>(H.terminal_inv);G.amg.terminal_inv.allocate(tinv.size());G.amg.terminal_inv.upload(tinv.data(),tinv.size());
   for(auto*p:{&G.pcg.x,&G.pcg.r,&G.pcg.z,&G.pcg.p,&G.pcg.q})p->allocate(G.nc);G.dotScratch.allocate(1);
   NODALS_CUDA(cudaDeviceSynchronize());return G;
+}
+
+
+static void h9_upload_mixlen_geometry(G4Gpu&G,const SerialTetMesh&M){
+  if((int)M.tets.size()!=G.nc)throw std::runtime_error("Gate1 mixlen geometry cell mismatch");
+  std::vector<OperatorReal> xy((std::size_t)G.nc*8);
+  for(int c=0;c<G.nc;++c){
+    const auto&t=M.tets[(std::size_t)c];
+    for(int i=0;i<4;++i){
+      const auto&X=M.points[(std::size_t)t[i]];
+      xy[(std::size_t)c*8+2*i+0]=OperatorReal(X.x);
+      xy[(std::size_t)c*8+2*i+1]=OperatorReal(X.y);
+    }
+  }
+  G.mixXY.allocate(xy.size());G.mixXY.upload(xy.data(),xy.size());
+  G.mixStats.allocate(4);NODALS_CUDA(cudaMemset(G.mixStats.data(),0,G.mixStats.bytes()));
+}
+
+static void h9_apply_mixlen(
+    G4Gpu&G,const PipeHost&P,double scale,int blocks)
+{
+  if(G.mixXY.size()!=(std::size_t)G.nc*8 || G.mixStats.size()!=4)
+    throw std::runtime_error("Gate1 mixlen device geometry not initialized");
+  NODALS_CUDA(cudaMemsetAsync(G.mixStats.data(),0,G.mixStats.bytes()));
+  h9_nikuradse_mixlen64_warp_cell_kernel<<<blocks,H7_BLOCK>>>(
+    G.cells.data(),G.nc,G.mixXY.data(),G.row.data(),G.fixed.data(),
+    G.u0.data(),G.u1.data(),G.u2.data(),
+    OperatorReal(P.cx),OperatorReal(P.cy),OperatorReal(P.R),
+    OperatorReal(P.nu),OperatorReal(scale),
+    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data(),G.mixStats.data());
+  NODALS_CUDA(cudaGetLastError());
+}
+
+static std::array<double,4> h9_download_mixlen_stats(const G4Gpu&G){
+  std::array<double,4> q{{0,0,0,0}};
+  if(G.mixStats.size()==4)G.mixStats.download(q.data(),q.size());
+  return q;
+}
+
+
+static void h10_upload_dg_inlet(G4Gpu&G,const SerialTetMesh&M,const G4SetupHost&S){
+  const auto h=h10_build_inlet_faces(M,S);
+  G.dgInletFaces.allocate(h.size());
+  if(!h.empty())G.dgInletFaces.upload(h.data(),h.size());
+}
+static void h10_initialize_plug(G4Gpu&G,const SerialTetMesh&M,const G4SetupHost&S){
+  std::vector<StateReal> u0((std::size_t)G.nv,StateReal(0)),u1((std::size_t)G.nv,StateReal(0)),u2((std::size_t)G.nv,StateReal(0));
+  long long set=0;
+  for(std::size_t v=0;v<M.points.size();++v){const int g=S.momMask.g2free[v];if(g<0)continue;u0[(std::size_t)g]=StateReal(S.pipe.inletVelocity[0]);u1[(std::size_t)g]=StateReal(S.pipe.inletVelocity[1]);u2[(std::size_t)g]=StateReal(S.pipe.inletVelocity[2]);++set;}
+  G.u0.upload(u0.data(),u0.size());G.u1.upload(u1.data(),u1.size());G.u2.upload(u2.data(),u2.size());
+  std::printf("NODALS_GPU_RANS_GATE2_INIT mode=plug freeP1VerticesSet=%lld freeBF3Init=zero Uhat=[%.12e,%.12e,%.12e] wallBC=%s setupH2D=YES status=PASS\n",set,S.pipe.inletVelocity[0],S.pipe.inletVelocity[1],S.pipe.inletVelocity[2],S.weakWall?"WEAK_SPALDING_AXIAL_UXUY_CLAMP":"STRONG_NO_SLIP");
+}
+static void h10_apply_dg_inlet(G4Gpu&G,const PipeHost&P,bool mixingLength,double mixlenScale){
+  if(!G.dgInletFaces.size())return;
+  h10_dg_inlet_kernel<<<g4grid(G.dgInletFaces.size()),G4B>>>(
+    G.dgInletFaces.data(),(int)G.dgInletFaces.size(),G.cells.data(),G.row.data(),G.fixed.data(),
+    G.u0.data(),G.u1.data(),G.u2.data(),G.mixXY.data(),mixingLength?1:0,
+    OperatorReal(P.cx),OperatorReal(P.cy),OperatorReal(P.R),OperatorReal(P.nu),OperatorReal(mixlenScale),
+    OperatorReal(P.inletVelocity[0]),OperatorReal(P.inletVelocity[1]),OperatorReal(P.inletVelocity[2]),
+    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
+  NODALS_CUDA(cudaGetLastError());
+}
+
+static std::string g_h11_wall_traction_mode="spalding";
+static double g_h11_wall_reference_f=0.0284003;
+static std::string g_h11_wall_diag_csv;
+
+static void h11_upload_wall(G4Gpu&G,const SerialTetMesh&M,const G4SetupHost&S){
+  const auto f=h11_build_wall_faces(M,S,0.25);
+  const auto m=h11_build_wall_row_mask(S);
+  G.wallFaces.allocate(f.size());if(!f.empty())G.wallFaces.upload(f.data(),f.size());
+  G.wallMask.allocate(m.size());if(!m.empty())G.wallMask.upload(m.data(),m.size());
+  G.wallStats.allocate(8);NODALS_CUDA(cudaMemset(G.wallStats.data(),0,G.wallStats.bytes()));
+}
+static void h11_apply_wall(G4Gpu&G,const PipeHost&P){
+  if(!G.wallFaces.size())return;
+  NODALS_CUDA(cudaMemsetAsync(G.wallStats.data(),0,G.wallStats.bytes()));
+  if(g_h11_wall_traction_mode=="reference_shear"){
+    const double tauRef=g_h11_wall_reference_f*P.bulk*P.bulk/8.0;
+    const double slipFloor=std::max(1e-12,1e-6*std::abs(P.bulk));
+    h11_reference_shear_wall_kernel<<<g4grid(G.wallFaces.size()),G4B>>>(
+      G.wallFaces.data(),(int)G.wallFaces.size(),G.cells.data(),G.row.data(),G.fixed.data(),G.u2.data(),
+      P.nu,tauRef,slipFloor,G.av.data(),G.c2.data(),G.wallStats.data());
+  }else{
+    h11_spalding_wall_kernel<<<g4grid(G.wallFaces.size()),G4B>>>(
+      G.wallFaces.data(),(int)G.wallFaces.size(),G.cells.data(),G.row.data(),G.fixed.data(),G.u2.data(),
+      P.nu,0.4,5.5,0.5,G.av.data(),G.c2.data(),G.wallStats.data());
+  }
+  NODALS_CUDA(cudaGetLastError());
+}
+static std::array<double,8> h11_download_wall_stats(const G4Gpu&G){
+  std::array<double,8> q{{0,0,0,0,0,0,0,0}};
+  if(G.wallStats.size()==8)G.wallStats.download(q.data(),q.size());
+  return q;
+}
+static void h11_clamp_transverse_rhs_state(G4Gpu&G){
+  if(!G.wallMask.size())return;
+  h11_clamp_transverse_rhs_state_kernel<<<g4grid(G.nv),G4B>>>(
+    G.nv,G.wallMask.data(),G.b0.data(),G.b1.data(),G.u0.data(),G.u1.data());
+  NODALS_CUDA(cudaGetLastError());
 }
 
 static double g5_power_fine_gpu(G4Gpu&G,int its,double safety){
@@ -968,18 +1096,65 @@ static void h7_apply_finalize_warp(G4Gpu&G,double alphaU,int blocks){
   NODALS_CUDA(cudaGetLastError());
 }
 
-static void assemble_live(G4Gpu&G,double alphaU){
+static const char* h8_rans_supg_kernel_mode()
+{
+  const char*e=std::getenv("NODALS_GPU_SUPG_KERNEL");
+  return (e&&*e)?e:"mixed64_8";
+}
+
+static void h8_rans_apply_supg(
+    G4Gpu&G,int blocks,double nu,double tauScale,double magic)
+{
+  const std::string mode=h8_rans_supg_kernel_mode();
+#define H8_RANS_SUPG_LAUNCH(W,CF,AF) \
+  h7_supg64_r2_kernel<W,CF,AF><<<blocks,32*(W)>>>( \
+    G.cells.data(),G.nc,G.row.data(),G.fixed.data(), \
+    G.u0.data(),G.u1.data(),G.u2.data(), \
+    OperatorReal(nu),OperatorReal(tauScale),OperatorReal(magic), \
+    G.av.data(),G.c0.data(),G.c1.data(),G.c2.data())
+
+  if(mode=="reference"){
+    h7_supg64_warp_cell_kernel<<<blocks,H7_BLOCK>>>(
+      G.cells.data(),G.nc,G.row.data(),G.fixed.data(),
+      G.u0.data(),G.u1.data(),G.u2.data(),
+      OperatorReal(nu),OperatorReal(tauScale),OperatorReal(magic),
+      G.av.data(),G.c0.data(),G.c1.data(),G.c2.data());
+  }
+  else if(mode=="exact8")      H8_RANS_SUPG_LAUNCH(8,false,false);
+  else if(mode=="exact16")     H8_RANS_SUPG_LAUNCH(16,false,false);
+  else if(mode=="exact32")     H8_RANS_SUPG_LAUNCH(32,false,false);
+  else if(mode=="mixed64_8")   H8_RANS_SUPG_LAUNCH(8,true,false);
+  else if(mode=="mixed64_16")  H8_RANS_SUPG_LAUNCH(16,true,false);
+  else if(mode=="mixed64_32")  H8_RANS_SUPG_LAUNCH(32,true,false);
+  else if(mode=="mixed32_8")   H8_RANS_SUPG_LAUNCH(8,true,true);
+  else if(mode=="mixed32_16")  H8_RANS_SUPG_LAUNCH(16,true,true);
+  else if(mode=="mixed32_32")  H8_RANS_SUPG_LAUNCH(32,true,true);
+  else throw std::runtime_error("invalid NODALS_GPU_SUPG_KERNEL");
+#undef H8_RANS_SUPG_LAUNCH
+  NODALS_CUDA(cudaGetLastError());
+}
+
+static void assemble_live(
+    G4Gpu&G,double alphaU,double rauScale,bool mixingLength,bool dgInlet,bool weakWall,bool supg,const PipeHost&P,
+    double mixlenScale,int mixlenBlocks,int supgBlocks,double supgTauScale,double supgMagic){
   h7_reset_momentum_physical(G);
+  if(mixingLength)h9_apply_mixlen(G,P,mixlenScale,mixlenBlocks);
+  if(weakWall)h11_apply_wall(G,P);
+  if(dgInlet)h10_apply_dg_inlet(G,P,mixingLength,mixlenScale);
   if(G.h7WarpConvection)
     h7_apply_convection_warp(G,G.h7ConvectionBlocks);
   else
     h7_apply_convection_scalar(G);
+  if(supg)h8_rans_apply_supg(G,supgBlocks,P.nu,supgTauScale,supgMagic);
 
   if(G.h7WarpFinalize)
     h7_apply_finalize_warp(G,alphaU,G.h7FinalizeBlocks);
   else
     h7_apply_finalize_scalar(G,alphaU);
+  if(rauScale!=1.0) device_scale(G.rau.data(),(std::size_t)G.nv,OperatorReal(rauScale));
 }
+
+#include "h14_discrete_momentum_budget.hpp"
 
 template<class T>
 static double h7_rel_diff(
@@ -1504,7 +1679,10 @@ static void forward_mcgs_fixed(G4Gpu&G,const ColoringHost&C,double omega){
   int q=h0_begin(H0_MOM_FORWARD);
   for(int c=0;c<C.ncolors;++c){
     int s=C.offset[(std::size_t)c],n=C.offset[(std::size_t)c+1]-s;
-    if(n)g4_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),1,1,1);
+    if(n){
+      if(G.wallMask.size())h11_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),G.wallMask.data());
+      else g4_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),1,1,1);
+    }
   }
   NODALS_CUDA(cudaGetLastError());h0_end(q);
 }
@@ -1512,7 +1690,10 @@ static void backward_mcgs_fixed(G4Gpu&G,const ColoringHost&C,double omega){
   int q=h0_begin(H0_MOM_BACKWARD);
   for(int c=C.ncolors-1;c>=0;--c){
     int s=C.offset[(std::size_t)c],n=C.offset[(std::size_t)c+1]-s;
-    if(n)g4_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),1,1,1);
+    if(n){
+      if(G.wallMask.size())h11_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),G.wallMask.data());
+      else g4_mcgs_color_kernel<<<g4grid(n),G4B>>>(n,G.colorRows.data()+s,G.row.data(),G.col.data(),G.av.data(),G.diag.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),OperatorReal(omega),1,1,1);
+    }
   }
   NODALS_CUDA(cudaGetLastError());h0_end(q);
 }
@@ -1525,12 +1706,18 @@ static const char* fixed_momentum_work(G4Gpu&G,const ColoringHost&C,double omega
     if(outer&1){forward_mcgs_fixed(G,C,omega);return "FWD";}
     backward_mcgs_fixed(G,C,omega);return "BWD";
   }
+  if(mode=="sgs1"){
+    forward_mcgs_fixed(G,C,omega);
+    backward_mcgs_fixed(G,C,omega);
+    return "FWD+BWD";
+  }
   throw std::runtime_error("H4 unknown fixed momentum work mode");
 }
 static std::array<double,3> momentum_initial_rel_audit(G4Gpu&G){
   int qp=h0_begin(H0_MOM_NORM_INITIAL);
   NODALS_CUDA(cudaMemset(G.momSums.data(),0,G.momSums.bytes()));
-  g4_mom_norms_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.row.data(),G.col.data(),G.av.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.momSums.data());
+  if(G.wallMask.size())h11_mom_norms_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.row.data(),G.col.data(),G.av.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.wallMask.data(),G.momSums.data());
+  else g4_mom_norms_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.row.data(),G.col.data(),G.av.data(),G.b0.data(),G.b1.data(),G.b2.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.momSums.data());
   NODALS_CUDA(cudaGetLastError());
   double h[6];G.momSums.download(h,6);h0_end(qp);
   std::array<double,3>q{};
@@ -1559,16 +1746,30 @@ static void h0_print_profile(const char*tag,int outer,double pressureStageMs,dou
 }
 
 int main(int argc,char**argv){try{
-  std::string mesh,tag="h8",wall="patch_0_0",inlet="patch_2_0",outlet="patch_1_0";
+  std::string mesh,tag="h8",wall="patch_0_0",inlet="patch_2_0",outlet="patch_1_0",vtuOut;
   double re=20,bulk=1,simpleTol=1e-6;
-  double alphaU=.5,alphaP=.5;
+  double alphaU=.5,alphaP=.5,rauScale=1.0;
   double momRtol=1e-6,momAtol=1e-12,momDrop=.1,momOmega=1.0;
   double pRtol=.5,pAtol=1e-12;
   double snapshotTol=5e-6;
+  bool mixingLength=false;
+  bool dgInlet=false;
+  bool weakWall=false;
+  bool supg=false;
+  std::string wallTractionMode="spalding",wallDiagCsv;
+  double wallReferenceF=0.0284003;
+  double mixlenScale=1.0;
+  double supgTauScale=0.05,supgMagic=9.0;
+  int supgQuadPoints=64;
+  std::string supgForm="implicit";
   int maxOuter=2500,momMax=20000,pMax=20;
   int fineCsrRefreshEvery=1;
   std::string momentumWork="fgs1",runMode="fixed10",amgSmoother="cheb2",amgHierarchy="sa",cfInterp="direct",pressureSolver="pcg",cfCoarsening="pmis",cfStrength="classical-negative",amgSpectrumPolicy="auto";
   double amgJacobiOmega=.7;
+  int amgJacobiFineSweeps=1,amgJacobiCoarseSweeps=1;
+  double amgMcgsOmega=1.0;
+  int amgMcgsFineSweeps=1,amgMcgsCoarseSweeps=1;
+  std::string amgMcgsOrder="symmetric";
   double pressureRichardsonOmega=1.0;
   double pressureChebLowFraction=.05;
   double pressurePowerSafety=1.15;
@@ -1585,13 +1786,27 @@ int main(int argc,char**argv){try{
 
   for(int i=1;i<argc;++i){std::string a=argv[i];
     if(a=="--mesh"&&i+1<argc)mesh=argv[++i];else if(a=="--tag"&&i+1<argc)tag=argv[++i];
+    else if(a=="--vtu-out"&&i+1<argc)vtuOut=argv[++i];
     else if(a=="--wall"&&i+1<argc)wall=argv[++i];else if(a=="--inlet"&&i+1<argc)inlet=argv[++i];
     else if(a=="--outlet"&&i+1<argc)outlet=argv[++i];else if(a=="--re"&&i+1<argc)re=std::atof(argv[++i]);
     else if(a=="--bulk"&&i+1<argc)bulk=std::atof(argv[++i]);
+    else if(a=="--mixing-length"&&i+1<argc)mixingLength=std::atoi(argv[++i])!=0;
+    else if(a=="--mixlen-scale"&&i+1<argc)mixlenScale=std::atof(argv[++i]);
+    else if(a=="--dg-inlet"&&i+1<argc)dgInlet=std::atoi(argv[++i])!=0;
+    else if(a=="--weak-wall"&&i+1<argc)weakWall=std::atoi(argv[++i])!=0;
+    else if(a=="--wall-traction-mode"&&i+1<argc)wallTractionMode=argv[++i];
+    else if(a=="--wall-reference-f"&&i+1<argc)wallReferenceF=std::atof(argv[++i]);
+    else if(a=="--wall-diag-csv"&&i+1<argc)wallDiagCsv=argv[++i];
+    else if(a=="--supg"&&i+1<argc)supg=std::atoi(argv[++i])!=0;
+    else if(a=="--supg-tau-scale"&&i+1<argc)supgTauScale=std::atof(argv[++i]);
+    else if(a=="--supg-magic"&&i+1<argc)supgMagic=std::atof(argv[++i]);
+    else if(a=="--supg-form"&&i+1<argc)supgForm=argv[++i];
+    else if(a=="--supg-quad-points"&&i+1<argc)supgQuadPoints=std::atoi(argv[++i]);
     else if(a=="--simple-tol"&&i+1<argc)simpleTol=std::atof(argv[++i]);
     else if(a=="--max-outer"&&i+1<argc)maxOuter=std::atoi(argv[++i]);
     else if(a=="--alpha-u"&&i+1<argc)alphaU=std::atof(argv[++i]);
     else if(a=="--alpha-p"&&i+1<argc)alphaP=std::atof(argv[++i]);
+    else if(a=="--rau-scale"&&i+1<argc)rauScale=std::atof(argv[++i]);
     else if(a=="--mom-rtol"&&i+1<argc)momRtol=std::atof(argv[++i]);
     else if(a=="--mom-atol"&&i+1<argc)momAtol=std::atof(argv[++i]);
     else if(a=="--mom-drop"&&i+1<argc)momDrop=std::atof(argv[++i]);
@@ -1623,15 +1838,31 @@ int main(int argc,char**argv){try{
     else if(a=="--pressure-power-safety"&&i+1<argc)pressurePowerSafety=std::atof(argv[++i]);
     else if(a=="--amg-smoother"&&i+1<argc)amgSmoother=argv[++i];
     else if(a=="--amg-jacobi-omega"&&i+1<argc)amgJacobiOmega=std::atof(argv[++i]);
+    else if(a=="--amg-jacobi-fine-sweeps"&&i+1<argc)amgJacobiFineSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-jacobi-coarse-sweeps"&&i+1<argc)amgJacobiCoarseSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-mcgs-omega"&&i+1<argc)amgMcgsOmega=std::atof(argv[++i]);
+    else if(a=="--amg-mcgs-fine-sweeps"&&i+1<argc)amgMcgsFineSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-mcgs-coarse-sweeps"&&i+1<argc)amgMcgsCoarseSweeps=std::atoi(argv[++i]);
+    else if(a=="--amg-mcgs-order"&&i+1<argc)amgMcgsOrder=argv[++i];
     else if(a=="--momentum-work"&&i+1<argc)momentumWork=argv[++i];
     else if(a=="--run-mode"&&i+1<argc)runMode=argv[++i];
     else throw std::runtime_error("H8 usage error");
   }
   if(mesh.empty())throw std::runtime_error("--mesh required");
   if(!(simpleTol>0.0) || maxOuter<1)throw std::runtime_error("H8 invalid SIMPLE controls");
+  if(!(mixlenScale>=0.0) || !std::isfinite(mixlenScale))throw std::runtime_error("Gate1 mixlen-scale must be finite and >=0");
   if(!(alphaU>0.0&&alphaU<=1.0) || !(alphaP>0.0&&alphaP<=1.0))throw std::runtime_error("H8 alpha-u/alpha-p must be in (0,1]");
+  if(!(rauScale>0.0) || !std::isfinite(rauScale))throw std::runtime_error("H8 rau-scale must be finite and > 0");
   if(momRtol<0.0 || momAtol<0.0 || momDrop<0.0 || momMax<1 || !(momOmega>0.0))throw std::runtime_error("H8 invalid momentum controls");
   if(pRtol<0.0 || pAtol<0.0 || pMax<1)throw std::runtime_error("H8 invalid pressure controls");
+  if(wallTractionMode!="spalding"&&wallTractionMode!="reference_shear")throw std::runtime_error("Gate5I wall-traction-mode must be spalding or reference_shear");
+  if(!(wallReferenceF>0.0)&&wallTractionMode=="reference_shear")throw std::runtime_error("Gate5I wall-reference-f must be >0 for reference_shear");
+  if(wallTractionMode=="reference_shear"&&!weakWall)throw std::runtime_error("Gate5I reference_shear requires --weak-wall 1");
+  g_h11_wall_traction_mode=wallTractionMode;g_h11_wall_reference_f=wallReferenceF;g_h11_wall_diag_csv=wallDiagCsv;
+  if(supg && !(supgTauScale>0.0))throw std::runtime_error("H8 RANS SUPG tau scale must be positive");
+  if(supg && !(supgMagic>0.0))throw std::runtime_error("H8 RANS SUPG magic must be positive");
+  if(supg && supgForm!="implicit")throw std::runtime_error("H8 RANS SUPG currently supports form=implicit");
+  if(supg && supgQuadPoints!=64)throw std::runtime_error("H8 RANS SUPG currently supports quad-points=64");
   if(amgHierarchy!="sa"&&amgHierarchy!="cf")throw std::runtime_error("H8 amg-hierarchy must be sa or cf");
   if(!(cfTheta>0.0&&cfTheta<=1.0))throw std::runtime_error("H8 cf-theta must be in (0,1]");
   if(cfPmax<1||cfPmax>16)throw std::runtime_error("H8 cf-pmax must be in [1,16]");
@@ -1666,21 +1897,29 @@ int main(int argc,char**argv){try{
     throw std::runtime_error("G12 Cheb low fraction must be in (0,1)");
   if(!(pressurePowerSafety>1.0&&pressurePowerSafety<=2.0))
     throw std::runtime_error("G12 pressure power safety must be in (1,2]");
-  if(amgSmoother!="cheb2"&&amgSmoother!="jacobi"&&amgSmoother!="l1jacobi")throw std::runtime_error("H8 amg-smoother must be cheb2, jacobi or l1jacobi");
+  if(amgSmoother!="cheb2"&&amgSmoother!="jacobi"&&amgSmoother!="l1jacobi"&&amgSmoother!="mcgs")throw std::runtime_error("H8 amg-smoother must be cheb2, jacobi, l1jacobi or mcgs");
   if(!(amgJacobiOmega>0.0&&amgJacobiOmega<=2.0))throw std::runtime_error("H8 amg-jacobi-omega must be in (0,2]");
+  if(amgJacobiFineSweeps<1||amgJacobiFineSweeps>16||amgJacobiCoarseSweeps<1||amgJacobiCoarseSweeps>16)throw std::runtime_error("H8 Jacobi sweeps must be in [1,16]");
+  if(!(amgMcgsOmega>0.0&&amgMcgsOmega<2.0))throw std::runtime_error("H8 amg-mcgs-omega must be in (0,2)");
+  if(amgMcgsFineSweeps<1||amgMcgsFineSweeps>16||amgMcgsCoarseSweeps<1||amgMcgsCoarseSweeps>16)throw std::runtime_error("H8 MCGS sweeps must be in [1,16]");
+  if(amgMcgsOrder!="symmetric"&&amgMcgsOrder!="forward"&&amgMcgsOrder!="backward")throw std::runtime_error("H8 amg-mcgs-order must be symmetric, forward or backward");
+  if(pressureSolver=="pcg"&&amgSmoother=="mcgs"&&amgMcgsOrder!="symmetric")throw std::runtime_error("H8 PCG requires symmetric MCGS");
   if(!(snapshotTol>0.0))throw std::runtime_error("H8 snapshot tolerance must be positive");
   if(fineCsrRefreshEvery!=1)throw std::runtime_error("H8 requires fine CSR refreshEvery=1");
-  if(momentumWork!="fgs1")throw std::runtime_error("H8 requires momentum-work=fgs1");
+  if(momentumWork!="fgs1"&&momentumWork!="altgs1"&&momentumWork!="sgs1")throw std::runtime_error("H8 momentum-work must be fgs1, altgs1 or sgs1");
   if(!(runMode=="fixed10"||runMode=="converge"))throw std::runtime_error("H8 run-mode must be fixed10 or converge");
   if(runMode=="fixed10"&&maxOuter!=10)throw std::runtime_error("H8 fixed10 requires maxOuter=10");
   const bool physicalUseCurrentCSR=true;
 
   NODALS_CUDA(cudaSetDevice(0));cudaDeviceProp prop{};NODALS_CUDA(cudaGetDeviceProperties(&prop,0));upload_tensors();NODALS_CUDA(cudaDeviceSynchronize());
   const auto memBaseline=device_memory_info();
-  auto M=load_foam_tet_mesh(mesh);auto S=build_g4_setup(M,re,bulk,wall,inlet,outlet);
+  auto M=load_foam_tet_mesh(mesh);auto S=build_g4_setup(M,re,bulk,wall,inlet,outlet,dgInlet,weakWall);
   std::array<std::vector<double>,3>U0;for(auto&u:U0)u.assign((std::size_t)S.topo.n,0.0);
+  if(dgInlet){for(std::size_t v=0;v<M.points.size();++v){const int g=S.momMask.g2free[v];if(g<0)continue;for(int d=0;d<3;++d)U0[(std::size_t)d][(std::size_t)g]=S.pipe.inletVelocity[d];}}
   std::vector<double>hostA,initDelta;std::array<std::vector<double>,3>hostConv;
-  host_assemble_central_g4(S,U0,hostA,hostConv);auto initRau=host_finalize_relax_g4(S,hostA,alphaU,&initDelta);S.pressure.rAU=initRau;
+  host_assemble_central_g4(S,U0,hostA,hostConv);auto initRau=host_finalize_relax_g4(S,hostA,alphaU,&initDelta);
+  if(rauScale!=1.0) for(double &q:initRau) q*=rauScale;
+  S.pressure.rAU=initRau;
   auto FH=build_h2_fine_csr_host(S);
   int effectiveAmgPowerIts=0;
   if(amgSpectrumPolicy=="always") effectiveAmgPowerIts=amgPowerIts;
@@ -1710,11 +1949,38 @@ int main(int argc,char**argv){try{
   std::printf("NODALS_GPU_H8_SETUP tag=%s cells=%zu freeVel=%d momentumNnz=%zu colors=%d hierarchyLevels=%zu terminal=%d transfer0Nnz=%zu cellPlanHostBytes=%zu cellPlanDeviceBytes=%zu baselineUsedMiB=%.3f totalMiB=%.3f status=PASS\n",
     tag.c_str(),M.tets.size(),S.topo.n,S.topo.val.size(),S.coloring.ncolors,H.csr.size(),H.terminal_n,H.P.empty()?0:H.P[0].val.size(),sizeof(G4CellPlanHost),sizeof(G4CellPlanDevice),g5_used_mib(memBaseline),(double)memBaseline.total_bytes/(1024.0*1024.0));
   std::printf("NODALS_GPU_H8_MOMENTUM_ASSEMBLY_DESIGN tag=%s diffusionCSR=BUILT_ONCE_HOST_UPLOADED_ONCE_DEVICE_PERSISTENT convectionCSRTopology=STATIC convectionNumeric=REFRESH_EACH_OUTER commonOperatorXYZ=YES pressureGradientBTopology=STATIC pressureGradientAction=APPLY_CURRENT_P fixedDiffusionDirichletRHS=PERSISTENT variableViscosityDesign=REFRESH_DIFFUSION_NUMERICS_ONLY_NO_TOPOLOGY_REBUILD status=PASS\n",tag.c_str());
+  if(dgInlet){double maxCoeffDiff=0.0,maxConstCancel=0.0;long long inletCells=0;for(std::size_t c=0;c<S.cells.size();++c){const auto&gc=S.cells[c];const auto&pc=S.pressure.cells[c];for(int a=0;a<8;++a)for(int d=0;d<3;++d)maxCoeffDiff=std::max(maxCoeffDiff,std::abs(g4_effective_bcoeff_host(gc,a,d)-coeff(pc,a,d)));if(pc.inletOpp>=0){++inletCells;double rr=S.pipe.inletVelocity[0]*pc.inletSf[0]+S.pipe.inletVelocity[1]*pc.inletSf[1]+S.pipe.inletVelocity[2]*pc.inletSf[2];for(int a=0;a<4;++a)for(int d=0;d<3;++d)rr+=coeff(pc,a,d)*S.pipe.inletVelocity[d];maxConstCancel=std::max(maxConstCancel,std::abs(rr));}}std::printf("NODALS_GPU_RANS_GATE2_BEFF_AUDIT inletCells=%lld hostPressureVsDeviceFactoryMaxAbs=%.12e constantP1PlusPrescribedFluxMaxAbs=%.12e expected=roundoff status=%s\n",inletCells,maxCoeffDiff,maxConstCancel,(maxCoeffDiff<1e-13&&maxConstCancel<1e-13)?"PASS":"FAIL");if(!(maxCoeffDiff<1e-13&&maxConstCancel<1e-13))throw std::runtime_error("Gate2 effective-B setup audit failed");}
 
-  G4Gpu G=upload_all(S,H,initRau,FH);G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;G.amg.smoother=amgSmoother;G.amg.jacobiOmega=amgJacobiOmega;G.amg.chebDegree=amgChebDegree;G.amg.powerIts=effectiveAmgPowerIts;G.amg.lambdaSafety=amgLambdaSafety;G.amg.lambdaLowFraction=amgLambdaLowFraction;
-  std::printf("NODALS_GPU_G9_L1_CONFIG tag=%s smoother=%s denominator=%s relaxWeight=%.8g fineL1Refresh=%s coarseL1=SETUP_SNAPSHOT definition=SUM_ABS_ROW status=PASS\n",tag.c_str(),amgSmoother.c_str(),amgSmoother=="l1jacobi"?"L1_ROW_ABS_SUM":"DIAGONAL",amgJacobiOmega,amgSmoother=="l1jacobi"?"EVERY_FINE_CSR_REFRESH":"OFF");
-  std::printf("NODALS_GPU_H8_AMG_SMOOTHER tag=%s hierarchy=%s smoother=%s jacobiOmega=%.8g chebDegree=%d powerIts=%d hierarchyConstruction=SELECTED_BY_AMG_HIERARCHY spectrumSetup=SETUP_ONLY status=PASS\n",
-    tag.c_str(),amgHierarchy.c_str(),amgSmoother.c_str(),amgJacobiOmega,G.amg.chebDegree,G.amg.powerIts);
+  if(weakWall){double maxCoeffDiff=0.0,maxWallXY=0.0,maxWallZ=0.0;long long wallBasis=0;for(std::size_t c=0;c<S.cells.size();++c){const auto&gc=S.cells[c];const auto&pc=S.pressure.cells[c];for(int a=0;a<8;++a){for(int d=0;d<3;++d)maxCoeffDiff=std::max(maxCoeffDiff,std::abs(g4_effective_bcoeff_host(gc,a,d)-coeff(pc,a,d)));if(gc.wallBasis[a]){++wallBasis;maxWallXY=std::max(maxWallXY,std::max(std::abs(coeff(pc,a,0)),std::abs(coeff(pc,a,1))));maxWallZ=std::max(maxWallZ,std::abs(coeff(pc,a,2)));}}}const bool ok=maxCoeffDiff<1e-13&&maxWallXY<1e-13&&wallBasis>0&&maxWallZ>0;std::printf("NODALS_GPU_RANS_GATE3_BEFF_AUDIT wallBasisEntries=%lld hostPressureVsDeviceFactoryMaxAbs=%.12e wallBxByMaxAbs=%.12e wallBzMaxAbs=%.12e expected=BxBy_zero_Bz_active status=%s\n",wallBasis,maxCoeffDiff,maxWallXY,maxWallZ,ok?"PASS":"FAIL");if(!ok)throw std::runtime_error("Gate3 weak-wall effective-B setup audit failed");}
+
+  G4Gpu G=upload_all(S,H,initRau,FH);G.pf.cells=G.cells.data();G.pf.bcoeff=G.bcoeff.data();G.pf.rau_live=G.rau.data();G.pf.csr_pc=&G.fineCsr;G.pf.physicalUseCurrentCSR=physicalUseCurrentCSR;G.amg.fine=&G.pf;G.amg.smoother=amgSmoother;G.amg.jacobiOmega=amgJacobiOmega;G.amg.jacobiFineSweeps=amgJacobiFineSweeps;G.amg.jacobiCoarseSweeps=amgJacobiCoarseSweeps;G.amg.chebDegree=amgChebDegree;G.amg.powerIts=effectiveAmgPowerIts;G.amg.lambdaSafety=amgLambdaSafety;G.amg.lambdaLowFraction=amgLambdaLowFraction;G.amg.mcgsFineSweeps=amgMcgsFineSweeps;G.amg.mcgsCoarseSweeps=amgMcgsCoarseSweeps;G.amg.mcgsOmega=amgMcgsOmega;G.amg.mcgsOrder=amgMcgsOrder;
+  if(amgSmoother=="mcgs"){
+    auto C0=g4_build_greedy_coloring(FH.n,FH.row,FH.col,"fine");
+    g4_upload_coloring(G.fineCsr.mcgs,C0);
+    std::printf("NODALS_GPU_AMG_MCGS_COLOR level=0 rows=%d colors=%d maxColorSize=%d bytes=%zu status=PASS\n",FH.n,C0.ncolors,C0.maxColorSize,G.fineCsr.mcgs.bytes());
+    if(H.csr.size()!=G.amg.L.size())throw std::runtime_error("AMG MCGS host/device coarse level mismatch");
+    for(std::size_t l=0;l+1<H.csr.size();++l){
+      auto CL=g4_build_greedy_coloring(H.csr[l].n,H.csr[l].row,H.csr[l].col,"coarse");
+      g4_upload_coloring(G.amg.L[l].mcgs,CL);
+      std::printf("NODALS_GPU_AMG_MCGS_COLOR level=%zu rows=%d colors=%d maxColorSize=%d bytes=%zu status=PASS\n",l+1,H.csr[l].n,CL.ncolors,CL.maxColorSize,G.amg.L[l].mcgs.bytes());
+    }
+  }
+  const int mixlenBlocks=std::max(1,prop.multiProcessorCount*4);
+  const int supgBlocks=std::max(1,prop.multiProcessorCount*8);
+  if(mixingLength)h9_upload_mixlen_geometry(G,M);
+  if(weakWall)h11_upload_wall(G,M,S);
+  if(dgInlet){h10_upload_dg_inlet(G,M,S);h10_initialize_plug(G,M,S);}
+  std::printf("NODALS_GPU_RANS_SOLVER_CONTROLS tag=%s simpleVariant=SIMPLE uRelaxMode=ROW_L1 rauMode=RELAXED_DIAG alphaU=%.8g alphaP=%.8g rauScale=%.8g simpleTol=%.8g maxOuter=%d momentumWork=%s momentumOmega=%.8g momRtol=%.3e momAtol=%.3e momDrop=%.3e momMax=%d momentumToleranceSemantics=PARSED_INERT_FOR_FIXED_WORK pressureSolver=%s pRtol=%.3e pAtol=%.3e pMax=%d amgHierarchy=%s amgSmoother=%s amgJacobiOmega=%.8g amgJacobiFineSweeps=%d amgJacobiCoarseSweeps=%d amgChebDegree=%d amgPowerIts=%d amgMcgsFineSweeps=%d amgMcgsCoarseSweeps=%d amgMcgsOmega=%.8g amgMcgsOrder=%s supg=%d supgTauScale=%.8g supgMagic=%.8g status=PASS\n",
+    tag.c_str(),alphaU,alphaP,rauScale,simpleTol,maxOuter,momentumWork.c_str(),momOmega,momRtol,momAtol,momDrop,momMax,pressureSolver.c_str(),pRtol,pAtol,pMax,amgHierarchy.c_str(),amgSmoother.c_str(),amgJacobiOmega,amgJacobiFineSweeps,amgJacobiCoarseSweeps,amgChebDegree,effectiveAmgPowerIts,amgMcgsFineSweeps,amgMcgsCoarseSweeps,amgMcgsOmega,amgMcgsOrder.c_str(),supg?1:0,supgTauScale,supgMagic);
+  std::printf("NODALS_GPU_RANS_GATE1 tag=%s mixingLength=%d model=nikuradse_pipe strain=raw scale=%.8g quadrature=collapsed64 laggedState=previous_SIMPLE wallBC=%s inletBC=%s supg=%s blocks=%d geometryBytes=%zu status=PASS\n",
+    tag.c_str(),mixingLength?1:0,mixlenScale,weakWall?"WEAK_SPALDING":"UNCHANGED",dgInlet?"DG_NUMERICAL_TRACE":"UNCHANGED",supg?"ON":"OFF",mixlenBlocks,G.mixXY.bytes());
+  if(dgInlet){const double prescribed=-(S.pipe.inletVelocity[0]*S.pipe.inletNormal[0]+S.pipe.inletVelocity[1]*S.pipe.inletNormal[1]+S.pipe.inletVelocity[2]*S.pipe.inletNormal[2])*S.pipe.inletProjectedArea;std::printf("NODALS_GPU_RANS_GATE2 tag=%s dgInlet=1 faces=%zu velocityDOFs=FREE numericalTrace=P0_prescribed_flux effectiveB=VOLUME_MINUS_FACE_TRACE momentum=inflow_plus_nonsymmetric_Nitsche nuEff=nu_plus_lagged_nuT Uhat=[%.12e,%.12e,%.12e] area=%.12e projectedArea=%.12e inwardFlux=%.12e wallBC=%s supg=%s status=PASS\n",tag.c_str(),G.dgInletFaces.size(),S.pipe.inletVelocity[0],S.pipe.inletVelocity[1],S.pipe.inletVelocity[2],S.pipe.inletArea,S.pipe.inletProjectedArea,prescribed,weakWall?"WEAK_SPALDING":"UNCHANGED_STRONG",supg?"ON":"OFF");}
+  if(weakWall)std::printf("NODALS_GPU_RANS_GATE3 tag=%s weakWall=1 wallFaces=%zu velocityDOFs=FREE transverseWall=UxUy_exact_clamp axialWall=Uz_weak_spalding pressureBxByWallResponse=OMITTED pressureBzWallResponse=ACTIVE law=spalding kappa=0.4 B=5.5 yFactor=0.25 betaScale=1 linearization=consistent_tangent tangentBlend=0.5 sampleMode=legacy_face_trace molecularConsistency=0 faceQuad=Dunavant7 supg=%s status=PASS\n",tag.c_str(),G.wallFaces.size(),supg?"ON":"OFF");
+  if(weakWall){const double utRef=bulk*std::sqrt(wallReferenceF/8.0);std::printf("NODALS_GPU_RANS_GATE5I_WALL_MODE tag=%s mode=%s referenceF=%.10f referenceUTau=%.12e referenceUTau2=%.12e finalDiagCsv=%s status=PASS\n",tag.c_str(),wallTractionMode.c_str(),wallReferenceF,utRef,utRef*utRef,wallDiagCsv.empty()?"DISABLED":wallDiagCsv.c_str());}
+  std::printf("NODALS_GPU_RANS_SUPG tag=%s enabled=%d form=%s quadPoints=%d tauScale=%.8g magic=%.8g tauViscosity=MOLECULAR_ONLY additiveToRANSOperator=1 setupHierarchySnapshotIncludesSUPG=0 kernel=%s blocks=%d status=PASS\n",tag.c_str(),supg?1:0,supgForm.c_str(),supgQuadPoints,supgTauScale,supgMagic,h8_rans_supg_kernel_mode(),supgBlocks);
+  std::printf("NODALS_GPU_G9_L1_CONFIG tag=%s smoother=%s denominator=%s relaxWeight=%.8g jacobiFineSweeps=%d jacobiCoarseSweeps=%d fineL1Refresh=%s coarseL1=SETUP_SNAPSHOT definition=SUM_ABS_ROW status=PASS\n",tag.c_str(),amgSmoother.c_str(),amgSmoother=="l1jacobi"?"L1_ROW_ABS_SUM":"DIAGONAL",amgJacobiOmega,amgJacobiFineSweeps,amgJacobiCoarseSweeps,amgSmoother=="l1jacobi"?"EVERY_FINE_CSR_REFRESH":"OFF");
+  std::printf("NODALS_GPU_H8_AMG_SMOOTHER tag=%s hierarchy=%s smoother=%s jacobiOmega=%.8g jacobiFineSweeps=%d jacobiCoarseSweeps=%d chebDegree=%d powerIts=%d mcgsFineSweeps=%d mcgsCoarseSweeps=%d mcgsOmega=%.8g mcgsOrder=%s hierarchyConstruction=SELECTED_BY_AMG_HIERARCHY spectrumSetup=SETUP_ONLY status=PASS\n",
+    tag.c_str(),amgHierarchy.c_str(),amgSmoother.c_str(),amgJacobiOmega,amgJacobiFineSweeps,amgJacobiCoarseSweeps,G.amg.chebDegree,G.amg.powerIts,amgMcgsFineSweeps,amgMcgsCoarseSweeps,amgMcgsOmega,amgMcgsOrder.c_str());
   h7_select_momentum_assembly(G,alphaU,prop.multiProcessorCount,tag.c_str());
   h8_select_precomputed_b(G,tag.c_str());
   double pressureChebLambdaMax=1.0;
@@ -1759,6 +2025,14 @@ int main(int argc,char**argv){try{
   }
   h2_action_parity_and_bench(G,tag.c_str(),24);
   H0Profiler H0P;g_h0=&H0P;
+  const char* h14Env=std::getenv("NODALS_DISCRETE_BUDGET_CSV");
+  const std::string h14BudgetCsv=(h14Env&&*h14Env)?std::string(h14Env):std::string();
+  H14Snapshots h14Snap;
+  if(!h14BudgetCsv.empty()){
+    h14Snap.allocate(G.nv,G.nc);
+    std::printf("NODALS_DISCRETE_BUDGET_CONFIG tag=%s csv=%s snapshots=PRE_EACH_MOMENTUM_SWEEP deviceToDeviceOnly=1 status=PASS\n",
+      tag.c_str(),h14BudgetCsv.c_str());
+  }
   NODALS_CUDA(cudaDeviceSynchronize());const auto memUpload=device_memory_info();
   const double baselineUsed=g5_used_mib(memBaseline),uploadUsed=g5_used_mib(memUpload),explicitMiB=g5_mib(G.bytes());
   std::printf("NODALS_GPU_H8_MEMORY tag=%s point=after_upload cells=%zu baselineUsedMiB=%.3f usedMiB=%.3f deltaFromBaselineMiB=%.3f explicitMiB=%.3f explicitBytesPerCell=%.3f status=PASS\n",
@@ -1772,14 +2046,20 @@ int main(int argc,char**argv){try{
   for(int it=1;it<=maxOuter;++it){
     H0P.currentOuter=it;if(H0P.used)throw std::runtime_error("H8 profiler nonempty at outer start");
     G5StageEvents E;E.rec(0);
-    assemble_live(G,alphaU);E.rec(1);
+    if(h14Snap.enabled)h14Snap.capture(G);
+    assemble_live(G,alphaU,rauScale,mixingLength,dgInlet,weakWall,supg,S.pipe,mixlenScale,mixlenBlocks,supgBlocks,supgTauScale,supgMagic);E.rec(1);
     if(it==1){
-      double rr=g5_rau_snapshot_rel(G);
-      std::printf("NODALS_GPU_H8_SNAPSHOT_PARITY it=1 rAURel=%.3e tol=%.3e status=%s\n",rr,snapshotTol,rr<snapshotTol?"PASS":"FAIL");
-      if(!(rr<snapshotTol))throw std::runtime_error("H8 setup rAU snapshot mismatch");
+      if(mixingLength||dgInlet||weakWall||supg){
+        const char*why=mixingLength?"live_nut_changes_rAU":(weakWall?"weak_wall_changes_rAU":(dgInlet?"dg_inlet_changes_rAU":"supg_changes_rAU"));
+        std::printf("NODALS_GPU_H8_SNAPSHOT_PARITY it=1 policy=SKIP_DYNAMIC_RANS reason=%s status=PASS\n",why);
+      }else{
+        double rr=g5_rau_snapshot_rel(G);
+        std::printf("NODALS_GPU_H8_SNAPSHOT_PARITY it=1 rAURel=%.3e tol=%.3e status=%s\n",rr,snapshotTol,rr<snapshotTol?"PASS":"FAIL");
+        if(!(rr<snapshotTol))throw std::runtime_error("H8 setup rAU snapshot mismatch");
+      }
     }
     G.pf.bt_state(G.p.data());
-    {int q=h0_begin(H0_MOM_RHS);g4_momentum_rhs_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.s0.data(),G.s1.data(),G.s2.data(),G.c0.data(),G.c1.data(),G.c2.data(),G.pf.v0.data(),G.pf.v1.data(),G.pf.v2.data(),G.delta.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.b0.data(),G.b1.data(),G.b2.data());NODALS_CUDA(cudaGetLastError());h0_end(q);}
+    {int q=h0_begin(H0_MOM_RHS);g4_momentum_rhs_kernel<<<g4grid(G.nv),G4B>>>(G.nv,G.s0.data(),G.s1.data(),G.s2.data(),G.c0.data(),G.c1.data(),G.c2.data(),G.pf.v0.data(),G.pf.v1.data(),G.pf.v2.data(),G.delta.data(),G.u0.data(),G.u1.data(),G.u2.data(),G.b0.data(),G.b1.data(),G.b2.data());NODALS_CUDA(cudaGetLastError());if(weakWall)h11_clamp_transverse_rhs_state(G);h0_end(q);}
     bool auditedThisOuter=false;
     std::array<double,3>auditRel{{NAN,NAN,NAN}};
     if(runMode=="converge" && it>1 && contRel<=simpleTol){
@@ -1855,6 +2135,38 @@ int main(int argc,char**argv){try{
   G.u2.download(uf.data(),uf.size());
   for(std::size_t i=0;i<uf.size();++i)finalU[2][i]=(double)uf[i];
 
+  if(const char*convDiag=std::getenv("NODALS_CONVECTION_FORM_DIAG_CSV")){
+    if(*convDiag)h13_write_convection_form_diag(convDiag,tag.c_str(),M,S,finalU);
+  }
+
+  if(weakWall&&!g_h11_wall_diag_csv.empty())
+    h11_write_final_wall_csv(g_h11_wall_diag_csv,M,S,finalU,g_h11_wall_traction_mode,g_h11_wall_reference_f);
+
+  if(mixingLength){
+    const auto ms=h9_download_mixlen_stats(G);
+    const double meanRatio=ms[1]>0.0?ms[0]/ms[1]:0.0;
+    const bool mixFinite=std::isfinite(meanRatio)&&std::isfinite(ms[2])&&std::isfinite(ms[3]);
+    std::printf("NODALS_GPU_RANS_GATE1_MIXLEN tag=%s nu=%.12e radius=%.12e scale=%.8g nuTRatioMean=%.12e nuTRatioMax=%.12e strainMax=%.12e statsD2H=4xFP64_AFTER_LOOP status=%s\n",
+      tag.c_str(),S.pipe.nu,S.pipe.R,mixlenScale,meanRatio,ms[2],ms[3],mixFinite?"PASS":"FAIL");
+    finiteAll=finiteAll&&mixFinite;
+  }
+  if(!vtuOut.empty())h12_write_vtu(vtuOut,M,S,finalU,pd,converged,finalIt);
+
+  if(weakWall){
+    const auto ws=h11_download_wall_stats(G);
+    const double area=ws[0],ut2Mean=area>0.0?ws[1]/area:0.0,ypMean=area>0.0?ws[2]/area:0.0,slipMean=area>0.0?ws[3]/area:0.0;
+    const double fWall=8.0*ut2Mean/(S.pipe.bulk*S.pipe.bulk);
+    const bool wallFinite=area>0.0&&std::isfinite(fWall)&&std::isfinite(ypMean)&&std::isfinite(slipMean)&&ws[6]==0.0&&ws[7]==0.0;
+    std::printf("NODALS_GPU_RANS_GATE3_WALL tag=%s wallMode=%s wallFaces=%zu area=%.12e yPlusMean=%.12e yPlusMax=%.12e slipMean=%.12e uTauMax=%.12e uTau2Mean=%.12e fWallApplied=%.10f referenceF=%.10f rootFailures=%.0f tangentFailures=%.0f statsD2H=8xFP64_AFTER_LOOP status=%s\n",
+      tag.c_str(),g_h11_wall_traction_mode.c_str(),G.wallFaces.size(),area,ypMean,ws[4],slipMean,ws[5],ut2Mean,fWall,g_h11_wall_reference_f,ws[6],ws[7],wallFinite?"PASS":"FAIL");
+    finiteAll=finiteAll&&wallFinite;
+  }
+  if(h14Snap.enabled){
+    h14_write_discrete_budget(
+      h14BudgetCsv,tag.c_str(),M,S,G,h14Snap,
+      mixingLength,dgInlet,weakWall,supg,
+      mixlenScale,mixlenBlocks,supgBlocks,supgTauScale,supgMagic);
+  }
   const auto hpErr=h8_compute_hp_errors(M,S,finalU,pd);
   double dp=pressure_drop_fit_g4(M,pd),exact=S.pipe.hpDrop,
          dpErr=std::abs(dp-exact)/std::max(std::abs(exact),1e-300);
