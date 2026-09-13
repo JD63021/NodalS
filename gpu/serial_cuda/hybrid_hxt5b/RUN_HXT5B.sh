@@ -13,7 +13,8 @@ RE="${RE:-13691.740248127866}"
 BULK="${BULK:-50.0}"
 MIXLEN_SCALE="${MIXLEN_SCALE:-1.0}"
 WALL_SAMPLE_FRACTION="${WALL_SAMPLE_FRACTION:-0.5}"
-GAMMA="${GAMMA:-50}"
+MOM_NITSCHE_GAMMA="${MOM_NITSCHE_GAMMA:-${GAMMA:-50}}"
+SCHUR_NITSCHE_GAMMA="${SCHUR_NITSCHE_GAMMA:-0}"
 MAX_OUTER="${MAX_OUTER:-10000}"
 SIMPLE_TOL="${SIMPLE_TOL:-1e-3}"
 OUTER_CONT_ATOL="${OUTER_CONT_ATOL:-1e-12}"
@@ -56,6 +57,37 @@ AMG_MCGS_FINE_SWEEPS="${AMG_MCGS_FINE_SWEEPS:-1}"
 AMG_MCGS_COARSE_SWEEPS="${AMG_MCGS_COARSE_SWEEPS:-1}"
 AMG_MCGS_OMEGA="${AMG_MCGS_OMEGA:-1.0}"
 AMG_MCGS_ORDER="${AMG_MCGS_ORDER:-symmetric}"
+
+SST_G1="${SST_G1:-0}"
+SST_G2="${SST_G2:-0}"
+SST_G2_START="${SST_G2_START:-g0}"
+SST_G2_MAX="${SST_G2_MAX:-800}"
+SST_G2_PRINT_EVERY="${SST_G2_PRINT_EVERY:-20}"
+SST_G2_PLATEAU_TOL="${SST_G2_PLATEAU_TOL:-2.5e-3}"
+SST_G2_PLATEAU_SAMPLES="${SST_G2_PLATEAU_SAMPLES:-5}"
+SST_INTENSITY="${SST_INTENSITY:-0.05}"
+SST_LENGTH_RATIO="${SST_LENGTH_RATIO:-0.07}"
+SST_ALPHA_K="${SST_ALPHA_K:-0.5}"
+SST_ALPHA_OMEGA="${SST_ALPHA_OMEGA:-0.5}"
+SST_TOL="${SST_TOL:-1e-3}"
+SST_MAX="${SST_MAX:-400}"
+SST_LINEAR_RTOL="${SST_LINEAR_RTOL:-0.20}"
+SST_LINEAR_ATOL="${SST_LINEAR_ATOL:-1e-7}"
+SST_LINEAR_MAX="${SST_LINEAR_MAX:-12}"
+SST_GS_OMEGA="${SST_GS_OMEGA:-1.0}"
+SST_K_FLOOR="${SST_K_FLOOR:-1e-8}"
+SST_OMEGA_FLOOR="${SST_OMEGA_FLOOR:-1e-3}"
+SST_WALL_PENALTY_GAMMA="${SST_WALL_PENALTY_GAMMA:-50}"
+SST_OMEGA_WALL_MODE="${SST_OMEGA_WALL_MODE:-trace_log}"
+SST_OF_KAPPA="${SST_OF_KAPPA:-0.41}"
+SST_OF_E="${SST_OF_E:-9.8}"
+SST_OF_BETA1="${SST_OF_BETA1:-0.075}"
+SST_OF_RE_BLEND="${SST_OF_RE_BLEND:-11.0}"
+SST_OF_PRODUCTION="${SST_OF_PRODUCTION:-1}"
+SST_OF_PRODUCTION_SCALE="${SST_OF_PRODUCTION_SCALE:-1.0}"
+SST_OF_WALL_VOLUME_SCALE="${SST_OF_WALL_VOLUME_SCALE:-1.0}"
+SST_OF_PRODUCTION_LIMIT="${SST_OF_PRODUCTION_LIMIT:-10.0}"
+SST_PRINT_EVERY="${SST_PRINT_EVERY:-10}"
 
 cat <<CFG
 === HXT5B FULL TURBULENT-BOUNDARY GPU SETTINGS ===
@@ -103,20 +135,46 @@ alphaU=$ALPHA_U
 alphaP=$ALPHA_P
 rauScale=$RAU_SCALE
 directionalRAU=1
-rauPenaltyIncluded=0
-gamma=$GAMMA
+rauPenaltyPolicy=SEPARATE_GAMMA
+momentumNitscheGamma=$MOM_NITSCHE_GAMMA
+schurNitscheGamma=$SCHUR_NITSCHE_GAMMA
 coarseHierarchy=exact initial directional Schur snapshot
 finePressureCSR=current directional Schur every outer
 maxOuter=$MAX_OUTER
 vtu=$VTU
+sstG1=$SST_G1
+sstG2=$SST_G2
+sstG2Start=$SST_G2_START
+sstG2Max=$SST_G2_MAX
+sstG2PrintEvery=$SST_G2_PRINT_EVERY
+sstG2PlateauTol=$SST_G2_PLATEAU_TOL
+sstG2PlateauSamples=$SST_G2_PLATEAU_SAMPLES
+sstModel=SST-2003m
+sstIntensity=$SST_INTENSITY
+sstLengthScaleOverD=$SST_LENGTH_RATIO
+sstAlphaK=$SST_ALPHA_K
+sstAlphaOmega=$SST_ALPHA_OMEGA
+sstTol=$SST_TOL
+sstLinearRtol=$SST_LINEAR_RTOL
+sstLinearMax=$SST_LINEAR_MAX
+sstOmegaWallMode=$SST_OMEGA_WALL_MODE
+sstWallPenaltyGamma=$SST_WALL_PENALTY_GAMMA
+sstOfKappa=$SST_OF_KAPPA
+sstOfE=$SST_OF_E
+sstOfBeta1=$SST_OF_BETA1
+sstOfReBlend=$SST_OF_RE_BLEND
+sstOfProduction=$SST_OF_PRODUCTION
+sstOfProductionScale=$SST_OF_PRODUCTION_SCALE
+sstOfWallVolumeScale=$SST_OF_WALL_VOLUME_SCALE
+sstOfProductionLimit=$SST_OF_PRODUCTION_LIMIT
 CFG
 
-make -C "$ROOT" -j"$(nproc)" ARCH="${ARCH:-sm_86}"
+make -C "$ROOT" -j"$(nproc)" ARCH="${ARCH:-sm_86}" "nodals_hxt5b_${PREC}"
 
 set +e
 stdbuf -oL -eL "$EXE" \
   --mesh "$MESH" --vtu "$VTU" --re "$RE" --bulk "$BULK" --mixlen-scale "$MIXLEN_SCALE" \
-  --wall-sample-fraction "$WALL_SAMPLE_FRACTION" --gamma "$GAMMA" \
+  --wall-sample-fraction "$WALL_SAMPLE_FRACTION" --gamma "$MOM_NITSCHE_GAMMA" --schur-nitsche-gamma "$SCHUR_NITSCHE_GAMMA" \
   --max-outer "$MAX_OUTER" --simple-tol "$SIMPLE_TOL" --outer-cont-atol "$OUTER_CONT_ATOL" \
   --alpha-u "$ALPHA_U" --alpha-p "$ALPHA_P" --rau-scale "$RAU_SCALE" \
   --momentum-work "$MOM_WORK" --mom-omega "$MOM_OMEGA" --mom-rtol "$MOM_RTOL" --mom-atol "$MOM_ATOL" --mom-max "$MOM_MAX" --mom-cap-policy "$MOM_CAP_POLICY" \
@@ -130,13 +188,18 @@ stdbuf -oL -eL "$EXE" \
   --amg-spectrum-policy "$AMG_SPECTRUM_POLICY" \
   --amg-mcgs-fine-sweeps "$AMG_MCGS_FINE_SWEEPS" --amg-mcgs-coarse-sweeps "$AMG_MCGS_COARSE_SWEEPS" \
   --amg-mcgs-omega "$AMG_MCGS_OMEGA" --amg-mcgs-order "$AMG_MCGS_ORDER" \
+  --sst-g1 "$SST_G1" --sst-g2 "$SST_G2" --sst-g2-start "$SST_G2_START" --sst-g2-max "$SST_G2_MAX" --sst-g2-print-every "$SST_G2_PRINT_EVERY" --sst-g2-plateau-tol "$SST_G2_PLATEAU_TOL" --sst-g2-plateau-samples "$SST_G2_PLATEAU_SAMPLES" --sst-intensity "$SST_INTENSITY" --sst-length-ratio "$SST_LENGTH_RATIO" \
+  --sst-alpha-k "$SST_ALPHA_K" --sst-alpha-omega "$SST_ALPHA_OMEGA" --sst-tol "$SST_TOL" --sst-max "$SST_MAX" \
+  --sst-linear-rtol "$SST_LINEAR_RTOL" --sst-linear-atol "$SST_LINEAR_ATOL" --sst-linear-max "$SST_LINEAR_MAX" --sst-gs-omega "$SST_GS_OMEGA" \
+  --sst-k-floor "$SST_K_FLOOR" --sst-omega-floor "$SST_OMEGA_FLOOR" --sst-wall-penalty-gamma "$SST_WALL_PENALTY_GAMMA" --sst-omega-wall-mode "$SST_OMEGA_WALL_MODE" \
+  --sst-of-kappa "$SST_OF_KAPPA" --sst-of-E "$SST_OF_E" --sst-of-beta1 "$SST_OF_BETA1" --sst-of-re-blend "$SST_OF_RE_BLEND" --sst-of-production "$SST_OF_PRODUCTION" --sst-of-production-scale "$SST_OF_PRODUCTION_SCALE" --sst-of-wall-volume-scale "$SST_OF_WALL_VOLUME_SCALE" --sst-of-production-limit "$SST_OF_PRODUCTION_LIMIT" --sst-print-every "$SST_PRINT_EVERY" \
   2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 set -e
 
 echo
 echo "=== HXT5B SUMMARY ==="
-grep -E 'NODALS_HXT5B_(DIRECTIONAL_SETUP|CONFIG|BOUNDARY_SETUP|MIXLEN|FINE_CSR_PARITY|SIMPLE|PRESSURE_FAIL|PHYSICS|OUTPUT)|NODALS_GPU_G8_CF_(SPECTRUM|HIERARCHY)|HXT5B_GATE_STATUS' "$LOG" || true
+grep -E 'NODALS_SST_G1|SST_G1_GATE_STATUS|NODALS_SST_G2|SST_G2_GATE_STATUS|NODALS_HXT5B_(DIRECTIONAL_SETUP|CONFIG|BOUNDARY_SETUP|MIXLEN|FINE_CSR_PARITY|SIMPLE|PRESSURE_FAIL|PHYSICS|OUTPUT)|NODALS_GPU_G8_CF_(SPECTRUM|HIERARCHY)|HXT5B_GATE_STATUS' "$LOG" || true
 echo "HXT5B_LOG=$LOG"
 echo "HXT5B_VTU=$VTU"
 exit "$rc"
