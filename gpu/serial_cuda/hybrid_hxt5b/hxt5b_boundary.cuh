@@ -302,6 +302,7 @@ __global__ void h5b3_finalize_row_l1(
     const Real*diagDG,const Real*diagWall,
     Real*rxy,Real*rz,Real*diagOrigXY,Real*diagOrigZ,
     Real*relaxDeltaXY,Real*relaxDeltaZ,
+    double momNitscheGamma,double schurNitscheGamma,
     double alphaU,double rauScale,unsigned long long*bad)
 {
   int i=(int)(blockIdx.x*blockDim.x+threadIdx.x);
@@ -324,24 +325,39 @@ __global__ void h5b3_finalize_row_l1(
     return;
   }
 
-  // Direct Nitsche penalty is absent from these physical diagonals.
+  // Penalty-free physical diagonal.  It is allowed to be locally non-positive:
+  // row-L1 equation relaxation is part of the actual rAU denominator.
   const Real noPenXY=diagRBase[i]+conv[d]+diagRTurb[i]+diagDG[i];
   const Real noPenZ =noPenXY+diagWall[i];
 
+  // The difference between the full assembled diagonal and noPen is exactly the
+  // direct HEX/TET Nitsche penalty contribution (molecular + current SST part).
+  // Since that contribution is linear in gamma, an independent Schur gamma can
+  // admit any desired fraction without changing the momentum operator.
+  const Real penXY=ox-noPenXY;
+  const Real penZ =oz-noPenZ;
+  const Real schurScale=(momNitscheGamma>0.0)
+      ? (Real)(schurNitscheGamma/momNitscheGamma) : Real(0);
+  const Real schurPenXY=schurScale*penXY;
+  const Real schurPenZ =schurScale*penZ;
+
   if(!(ox>Real(0))||!(oz>Real(0))||!(l1x>Real(0))||!(l1z>Real(0))||
-     !(noPenXY>Real(0))||!(noPenZ>Real(0))||
      !isfinite((double)ox)||!isfinite((double)oz)||
      !isfinite((double)dx)||!isfinite((double)dz)||
-     !isfinite((double)noPenXY)||!isfinite((double)noPenZ)){
+     !isfinite((double)noPenXY)||!isfinite((double)noPenZ)||
+     !isfinite((double)penXY)||!isfinite((double)penZ)||
+     !isfinite((double)schurPenXY)||!isfinite((double)schurPenZ)||
+     (schurNitscheGamma>0.0 && (!(penXY>=Real(0))||!(penZ>=Real(0))))){
     atomicAdd(bad,1ULL);rxy[i]=rz[i]=Real(0);return;
   }
 
   xy[d]=ox+dx;
   z[d] =oz+dz;
 
-  // The row-L1 delta is algorithmic under-relaxation and is retained in rAU.
-  // The physical Nitsche penalty itself remains excluded.
-  const Real mx=noPenXY+dx,mz=noPenZ+dz;
+  // Validate the denominator actually used by the Schur approximation.
+  // With schurNitscheGamma=0 this is noPen + row-L1 delta, preserving the
+  // previous pressure approximation except for removing the premature raw-noPen gate.
+  const Real mx=noPenXY+schurPenXY+dx,mz=noPenZ+schurPenZ+dz;
   if(!(mx>Real(0))||!(mz>Real(0))||
      !isfinite((double)mx)||!isfinite((double)mz)){
     atomicAdd(bad,1ULL);rxy[i]=rz[i]=Real(0);return;
