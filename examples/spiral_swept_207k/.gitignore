@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.vtu
+*.vtk
+*.log
+*.ckpt

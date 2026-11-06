@@ -1,0 +1,63 @@
+{
+  "generator": "OCP STEP exact-sections swept square-to-circle hex-to-face-center 24tet",
+  "source_step": "spiral.stp",
+  "source_units": "mm",
+  "mesh_units": "m",
+  "cross_cells_per_side": 6,
+  "axial_segments": 240,
+  "hex_equivalents": 8640,
+  "points": 49285,
+  "tetrahedra": 207360,
+  "faces_inlet": 144,
+  "faces_outlet": 144,
+  "faces_wall": 23040,
+  "tets_ever_negative_reoriented": 103680,
+  "min_tet_volume_m3": 7.48159402771827e-12,
+  "max_tet_volume_m3": 2.4121948019872314e-10,
+  "volume_total_m3": 1.9804015052052424e-05,
+  "step_volume_m3": 1.9950177032478724e-05,
+  "volume_rel_error_to_cad": -0.007326350046335417,
+  "step_sweep_centerline_length_m": 0.7055592379188571,
+  "bbox_min_m": [
+    0.0022079105545787427,
+    0.010185955341552916,
+    0.006780068184214493
+  ],
+  "bbox_max_m": [
+    0.09254582950323165,
+    0.09331331093936655,
+    0.06969590153416946
+  ],
+  "inlet_area_m2": 2.7934977524774736e-05,
+  "outlet_area_m2": 2.793497752477453e-05,
+  "inlet_normal_outward": [
+    -0.002584632409918911,
+    0.8313581484666088,
+    0.5557310038620102
+  ],
+  "outlet_normal_outward": [
+    -0.21954237400040022,
+    -0.8654950237638296,
+    -0.45024383378155947
+  ],
+  "inlet_velocity_mps": [
+    0.05060791124464105,
+    -16.27825265544327,
+    -10.881386928142035
+  ],
+  "inlet_bulk_speed_mps": 19.580312871735906,
+  "inlet_perimeter_m": 0.018792832255745715,
+  "inlet_hydraulic_diameter_m": 0.005945879183002638,
+  "volumetric_flow_m3ps": 0.0005469756,
+  "density_kgpm3": 1000.0,
+  "dynamic_viscosity_Pas": 0.01460735,
+  "kinematic_viscosity_m2ps": 1.460735e-05,
+  "reynolds_number": 7970.109205347521,
+  "physical_pressure_pa_factor": 1000.0,
+  "orientation_swaps_boundary": {
+    "inlet": 144,
+    "outlet": 0,
+    "wall": 11520
+  },
+  "elapsed_seconds": 1.0636708736419678
+}

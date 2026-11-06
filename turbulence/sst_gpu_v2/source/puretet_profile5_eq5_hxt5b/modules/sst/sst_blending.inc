@@ -1,0 +1,14 @@
+  const Real dotkw=gk[0]*gw[0]+gk[1]*gw[1]+gk[2]*gw[2];
+  const Real CD=fmax(Real(2*SIGMA_W2)*dotkw/om,Real(1e-10));
+  const Real sqk=sqrt(k),d2=d*d;
+  const Real a11=sqk/(Real(BETA_STAR)*om*d);
+  const Real a12=Real(500)*nu/(d2*om);
+  const Real a13=Real(4*SIGMA_W2)*k/(CD*d2);
+  const Real arg1=fmin(fmax(a11,a12),a13);
+  const Real arg2=fmax(Real(2)*a11,a12);
+  const Real a1sq=arg1*arg1;
+  q.F1=tanh(a1sq*a1sq);q.F2=tanh(arg2*arg2);
+  q.sigmaK=q.F1*Real(SIGMA_K1)+(Real(1)-q.F1)*Real(SIGMA_K2);
+  q.sigmaW=q.F1*Real(SIGMA_W1)+(Real(1)-q.F1)*Real(SIGMA_W2);
+  q.beta=q.F1*Real(BETA1)+(Real(1)-q.F1)*Real(BETA2);
+  q.gamma=q.F1*Real(GAMMA1)+(Real(1)-q.F1)*Real(GAMMA2);

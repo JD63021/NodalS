@@ -1,0 +1,3 @@
+  hxt5c::assemble_equation(hxt5c::K_EQ,M,BH,inH,inT,wallH,pts,hc,tc,hv,tv,tg,ip,A,u0,u1,u2,S.oldK.p,S.oldW.p,vol,dg,wall,S.rhs,S.wallStats,bad,S.diagAudit,S.kIn,bulk,radius,nu,gamma,wallSampleFraction,O,outer,ifCache,calibratedK);
+  auto lk=hxt5c::scalar_solve(A,C,scalarFixed,S.rhs.p,S.k.p,red,O,outer,"k");if(q1Transport&&A.n>S.nvert)hxt5c::zero_enrichment_kernel<<<(A.n-S.nvert+hxt4b::TPB-1)/hxt4b::TPB,hxt4b::TPB>>>(S.nvert,A.n,S.k.p);HXT1_CUDA(cudaMemset(S.clipK.p,0,sizeof(unsigned long long)));hxt5c::floor_vertex_kernel<<<(M.h.nv+hxt4b::TPB-1)/hxt4b::TPB,hxt4b::TPB>>>((int)M.h.nv,(Real)O.kFloor,S.k.p,S.clipK.p);
+  if(bernsteinBF3)bf3_bernstein_apply(S,M,S.k.p,S.oldK.p,(Real)O.kFloor,outer,"k");

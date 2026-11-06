@@ -1,0 +1,324 @@
+# =============================================================================
+# NodalS GPU FEM / k-omega SST -- EDITABLE, ANNOTATED 200k UNSTRUCTURED U-BEND
+# =============================================================================
+# STATUS: reference configuration for the M3 masked-P1, 200245-tet U-bend.
+# PURPOSE: edit ONLY values to the right of '='; save; run without rebuilding.
+#
+# Open on your Ubuntu workstation:
+#   xdg-open ~/Downloads/NodalS_SST_SOFTWARE_V2_PROFILE/examples/ubend_200k.case
+# Run from the NodalS_SST_SOFTWARE_V2_PROFILE directory:
+#   python3 -u nodals.py run --case examples/ubend_200k.case
+#
+# IMPORTANT: do not append --steps or --momentum-solver to the command above
+# if you want the .case settings to control both options.
+#
+# Syntax: '#' or ';' starts a comment; lines beginning '#' are inactive.
+# Bool values: true/false, on/off, yes/no, 1/0.
+# Physics/solver settings preserve the masked-P1 M3 reference; reporting is lean.
+# The scalar state and wall physics are deliberately unchanged.
+#
+# N.B. A completed 10-iteration run is NOT convergence. V2 avoids the old
+# all-hex cross-section audit during normal tetrahedral runs, without changing
+# the physical solver. CUDA compilation and numerical regression are pending.
+#
+# Settings described as FIXED or METADATA cannot presently be used to switch
+# that functionality in the Python wrapper: don't assume they are implemented.
+# =============================================================================
+
+[mesh]
+# Supported: msh2 = Gmsh ASCII 2.2; hxt1 = native preconverted HXT1 binary.
+format = msh2
+# Mesh filename: relative to THIS .case file, or an absolute filesystem path.
+# This file is the original 200245-cell UNSTRUCTURED tetrahedral U-bend.
+path = ../reference_mesh/ubend_200k_for_audit.msh
+# Reference/characteristic length (metres), used in Re and default wall fit.
+diameter = 0.0889
+# Optional: custom boundary patch map file for supported existing native tags.
+# patch_map = /absolute/path/to/patch_map.txt
+# For .msh input, physical tags: inlet=1, outlet=2, wall=3, tet volume=4.
+
+[physics]
+# Current native solver uses kinematic pressure: density must be exactly 1.
+# This is a SOFTWARE restriction; it does not imply the real fluid is rho=1.
+density = 1
+# Reynolds number Re = bulk_speed * diameter / kinematic_viscosity.
+reynolds = 72600
+# Viscosity [m^2/s]; must agree with inlet speed, Re, and diameter within 0.1%.
+kinematic_viscosity = 1.460734693878e-5
+
+[inlet.main]
+# Available: velocity = specify 3D vector; speed = magnitude + direction.
+mode = velocity
+# Used only for mode=velocity. Sign/direction must point INTO inlet tag 1.
+velocity = (11.9290594798, 0, 0)
+# Used only for mode=speed; uncomment these AND change mode above to speed:
+# speed = 11.9290594798
+# direction = (1, 0, 0)
+# OPTIONAL developed velocity profile. Leave commented for plug inlet.
+# Use an absolute path to your precursor CSV (8 columns, header exactly as below).
+profile_csv = /home/jd/Downloads/STAGE27_DG_PROFILE_V1_PACKAGE/inlet_profile_developed_it1500.csv
+# profile_mapping: exact = already 196 mesh-matched inlet rows (native strict);
+# interpolate = map an old 169-point profile onto this 196-node inlet in y,z.
+# This mapping is performed by Python, NOT CUDA; SciPy needed for interpolate.
+profile_mapping = interpolate
+# profile_flux: preserve = keep interpolated speeds (default); match_bulk =
+# scale Ux,Uy,Uz uniformly so the numerical inlet flux equals the flux from
+# the inlet.main.velocity reference vector. Prefer preserve for strict old parity.
+profile_flux = preserve
+# Minimal positive inlet speed (m/s) for all-wall corner triangles. Current
+# strict native loader rejects EXACTLY zero inlet flux on these faces.
+# 1e-9 changes inlet values by < 1e-10 relative to bulk; zero means fail.
+profile_corner_epsilon = 1e-9
+# The native inlet uses ONLY Ux_m_s,Uy_m_s,Uz_m_s; k/omega remain uniform.
+# Header: x_m,y_m,z_m,Ux_m_s,Uy_m_s,Uz_m_s,k_m2_s2,omega_1_s
+# Keep mode=velocity and velocity=(11.929...,0,0) above for Re and direction.
+
+[outlet.main]
+# FIXED/METADATA: outlet tag 2 has the existing natural/open treatment.
+# Changing the word below does not currently change the native outlet BC.
+type = open
+
+[wall.main]
+# FIXED/METADATA: wall tag 3 uses the Spalding treatment specified below.
+# Do not change to another wall law: not yet exposed by this case interface.
+type = spalding
+
+[initialization]
+# Available: potential_flow = P1 Laplace projection; plug = initial constant U.
+# Inlet is configured independently by [inlet.main].
+mode = potential_flow
+
+[wall_distance]
+# Reference: geometric closest wall triangles / P1 interpolated distance.
+# Other methods are not validated in the standalone case interface.
+method = geometric
+
+[wall_sampling]
+# Available: ray_trace (reference; correct interior sampling),
+#            legacy_endpoint (older approximation; CHANGES numerical sampling).
+mode = ray_trace
+# Maximum tet crossings when following a wall-normal sample ray; integer >=1.
+max_crossings = 4096
+# Positive barycentric tolerance used for point location in tets.
+bary_tolerance = 1e-9
+
+[wall_function]
+# Currently supported: spalding only (fixed numerical law).
+law = spalding
+# Active subset for sampled fit: INTEGER 1..5. Reference is 1.
+# NOTE: five PROFILE5 physical heights are still supplied to the native solver;
+# this parameter controls the active subset/path, not the number of heights.
+samples = 1
+# Spalding sampling fraction: 0.001..1 inclusive; 0.50 is reference.
+# In the reference rule all five physical heights scale with this value.
+spalding_sample_scale = 0.50
+# true/false: apply zero-limit fix to small active subsets (<=4 points).
+zero_limit = true
+# Small Nitsche normal-constraint penalty, reference 1e-6.
+nitsche_gamma = 1e-6
+# true/false: F2 area-weighted face Spalding; reference true.
+face_spalding = true
+# true/false: F1B cached wall coupling; required by M3 current reference.
+# Keep TRUE for m3-fgs/m3-sgs unless explicitly testing another operator.
+frozen_wall_cache = true
+# true/false: reuse the same Spalding friction velocity in omega treatment.
+shared_wall_state = true
+# true/false: existing integral wall-profile friction velocity option.
+integral_utau = true
+# Wall quadrature count; original reference uses 12.
+integral_nq = 12
+# OPTIONAL alternative to the diameter-scaled physical PROFILE5 fit distances.
+# Uncomment exactly FIVE strictly increasing distances IN METRES.
+# When distances is given, it OVERRIDES spalding_sample_scale for fit heights.
+# distances = 0.001632945926233649, 0.003265891852467298, 0.004898837778700947, 0.006531783704934596, 0.008164729631168245
+
+[omega_wall]
+# Currently exposed: of_auto only. Other native omega models need an explicitly
+# validated extension to the .case interface (do not just change this string).
+method = of_auto
+# Integer 1..5: omega sample point; reference index 3, distinct from Spalding.
+sample_index = 3
+# Omega sampling fraction 0.001..1; separate from Spalding. Reference 0.50.
+# For experimental closer-to-wall sampling one might test 0.05; NOT baseline.
+sample_scale = 0.50
+# Rank-one omega wall penalty coefficient, reference 1e6.
+gamma = 1e6
+# true/false: optional OF_AUTO wall production term; reference false.
+production = false
+# Advanced host mode: sample_log (reference) OR of_auto (different pathway).
+# stage41_mode = sample_log
+
+[sst]
+# Scalar state space: q1 (REFERENCE masked-P1); bernstein_q2 (EXPERIMENTAL);
+# q1bf2_unlimited (EXPERIMENTAL active enriched modes, not masked-P1 parity).
+state_space = q1
+# true/false: experimental truly compact P1 path; keep false for masked-P1.
+compact_p1 = false
+# Optional advanced compact-quadrature setting for compact P1 experiments.
+# compact_quad = 24
+# Turbulence inlet parameters: intensity and length-scale ratio L/D.
+intensity = 0.05
+length_ratio = 0.07
+# Scalar nonlinear under-relaxation factors; typical 0 < alpha <= 1.
+ur_k = 0.70
+ur_omega = 0.70
+# Available scalar solvers: fgs-fixed (reference), fgs-guarded, fgmres-fgs,
+# fgs1, sgs1, inherit. 'fgs-guarded' REQUIRES check_every > 0.
+k_solver = fgs-fixed
+omega_solver = fgs-fixed
+# Fixed FGS sweep counts per SIMPLE outer (used for fgs-fixed/fgs-guarded).
+k_sweeps = 8
+omega_sweeps = 8
+# 0 = do not compute true scalar linear residuals (prints NaN for k/omega).
+# 10 = evaluate only at iterations 10, 20, 30... (no first-step exception).
+# Extra SpMV and reductions are NOT performed between these measurements.
+# For guarded FGS check_every MUST be >=1; the mode may change solver behavior.
+check_every = 10
+# OF_AUTO constants (reference values). Normally do not change together with
+# wall physics while performing software regression.
+# of_kappa = 0.4
+# of_e = 9.025013499434122
+# of_beta1 = 0.075
+# of_re_blend = 11
+
+[simple]
+# Maximum ABSOLUTE SIMPLE iterations from a fresh start; examples: 10, 200, 500.
+# This setting is honored ONLY when the CLI does not override it via --steps or
+# --outer-iterations. A restart has separate absolute iteration semantics.
+max_iterations = 10
+# true/false: extra physical plateau requirement in convergence checks.
+# FALSE does not force the native executable to report PASS after 10 steps.
+physical_gate = false
+# Momentum / pressure under-relaxation: reference 0.70 / 0.70.
+ur_u = 0.70
+ur_p = 0.70
+# SIMPLE outer diagnostic threshold (reference tightened for timing run).
+simple_tol = 1e-12
+# Continuity tolerance for convergence decision (NOT a crash threshold).
+continuity_atol = 1e-6
+# SST relative plateau tolerance and history size for convergence monitoring.
+# This is a NONLINEAR convergence criterion, NOT the scalar linear solver rtol.
+plateau_tol = 0.01
+plateau_samples = 5
+# IMPORTANT: 'early_stop' was present in the original case but NOT used by
+# nodals.py. It is omitted here rather than offering a fake on/off switch.
+
+[solver.u]
+# Available: m3-fgs (REFERENCE), m3-sgs, coupled-fgmres, m4-hybrid.
+# m4-hybrid compiled previously but has NOT passed GPU parity/performance tests.
+method = m3-fgs
+# Number of M3 fixed sweeps per SIMPLE outer, integer 1..60.
+sweeps = 5
+# M3 sweep damping/relaxation coefficient, reference 0.7.
+omega = 0.7
+# Following tolerances and restart are relevant to coupled-fgmres, NOT the
+# fixed M3-FGS5 reference. Changing them won't change M3 sweep work.
+rtol = 1e-6
+atol = 0
+max_iterations = 800
+restart = 30
+
+[solver.p]
+# Available native pressure solvers: pcg_amg (REFERENCE), pcg_jacobi.
+method = pcg_amg
+# Relative/absolute stopping tolerances and PCG iteration cap.
+rtol = 0.5
+atol = 1e-12
+max_iterations = 600
+
+[amg]
+# Supported hierarchy = cf only; coarsening = pmis only;
+# strength = classical-negative only (native currently enforces these).
+hierarchy = cf
+coarsening = pmis
+strength = classical-negative
+# Available interpolation: exti (REFERENCE), direct.
+interpolation = exti
+# AMG CF strength threshold; reference 0.25.
+theta = 0.25
+# Terminal coarse-system size threshold.
+terminal = 1000
+# Available smoothers: jacobi (REFERENCE), l1jacobi, cheb2, mcgs.
+# cheb2 requires a valid spectrum estimate; mcgs requires symmetric ordering.
+smoother = jacobi
+# Available fine mode: explicit (REFERENCE), matrixfree.
+# matrixfree requires pcg_amg, jacobi and fine_sweeps = 1.
+fine_mode = explicit
+# Jacobi fine/coarse sweeps; native reference uses 1 each.
+fine_sweeps = 1
+coarse_sweeps = 1
+# Optional advanced native settings for other AMG smoothers:
+# [native] amg-power-its = 16 (for cheb2); amg-mcgs-order = symmetric.
+
+[supg]
+# Each control is true/false; all OFF in frozen M3 reference.
+# Switching any to true CHANGES stabilization; test separately.
+momentum = false
+k = false
+omega = false
+# Momentum SUPG stabilization scale; reference dormant value 0.05.
+tau_scale = 0.05
+# Separate scalar SUPG scales; independent of momentum tau_scale.
+k_tau_scale = 0.05
+omega_tau_scale = 0.05
+
+[restart]
+# Blank = fresh simulation. For restart, enter a FULL Stage31 FP64 .ckpt path.
+# Example: path = /home/jd/NodalS_SST_LOCAL_RUNS/oldrun/NODALS_STAGE31_STATE_it200.ckpt
+# Relative paths are resolved against the location of this .case file.
+# max_iterations in [simple] is the ABSOLUTE target, e.g. 500 after it200.
+# CLI --restart overrides this path; CLI --steps 50 makes target it250.
+# A .vtu file is a visualization file and CANNOT restart the solver.
+path =
+# Only for legacy HXT1 binary mesh restart: optional explicit fingerprint.
+# input_fingerprint = <64-character checkpoint input fingerprint>
+
+[output]
+# Console: compact shows only every-N residual line, checkpoint notifications,
+# completion and errors; full also shows all native stage/debug messages.
+# Independently of console choice, terminal.log keeps full diagnostic text.
+console = compact
+# Positive cadence for concise residual report. 10 means 10,20,30... only.
+print_every = 10
+# Frequency for EXTRA pressure-drop/wall metrics and convergence plateau.
+# Must divide print_every. 10 = evaluate those only at reporting steps.
+# SIMPLE still computes corrected continuity and SST update safety every step.
+metrics_every = 10
+# Optional GPU diagnostic operator/audit actions: 0=OFF, N=every N steps.
+# This is distinct from ordinary physics checks and print_every.
+diagnostics_every = 0
+# Native optional historical final diagnostics, including hex-only section audit.
+# Keep false for generalized tetrahedral CFD; when true, hex-only section audit
+# is skipped on tetrahedral meshes. Final ordinary VTUs still get written.
+legacy_final_diagnostics = false
+# Native VTU visualization files at 100, 200, 300, ...; 0 disables periodic.
+# Final flow and SST VTUs are written separately on normal solver completion.
+vtu_every = 100
+# Native FULL-state binary restart checkpoints at 100, 200, 300,...
+# Distinct from VTU files. 0 disables even the converged-state checkpoint.
+checkpoint_every = 100
+# Blank = automatic fresh timestamped directory, or specify an absolute path.
+# CLI --output overrides directory.
+# directory = /home/jd/NodalS_SST_LOCAL_RUNS/ubend_current
+# VTU / restart subdirs, relative to that run's output folder. Blank => same.
+# vtu_dir = vtu
+# checkpoint_dir = checkpoints
+# CUDA event profiling and historical profile audit are OFF.
+profile = false
+profile_audit = false
+
+# -----------------------------------------------------------------------------
+# ADVANCED OPTIONAL SECTIONS. Uncomment only if you understand the native flags.
+# [native] sends 'option = value' to the compiled executable as '--option value'.
+# [environment] passes existing uppercase native environment controls.
+# These are transition mechanisms, not compulsory gates or install hashes.
+# -----------------------------------------------------------------------------
+# [native]
+# sst-k-linear-rtol = 1e-6
+# sst-omega-linear-rtol = 1e-6
+# amg-power-its = 16
+# amg-mcgs-order = symmetric
+#
+# [environment]
+# These passthrough fields are for advanced experiments; ordinary restart,
+# checkpoint and VTU settings now belong directly in [restart] and [output].

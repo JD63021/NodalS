@@ -1,0 +1,22 @@
+/build/
+/runs/
+/.cache/
+__pycache__/
+*.py[cod]
+*.o
+*.a
+*.so
+*.log
+*.vtu
+*.vtk
+*.bin
+*.ckpt
+*.tar.gz
+*.zip
+*.before*
+*.bak
+
+# Local experimental snapshots
+*.BEFORE_*
+*.BAK_*
+*.bak
