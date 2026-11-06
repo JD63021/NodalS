@@ -57,3 +57,11 @@ __pycache__/
 #   comparison_OpenFOAM12/
 # Those are intentionally versioned.
 # ------------------------------------------------------------
+
+# Locally generated numerical outputs (never commit)
+runs/
+.cache/
+build/
+*.ckpt
+*.bundle
+*.log

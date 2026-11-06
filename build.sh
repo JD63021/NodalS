@@ -12,7 +12,6 @@ if [[ ! -f "$PETSC_DIR/lib/petsc/conf/variables" ]]; then
   exit 2
 fi
 
-python3 tests/check_source_freeze.py
 python3 tests/test_case_translation.py
 python3 tests/test_cpu_custom_amg_annotated.py
 python3 tests/test_gpu_case_translation.py

@@ -8,8 +8,6 @@
 # Physical tags: 1 inlet at CAD u=end (same original patch_1_0), 2 outlet at CAD u=start (same original patch_2_0), 3 wall.
 # Inlet velocity = Q/A times inward unit normal; use mesh_stats.json for geometry.
 # D=4A/P from the NEW triangulated inlet; Re=U*D/nu, approximately 7970.1.
-# First 200 iterations fixed samples (0.50/0.50), then refresh at 200,450 and HOLD through 1000 (avoid third refresh after previous divergence).
-# Edit values in this file, or use RUN_SPIRAL.sh --set section.key=value.
 
 [mesh]
 format = msh2
@@ -71,12 +69,12 @@ ur_k = 0.3
 ur_omega = 0.3
 k_solver = fgs-fixed
 omega_solver = fgs-fixed
-k_sweeps = 40
-omega_sweeps = 40
+k_sweeps = 20
+omega_sweeps = 20
 check_every = 0
 
 [simple]
-max_iterations = 500
+max_iterations = 1000
 physical_gate = false
 ur_u = 0.7
 ur_p = 0.3
@@ -87,7 +85,7 @@ plateau_samples = 5
 
 [solver.u]
 method = m3-fgs
-sweeps = 40
+sweeps = 20
 omega = 0.7
 rtol = 1e-6
 atol = 0
@@ -96,7 +94,7 @@ restart = 30
 
 [solver.p]
 method = pcg_amg
-rtol = 1e-6
+rtol = 1e-3
 atol = 1e-12
 max_iterations = 600
 
@@ -133,15 +131,15 @@ vtu_every = 100
 checkpoint_every = 100
 profile = false
 profile_audit = false
-directory = ~/Downloads/NodalS_SST_SOFTWARE_V2/runs/SPIRAL_SWEPT_207K_YPLUS30_20SWEEPS
+directory = ../../runs/spiral_swept_207k_yplus30
 
 [adaptive_sampling]
 enabled = true
 first_refresh = 200
-refresh_every = 500
+refresh_every = 250
 max_refreshes = 2
-target_spalding_yplus = 300
-target_omega_yplus = 300
+target_spalding_yplus = 30
+target_omega_yplus = 30
 min_scale = 0.05
 max_scale = 0.90
 

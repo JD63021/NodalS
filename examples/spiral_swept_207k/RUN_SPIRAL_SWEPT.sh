@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${NODALS_ROOT:-$HOME/Downloads/NodalS_SST_SOFTWARE_V2}"
+ROOT="${NODALS_ROOT:-$(cd "$HERE/../../turbulence/sst_gpu_v2" && pwd)}"
 RUNNER="$HERE/run_adaptive_case.py"
 MESH="$HERE/spiral_swept_207360_24tet.msh"
 CASE="$HERE/SPIRAL_SWEPT_ADAPTIVE.case"
