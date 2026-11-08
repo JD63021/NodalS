@@ -39,23 +39,26 @@
           std::fflush(stdout);
         }
 #endif
-        if(stage33MomentumSupg){
-          if(!M.h.ntet||M.h.nhex||M.h.ninterface)
-            throw std::runtime_error("STAGE33A momentum SUPG currently PURETET_ONLY");
+        // Full SUPG implicit part (a.grad v, tau a.grad u); always paired with
+        // complete strong-residual Picard RHS in simple_pressure_predictor.inc.
+        if(momentumFullSupg){ // NODALS_UNIFIED_FULL_MOMENTUM_SUPG_V1
+          if(!M.h.ntet || M.h.nhex || M.h.ninterface)
+            throw std::runtime_error("Full momentum SUPG requires pure tetrahedra");
           hxt5d::stage33a_momentum_supg64<<<(M.h.ntet+7)/8,256>>>(
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,A.tetSlot.p,
             d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
             d_turb.p,d_diagRTurb.p,M.h.ntet,R,nu,
-            sstG1.kFloor,sstG1.omegaFloor,stage33TauScale,stage33Magic,d_bad.p);
-          HXT1_CUDA(cudaGetLastError());
-          HXT1_CUDA(cudaDeviceSynchronize());
-          unsigned long long s33bad=0;
-          HXT1_CUDA(cudaMemcpy(&s33bad,d_bad.p,sizeof(s33bad),cudaMemcpyDeviceToHost));
-          if(s33bad)throw std::runtime_error("STAGE33A invalid SUPG element state count="+std::to_string(s33bad));
+            sstG1.kFloor,sstG1.omegaFloor,stage33TauScale,stage33Magic,
+            1,d_bad.p);
+          HXT1_CUDA(cudaGetLastError());HXT1_CUDA(cudaDeviceSynchronize());
+          unsigned long long supgBad=0;
+          HXT1_CUDA(cudaMemcpy(&supgBad,d_bad.p,sizeof(supgBad),cudaMemcpyDeviceToHost));
+          if(supgBad)throw std::runtime_error("Full momentum SUPG LHS invalid cell count="+
+            std::to_string(supgBad));
           if(git<=2||git%sstG2PrintEvery==0)
-            std::printf("STAGE33A_MOM_ASSEMBLED it=%d cells=%llu tauScale=%.8g magic=%.8g "
-              "matrix=EXISTING_TURB_CSR_WITH_DIAG_UPDATE status=PASS\n",git,
-              (unsigned long long)M.h.ntet,stage33TauScale,stage33Magic);
+            std::printf("NODALS_MOMENTUM_FULL_SUPG_LHS_ASSEMBLED it=%d cells=%llu "
+              "tauScale=%.8g quadrature=64 pairedStrongRhs=YES status=PASS\n",
+              git,(unsigned long long)M.h.ntet,stage33TauScale);
         }
         hxt5d::assemble_boundary_sst(BH,d_inH,d_inT,d_wallH,d_pts,d_hc,d_tc,d_hv,d_tv,d_tg,A,d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,d_dg,d_diagDG,d_inletRhsX,d_inletRhsY,d_inletRhsZ,d_wall,d_diagWall,d_wallStats,d_bad,bulk,R,nu,wallSampleFraction,sstG1,momentumWallMode,spaldingMolecularConsistency,weakWallGamma,weakWallHScale,weakWallNutScale,
           (stage22Vector && !stage22d4Live),stage22Penalty,d_s22Rhs0.p,d_s22Rhs1.p,d_s22Rhs2.p,

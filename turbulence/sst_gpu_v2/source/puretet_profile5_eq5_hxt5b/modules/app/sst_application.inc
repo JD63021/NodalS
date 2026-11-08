@@ -233,15 +233,58 @@ int main(int argc,char**argv){
       throw std::runtime_error("NODALS_MOMENTUM_STRESS_FORM must be vector_laplacian or deviatoric");
     const bool implicitDevStress=(stressForm=="deviatoric");
     const char* s33Flag=std::getenv("STAGE33A_MOMENTUM_SUPG");
-    const bool stage33MomentumSupg=s33Flag&&std::string(s33Flag)=="1";
+    // Stage33A's old constant-viscosity/Laplacian residual is retired:
+    // it is not full strong-form SUPG for variable-viscosity SST.
+    const bool stage33MomentumSupg=false;
+    if(s33Flag && std::string(s33Flag)=="1")
+      throw std::runtime_error("Legacy Stage33A momentum SUPG is unsupported; "
+        "select [supg] momentum=true through nodals.py instead");
     if(s33Flag&&*s33Flag&&std::string(s33Flag)!="0"&&std::string(s33Flag)!="1")
       throw std::runtime_error("STAGE33A_MOMENTUM_SUPG must be 0/1");
     const double stage33TauScale=s33_env("STAGE33A_TAU_SCALE","0.05");
     const double stage33Magic=s33_env("STAGE33A_MAGIC","9");
-    std::printf("STAGE33A_MOM_SUPG=%s tauScale=%.8g magic=%.8g quadrature=64 "
-      "kernel=WARP_PER_TET strong=FROZEN_CENTROID_NU_PLUS_NUT_LAPLACIAN "
-      "pressure=P0_INTERIOR_ZERO scalarSUPG=OFF zeroExtraCSR=1 status=PASS\n",
-      stage33MomentumSupg?"ON":"OFF",stage33TauScale,stage33Magic);
+    // NODALS_SKEW_SD_DIAGNOSTIC_V1: opt-in positive streamline diffusion.
+    // Never active by default; *not* full residual-consistent RANS SUPG.
+    // NODALS_UNIFIED_FULL_MOMENTUM_SUPG_V1
+    // One canonical momentum switch for full element-interior strong residual.
+    // Older independent streamline-only and full-mode flags must not be used.
+    const char* oldSupgFlags[]={
+      "NODALS_SKEW_STREAMLINE_DIFFUSION",
+      "NODALS_SKEW_FULL_SUPG",
+      "NODALS_CONSERVATIVE_STREAMLINE_DIFFUSION",
+      "NODALS_CONSERVATIVE_FULL_SUPG",
+      "NODALS_SKEW_SD_TAU_SCALE", "NODALS_CONSERVATIVE_SD_TAU_SCALE",
+      "NODALS_SKEW_FULL_NU_FD_REL", "NODALS_CONSERVATIVE_FULL_NU_FD_REL"};
+    for(const char* key:oldSupgFlags){
+      const char* x=std::getenv(key);
+      if(x&&*x)
+        throw std::runtime_error(std::string("Deprecated independent momentum SUPG option ")+
+          key+"; remove it and set [supg] momentum=true/false");
+    }
+    const char* fullRaw=std::getenv("NODALS_MOMENTUM_FULL_SUPG");
+    const std::string fullFlag=(fullRaw&&*fullRaw)?std::string(fullRaw):"0";
+    if(fullFlag!="0" && fullFlag!="1")
+      throw std::runtime_error("NODALS_MOMENTUM_FULL_SUPG must be 0 or 1");
+    const bool momentumFullSupg=(fullFlag=="1");
+    const double supgViscosityFdRel=s33_env("NODALS_MOMENTUM_SUPG_NU_FD_REL","0.001");
+    if(momentumFullSupg){
+      if(!implicitDevStress || sstG1.deviatoricMomentum || momentumEmac)
+        throw std::runtime_error("Full momentum SUPG unsupported for requested stress/convection; "
+          "currently requires implicit deviatoric stress and advective, skew_symmetric, or conservative convection");
+      if(!std::isfinite(supgViscosityFdRel) || supgViscosityFdRel>0.01)
+        throw std::runtime_error("[supg] nu_fd_rel must be in (0,0.01]");
+    }
+    const bool momentumStreamlineDiffusion=momentumFullSupg;
+    const double activeSdTauScale=stage33TauScale;
+    const double convectionDivFactor=momentumSkew?0.5:(momentumConservative?1.0:0.0);
+    std::printf("NODALS_MOMENTUM_FULL_SUPG_CONFIG enabled=%d convection=%s "
+      "stress=%s divFactor=%.1f tauScale=%.8g fdRel=%.8g "
+      "residual=FULL_DEVIATORIC_ELEMENT_INTERIOR_PRESSURE_P0 "
+      "nuGrad=CENTERED_FD faceJumps=NOT_INCLUDED status=PASS\n",
+      (int)momentumFullSupg,momentumConvectionForm.c_str(),stressForm.c_str(),
+      convectionDivFactor,stage33TauScale,supgViscosityFdRel);
+
+    std::printf("NODALS_LEGACY_STAGE33A_SUPG=RETIRED canonical=FULL_RESIDUAL_ONLY\n");
     if(stage33MomentumSupg && implicitDevStress)
       throw std::runtime_error("momentum SUPG strong residual not yet available for implicit deviatoric stress");
     if(stage33MomentumSupg && sstG1.deviatoricMomentum)
@@ -261,7 +304,15 @@ int main(int argc,char**argv){
       throw std::runtime_error("STAGE32 requires OF_AUTO and --omega-sample-index 3 (Spalding samples 1..5 supported)");
     const char* yplusFaceInput=std::getenv("NODALS_FACE_YPLUS_UTAU_CSV");
     const bool faceYplusEnabled=yplusFaceInput && *yplusFaceInput;
-    const bool stage32Split=faceYplusEnabled || (stage32Requested &&
+    // NODALS_AUTO_CENTROID_SAMPLING_V1
+    const auto autoSwitch=[](const char*key){const char*p=std::getenv(key);
+      return p && std::string(p)=="1";};
+    const bool autoCentroidMode=autoSwitch("NODALS_AUTO_CENTROID_MODE");
+    const bool autoCentroidSp=autoSwitch("NODALS_AUTO_CENTROID_SP");
+    const bool autoCentroidOm=autoSwitch("NODALS_AUTO_CENTROID_OM");
+    if((autoCentroidSp||autoCentroidOm) && !autoCentroidMode)
+      throw std::runtime_error("NODALS_AUTO requires centroid mode");
+    const bool stage32Split=autoCentroidMode || faceYplusEnabled || (stage32Requested &&
       std::abs(stage32OmegaScale-stage32SpaldingScale)>1.e-13);
 
     if(stage24bN!=5 && sstG1.omegaWallMode!=hxt5c::OMEGA_WALL_OF_AUTO)
@@ -646,6 +697,8 @@ int main(int argc,char**argv){
     if(implicitDevStress && m3Mode=="m4")
       throw std::runtime_error("implicit deviatoric stress supports M3 FGS/SGS or coupled FGMRES, not experimental M4");
     const bool m3Active=m3Mode!="off";
+    if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
+      throw std::runtime_error("Full momentum SUPG requires M3 FGS or M3 SGS");
     const int m3Sweeps=s05b1Integer("NODALS_M3_SWEEPS",m3Mode=="sgs"?5:10,1,60);
     const double m3Omega=std::getenv("NODALS_M3_OMEGA")?
       std::stod(std::getenv("NODALS_M3_OMEGA")):0.7;
@@ -956,6 +1009,29 @@ int main(int argc,char**argv){
     // wall-face fitted friction velocities. No velocity field interpolation
     // from vertex-only VTU, and no moving samples during SIMPLE.
     std::vector<double> faceSpY3,faceOmY3;
+    std::vector<double> autoFaceUtau;
+    std::vector<hxt5b::AutoFaceGeometry> autoFaceGeometry;
+    std::vector<int> autoCornerFlags,autoSpFallback,autoOmFallback;
+    const double autoCornerDegrees=[](){const char*s=std::getenv("NODALS_AUTO_CORNER_DEGREES");
+      return s&&*s?std::stod(s):45.;}();
+    if(autoCentroidMode){
+      const std::string samplingMode=std::getenv("SST_WALL_SAMPLING_MODE")?
+        std::getenv("SST_WALL_SAMPLING_MODE"):"";
+      if(M.h.nhex!=0 || stage24bN!=1 || stage24bOmega!=3 ||
+         samplingMode!="ray_trace" || !f2FaceSpalding)
+        throw std::runtime_error("NODALS_AUTO requires pure-tet F2 ray_trace, one-point Spalding and omega index 3");
+      autoFaceGeometry=hxt5b::auto_face_geometry(M,BH.wallT,autoCornerDegrees);
+      autoCornerFlags.resize(autoFaceGeometry.size());
+      std::size_t corners=0;
+      for(std::size_t i=0;i<autoCornerFlags.size();++i){
+        autoCornerFlags[i]=autoFaceGeometry[i].nearSharpCorner?1:0; // NODALS_AUTO_CENTROID_CORNER_NEIGHBORHOOD_V11
+        corners+=(std::size_t)autoCornerFlags[i];
+      }
+      std::printf("NODALS_AUTO_CENTROID_CONFIG enabled=1 spAuto=%d omegaAuto=%d "
+        "wallFaces=%zu sharpCornerNeighborhoodFaces=%zu cornerAngleDegrees=%.3f "
+        "cellCentroidNormalHeight=3V_OVER_4A strictThinPolicy=ERROR status=PASS\n",
+        (int)autoCentroidSp,(int)autoCentroidOm,autoFaceGeometry.size(),corners,autoCornerDegrees);
+    }
     if(faceYplusEnabled){
       if(M.h.nhex!=0 || stage24bN!=1 || stage24bOmega!=3 || !f2FaceSpalding)
         throw std::runtime_error("NODALS_FACE_YPLUS requires pure tet, F2, fitPoints=1, omegaIndex=3");
@@ -976,11 +1052,13 @@ int main(int argc,char**argv){
       if(targetSp>500. || targetOm>500. || scaleMax>1. || scaleMin>scaleMax)
         throw std::runtime_error("NODALS_FACE_YPLUS target/scale range invalid");
       const char* baseScaleEnv=std::getenv("STAGE32_SPALDING_SAMPLE_SCALE");
-      const double baseScale=baseScaleEnv&&*baseScaleEnv?std::stod(baseScaleEnv):0.05;
+      if(!baseScaleEnv || !*baseScaleEnv)
+        throw std::runtime_error("NODALS_FACE_YPLUS requires explicit STAGE32_SPALDING_SAMPLE_SCALE; refusing unsafe 0.05 default");
+      const double baseScale=std::stod(baseScaleEnv);
       const double referenceFullScaleY3=sstG1.profileFitY3/baseScale;
       if(!(referenceFullScaleY3>0.))throw std::runtime_error("NODALS_FACE_YPLUS bad reference Y3");
-      const double yMin=referenceFullScaleY3*scaleMin;
-      const double yMax=referenceFullScaleY3*scaleMax;
+      const double yMin=autoCentroidMode?0.:referenceFullScaleY3*scaleMin;
+      const double yMax=autoCentroidMode?std::numeric_limits<double>::infinity():referenceFullScaleY3*scaleMax;
       faceSpY3.resize(BH.wallT.size());faceOmY3.resize(BH.wallT.size());
       std::ifstream in(yplusFaceInput);
       if(!in)throw std::runtime_error(std::string("NODALS_FACE_YPLUS cannot open input: ")+yplusFaceInput);
@@ -994,9 +1072,11 @@ int main(int argc,char**argv){
            fi!=(int)count || count>=BH.wallT.size() ||
            cell!=BH.wallT[count].cell || lf!=(int)BH.wallT[count].lf || !std::isfinite(utau) || utau<0.)
           throw std::runtime_error("NODALS_FACE_YPLUS input face/geometry mismatch at row "+std::to_string(count));
-        const double unboundedSp=utau>1.e-8?targetSp*nu/utau:sstG1.profileFitY3;
+        const double localCentroid=autoCentroidMode?autoFaceGeometry[count].centroidHeight:sstG1.profileFitY3;
+        const double unboundedSp=utau>1.e-8?targetSp*nu/utau:localCentroid;
         const double unboundedOm=utau>1.e-8?targetOm*nu/utau:
-          sstG1.profileFitY3*(targetOm/targetSp);
+          (autoCentroidMode?localCentroid:sstG1.profileFitY3*(targetOm/targetSp));
+        if(autoCentroidMode)autoFaceUtau.push_back(utau);
         if(!(utau>1.e-8))++fallback;
         const double sp=std::min(yMax,std::max(yMin,unboundedSp));
         const double om=std::min(yMax,std::max(yMin,unboundedOm));
@@ -1016,6 +1096,33 @@ int main(int argc,char**argv){
         "input=%s source=LAGGED_F2_FACE_UTAU status=PASS\n",
         count,targetSp,targetOm,scaleMin,scaleMax,fallback,clampSp,clampOm,
         minSp,sumSp/count,maxSp,minOm,sumOm/count,maxOm,yplusFaceInput);
+    }
+    // Initial stage: each physical wall face gets 3V/(4A), independently
+    // for Spalding and omega unless that field has an explicit numeric override.
+    // Subsequent stages: previous fitted face u_tau supplies y+ targets.
+    std::vector<double> autoCentroidHeights;
+    if(autoCentroidMode){
+      autoCentroidHeights.resize(BH.wallT.size());
+      for(std::size_t i=0;i<BH.wallT.size();++i)
+        autoCentroidHeights[i]=autoFaceGeometry[i].centroidHeight;
+      if(!faceYplusEnabled){
+        faceSpY3.resize(BH.wallT.size());faceOmY3.resize(BH.wallT.size());
+        for(std::size_t i=0;i<BH.wallT.size();++i){
+          faceSpY3[i]=autoCentroidSp?autoFaceGeometry[i].centroidHeight:sstG1.profileFitY3;
+          faceOmY3[i]=autoCentroidOm?autoFaceGeometry[i].centroidHeight:
+            sstG1.profileFitY3*stage32OmegaScale/stage32SpaldingScale;
+        }
+      }
+      const auto makeFlags=[&](const std::vector<double>&h,const char*kind,double yplus){
+        return hxt5b::auto_preflight_samples(M,BH.wallT,autoFaceGeometry,h,
+          autoFaceUtau,nu,yplus,kind,faceYplusEnabled);
+      };
+      const double spTarget=std::getenv("NODALS_FACE_YPLUS_SP")?
+        std::stod(std::getenv("NODALS_FACE_YPLUS_SP")):30.;
+      const double omTarget=std::getenv("NODALS_FACE_YPLUS_OMEGA")?
+        std::stod(std::getenv("NODALS_FACE_YPLUS_OMEGA")):30.;
+      autoSpFallback=makeFlags(faceSpY3,"SPALDING",spTarget);
+      autoOmFallback=makeFlags(faceOmY3,"OMEGA",omTarget);
     }
     std::vector<hxt5b::TetWallMatchPoint>tetMatchHost;
     if(!BH.wallT.empty()){
@@ -1048,8 +1155,14 @@ int main(int argc,char**argv){
           throw std::runtime_error("STAGE27_LOCAL_RAY_ADAPT must be 0 or 1");
         tetMatchHost=hxt5b::build_tet_wall_ray_profile_cache(
           M,BH.wallT,yy,maxCross,tol,requestedMask,
-          localRayAdapt || faceYplusEnabled,
-          faceYplusEnabled?&faceSpY3:nullptr);
+          autoCentroidMode?false:(localRayAdapt || faceYplusEnabled),
+          (autoCentroidMode || faceYplusEnabled)?&faceSpY3:nullptr,
+          autoCentroidMode?&autoSpFallback:nullptr,
+          autoCentroidMode?&autoCornerFlags:nullptr,
+          autoCentroidMode?&autoCentroidHeights:nullptr,
+          autoCentroidMode?&autoFaceUtau:nullptr,nu,
+          faceYplusEnabled?(std::getenv("NODALS_FACE_YPLUS_SP")?
+            std::stod(std::getenv("NODALS_FACE_YPLUS_SP")):30.):-1.);
         std::printf("SST_WALL_SAMPLING_RUNTIME method=ray_trace rayContainment=VERIFIED "
           "samples=%d activeMask=0x%x maxCrossings=%d baryTolerance=%.3e status=PASS\n",
           __builtin_popcount(requestedMask),requestedMask,maxCross,tol);
@@ -1147,7 +1260,14 @@ int main(int argc,char**argv){
       const bool adapt=local && std::string(local)=="1";
       const auto omegaFull=hxt5b::build_tet_wall_ray_profile_cache(
         M,BH.wallT,omegaHeights,maxCross,tol,1u<<2,
-        adapt || faceYplusEnabled,faceYplusEnabled?&faceOmY3:nullptr);
+         autoCentroidMode?false:(adapt || faceYplusEnabled),
+         (autoCentroidMode || faceYplusEnabled)?&faceOmY3:nullptr,
+         autoCentroidMode?&autoOmFallback:nullptr,
+         autoCentroidMode?&autoCornerFlags:nullptr,
+         autoCentroidMode?&autoCentroidHeights:nullptr,
+         autoCentroidMode?&autoFaceUtau:nullptr,nu,
+         faceYplusEnabled?(std::getenv("NODALS_FACE_YPLUS_OMEGA")?
+           std::stod(std::getenv("NODALS_FACE_YPLUS_OMEGA")):30.):-1.);
       if(omegaFull.size()!=s02b_quads*5u)
         throw std::runtime_error("STAGE32 omega ray count mismatch");
       std::vector<hxt5b::TetWallPackedPoint> packed(s02b_quads);

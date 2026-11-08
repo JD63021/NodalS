@@ -164,8 +164,6 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
             raise ValueError('conservative momentum convection requires sst.state_space=q1')
         if flag(cp,'sst','compact_p1',False):
             raise ValueError('conservative momentum convection requires noncompact masked-P1')
-        if flag(cp,'supg','momentum',False):
-            raise ValueError('conservative momentum convection cannot combine with momentum SUPG')
         if mode=='m4-hybrid':
             raise ValueError('conservative momentum convection not supported with experimental M4')
     if convection_form=='emac':
@@ -181,8 +179,21 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     if stress_form=='deviatoric':
         if state!='q1':raise ValueError('deviatoric stress currently requires sst.state_space=q1')
         if mode=='m4-hybrid':raise ValueError('deviatoric stress not supported for experimental M4')
-        if flag(cp,'supg','momentum',False):
-            raise ValueError('deviatoric stress does not yet support momentum SUPG')
+    if flag(cp,'supg','k',False) or flag(cp,'supg','omega',False):
+        raise ValueError('Full strong-residual scalar SUPG is not verified for k or omega; both must be false')
+    # Unified full strong-residual momentum SUPG. No streamline-only modes.
+    if flag(cp,'supg','momentum',False):
+        if stress_form!='deviatoric' or convection_form not in ('advective','skew_symmetric','conservative'):
+            raise ValueError('Full momentum SUPG is only available with deviatoric stress and advective, skew_symmetric or conservative convection')
+        if state!='q1' or flag(cp,'sst','compact_p1',False):
+            raise ValueError('Full momentum SUPG requires masked-P1/Q1 SST (state_space=q1, compact_p1=false)')
+        if mode not in ('m3-fgs','m3-sgs'):
+            raise ValueError('Full momentum SUPG requires M3 FGS or SGS')
+        fd=number(cp,'supg','nu_fd_rel',0.001)
+        if not 0 < fd <= 0.01:
+            raise ValueError('supg.nu_fd_rel must be in (0,0.01]')
+        if not number(cp,'supg','tau_scale',0.05)>0:
+            raise ValueError('supg.tau_scale must be positive')
     sweeps=integer(cp,'solver.u','sweeps',5)
     if not 1<=sweeps<=60:raise ValueError('solver.u.sweeps outside 1..60')
 
@@ -208,8 +219,23 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     omega_sample=integer(cp,'omega_wall','sample_index',3)
     if not (1<=samples<=5 and 1<=omega_sample<=5):
         raise ValueError('wall sample indices must be between 1 and 5')
-    scale=number(cp,'wall_function','spalding_sample_scale',0.5)
-    omega_scale=number(cp,'omega_wall','sample_scale',scale)
+    # NODALS_AUTO_CENTROID_SAMPLING_V1: opt-in geometry-based initial heights.
+    # A numeric scale overrides auto independently for each wall model.
+    auto_mode=get(cp,'wall_sampling','initial_distance','legacy_scale').strip().lower()
+    if auto_mode not in ('legacy_scale','first_cell_centroid'):
+        raise ValueError('wall_sampling.initial_distance must be legacy_scale or first_cell_centroid')
+    auto_enabled=(auto_mode=='first_cell_centroid')
+    def sampling_value(sec,key,fallback):
+        raw=get(cp,sec,key,fallback).strip().lower()
+        if raw=='auto':
+            if not auto_enabled:
+                raise ValueError(f'{sec}.{key}=auto requires [wall_sampling] initial_distance=first_cell_centroid')
+            return 0.5,True
+        return float(raw),False
+    scale,auto_sp=sampling_value('wall_function','spalding_sample_scale',
+                                 'auto' if auto_enabled else '0.5')
+    omega_scale,auto_om=sampling_value('omega_wall','sample_scale',
+                                 'auto' if auto_enabled else str(scale))
     if not (0.001<=scale<=1 and 0.001<=omega_scale<=1):
         raise ValueError('Sampling scales must be between 0.001 and 1')
     if get(cp,'wall_function','law','spalding')!='spalding':
@@ -278,6 +304,12 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'SST23_INLET_VELOCITY':','.join(map(fmt,vel)),
         'SST_WALL_DISTANCE_METHOD':get(cp,'wall_distance','method','geometric'),
         'SST_WALL_SAMPLING_MODE':ray_mode,
+        'NODALS_AUTO_CENTROID_MODE':'1' if auto_enabled else '0',
+        'NODALS_AUTO_CENTROID_SP':'1' if auto_sp else '0',
+        'NODALS_AUTO_CENTROID_OM':'1' if auto_om else '0',
+        'NODALS_AUTO_CORNER_DEGREES':get(cp,'wall_sampling','corner_angle_degrees','45'),
+        # NODALS_AUTO_THIN_CENTROID_V13: optional warning-only thin-passage fallback.
+        'NODALS_AUTO_THIN_POLICY':get(cp,'wall_sampling','thin_channel_policy','error').strip().lower(),
         'SST_WALL_RAY_MAX_CROSSINGS':str(ray_cross),
         'SST_WALL_RAY_BARY_TOLERANCE':fmt(ray_tol),
         'STAGE27_S02B_PACK':'1',
@@ -289,9 +321,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         # Only request the separate omega ray when the physical sample
         # distances differ. Same-scale cases use the original shared ray path,
         # which supports all 1..5 Spalding fitting points unchanged.
-        **({'STAGE32_SPALDING_SAMPLE_SCALE':fmt(scale),
-            'STAGE32_OMEGA_SAMPLE_SCALE':fmt(omega_scale)}
-           if abs(scale-omega_scale)>1.e-13 else {}),
+        'STAGE32_SPALDING_SAMPLE_SCALE':fmt(scale),
+        'STAGE32_OMEGA_SAMPLE_SCALE':fmt(omega_scale),
         'SST22_TRACTION_MODEL':'vector_projected',
         'SST22D4_NITSCHE_ENABLE':'1',
         'SST22D4_GAMMA_N':fmt(number(cp,'wall_function','nitsche_gamma',1e-6)),
@@ -319,7 +350,9 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'STAGE27_S05B2_FAST_SCALAR_ACTION':'1',
         'STAGE27_S05B1_MOM_MODE':'inherit',
         'STAGE27_S05B3_MOM_MODE':'inherit',
-        'STAGE33A_MOMENTUM_SUPG':str(int(flag(cp,'supg','momentum',False))),
+        'STAGE33A_MOMENTUM_SUPG':'0',  # retired approximate residual
+        'NODALS_MOMENTUM_FULL_SUPG':str(int(flag(cp,'supg','momentum',False))),
+        'NODALS_MOMENTUM_SUPG_NU_FD_REL':fmt(number(cp,'supg','nu_fd_rel',0.001)),
         'STAGE33BC_K_SUPG':str(int(flag(cp,'supg','k',False))),
         'STAGE33BC_OMEGA_SUPG':str(int(flag(cp,'supg','omega',False))),
         'STAGE33A_TAU_SCALE':fmt(number(cp,'supg','tau_scale',0.05)),
@@ -380,6 +413,14 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         for k,v in cp.items('environment'):
             key=k.upper()
             if not re.fullmatch(r'[A-Z_][A-Z_0-9]*',key):raise ValueError('Invalid environment key '+k)
+            if key in {
+                'NODALS_SKEW_STREAMLINE_DIFFUSION','NODALS_SKEW_SD_TAU_SCALE',
+                'NODALS_SKEW_FULL_SUPG','NODALS_SKEW_FULL_NU_FD_REL',
+                'NODALS_CONSERVATIVE_STREAMLINE_DIFFUSION','NODALS_CONSERVATIVE_SD_TAU_SCALE',
+                'NODALS_CONSERVATIVE_FULL_SUPG','NODALS_CONSERVATIVE_FULL_NU_FD_REL',
+                'STAGE33A_MOMENTUM_SUPG','NODALS_MOMENTUM_FULL_SUPG',
+                'NODALS_MOMENTUM_SUPG_NU_FD_REL'}:
+                raise ValueError(f'Deprecated/restricted momentum SUPG environment key {key}; use [supg] momentum, tau_scale, nu_fd_rel')
             env[key]=v
 
     native=[str(args.binary),'--mesh',str(mesh),'--vtu',str(output/'flow_sst.vtu'),

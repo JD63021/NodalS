@@ -4,7 +4,11 @@
 inline std::vector<TetWallMatchPoint> build_tet_wall_ray_profile_cache(
     const HostMesh&M,const std::vector<TetFacePlan>&faces,const double y[5],
     int maxCrossings,double baryTolerance,unsigned activeMask=0x1fu, bool localAdapt=false,
-    const std::vector<double>* faceY3=nullptr)
+    const std::vector<double>* faceY3=nullptr,
+    const std::vector<int>* cornerFallback=nullptr,
+    const std::vector<int>* isCorner=nullptr,
+    const std::vector<double>* centroidY=nullptr,
+    const std::vector<double>* wallUtau=nullptr,double nu=0.,double targetYplus=0.)
 {
   using namespace ::nodals::wall::ray;
   std::vector<P> vertices;vertices.reserve(M.points.size());
@@ -33,6 +37,21 @@ inline std::vector<TetWallMatchPoint> build_tet_wall_ray_profile_cache(
     throw std::runtime_error("NODALS_FACE_YPLUS_BAD_BASE_HEIGHT");
   if(localAdapt && activeSlots.size()!=1)
     throw std::runtime_error("STAGE27_LOCAL_RAY_ADAPT requires exactly one active physical slot");
+  // NODALS_AUTO_CENTROID_SAMPLING_V1: only one active Spalding sample
+  // may fall back to the actual owner-cell centroid. The old ray path is unchanged.
+  if(cornerFallback && (cornerFallback->size()!=faces.size()*12u ||
+      !centroidY || centroidY->size()!=faces.size() ||
+      !isCorner || isCorner->size()!=faces.size() ||
+      activeSlots.size()!=1 || activeSlots.front()!=2))
+    throw std::runtime_error("NODALS_AUTO corner fallback requires point #3 only");
+  // NODALS_AUTO_THIN_CENTROID_V13 : if ray leaves fluid in a thin passage, use valid
+  // owner-tetra centroid. Keep the old strict option as the default.
+  const char* thinRaw=std::getenv("NODALS_AUTO_THIN_POLICY");
+  const std::string thinPolicy=(thinRaw&&*thinRaw)?std::string(thinRaw):"error";
+  if(thinPolicy!="error" && thinPolicy!="centroid_fallback_warn")
+    throw std::runtime_error("NODALS_AUTO_THIN_POLICY invalid");
+  const bool thinFallback=cornerFallback && thinPolicy=="centroid_fallback_warn";
+  std::size_t autoFallbackQuads=0,thinRayFallbackQuads=0;
   std::size_t shortened=0;
   double minFraction=1.0,maxFraction=0.0;
   const double floorFraction=0.25,safety=0.90;
@@ -59,8 +78,28 @@ inline std::vector<TetWallMatchPoint> build_tet_wall_ray_profile_cache(
       std::vector<Hit> hits;
       std::vector<double> localHeights=distances;
       bool locallyShortened=false;
-      try{hits=locator.trace(f.cell,start,inward,distances,maxCrossings,baryTolerance);}
-      catch(const std::exception&e){
+      const int geometricReason=cornerFallback ? (*cornerFallback)[fi*12u+(std::size_t)q] : 0;
+      bool useCentroid=geometricReason!=0; // NODALS_AUTO_THIN_CENTROID_V13
+      std::string cornerReason=geometricReason==2 ? "THIN_CHANNEL_PREFLIGHT" : "NEAREST_ADJACENT_CORNER";
+      if(!useCentroid){
+        try{hits=locator.trace(f.cell,start,inward,distances,maxCrossings,baryTolerance);}
+        catch(const std::exception&e){
+          // Near a recognized sharp corner it is acceptable to use the
+          // *actual* first tetrahedron centroid, never a fabricated ray hit.
+          const std::string rayFailure=e.what();
+          const bool obstructedRay=
+            rayFailure.find("wall-normal ray exited fluid")!=std::string::npos ||
+            rayFailure.find("no forward face-connected tetra")!=std::string::npos ||
+            rayFailure.find("no forward progress")!=std::string::npos ||
+            rayFailure.find("unable to make forward topological progress")!=std::string::npos;
+          // Keep unrelated invalid-policy/tetra errors fatal even in warning mode.
+          if(cornerFallback && ((*cornerFallback)[fi*12u+(std::size_t)q] ||
+                                 (thinFallback && obstructedRay))){
+            useCentroid=true;
+            cornerReason=((*cornerFallback)[fi*12u+(std::size_t)q])==1 ?
+              "RAY_FAILED_AT_SHARP_CORNER" : "THIN_CHANNEL_RAY_FAILURE";
+            if(thinFallback && geometricReason==0)++thinRayFallbackQuads;
+          }else{
         if(localAdapt){
           const double requested=distances.front();
           double lo=0.,hi=requested;
@@ -111,6 +150,24 @@ inline std::vector<TetWallMatchPoint> build_tet_wall_ray_profile_cache(
           " requestedY="+std::to_string(distances[(std::size_t)ordinal[failedSlot]])+
           " strictContainment=FAIL "+e.what());
         }
+          } // non-corner old local adaptation path
+        } // ray catch
+      } // not a preset corner fallback
+      if(useCentroid){
+        const double h=(*centroidY)[fi];
+        if(!(h>0. && std::isfinite(h)))
+          throw std::runtime_error("NODALS_AUTO bad cell-centroid fallback height");
+        Hit z;z.cell=f.cell;z.bary={0.25,0.25,0.25,0.25};z.crossings=0;
+        hits.assign(1,z);localHeights.assign(1,h);
+        ++autoFallbackQuads;
+        if(autoFallbackQuads<=20){
+          const double u=wallUtau && !wallUtau->empty()?(*wallUtau)[fi]:0.;
+          const double achieved=(u>0.&&nu>0.)?h*u/nu:-1.;
+          std::printf("NODALS_AUTO_CORNER_CENTROID_USED face=%zu q=%d reason=%s "
+            "requestedY=%.9g centroidY=%.9g targetYplus=%.9g achievedYplus=%.9g "
+            "status=FALLBACK\n",fi,q,cornerReason.c_str(),
+            distances.front(),h,targetYplus,achieved);
+        }
       }
       (void)locallyShortened;
       for(int m=0;m<5;++m){
@@ -135,6 +192,11 @@ inline std::vector<TetWallMatchPoint> build_tet_wall_ray_profile_cache(
     }
   }
   const std::size_t actualRays=faces.size()*12u*activeSlots.size();
+  if(cornerFallback)std::printf("NODALS_AUTO_CENTROID_FALLBACK_SUMMARY "
+      "totalQuads=%zu fallbackQuads=%zu unexpectedRayFailures=%zu "
+      "centroid=ACTUAL_OWNER_TET policy=%s fallbackLogTruncated=%d status=PASS\n",
+      faces.size()*12u,autoFallbackQuads,thinRayFallbackQuads,
+      thinPolicy.c_str(),(int)(autoFallbackQuads>20));
   std::printf("STAGE27_LOCAL_RAY_STATS enabled=%d wallQuads=%zu shortened=%zu "
     "fraction=%.9g minRetainedFrac=%.9g maxRetainedFrac=%.9g "
     "safety=0.90 minAllowed=0.25 strictContainment=YES physicalHeight=PER_QUAD status=PASS\n",

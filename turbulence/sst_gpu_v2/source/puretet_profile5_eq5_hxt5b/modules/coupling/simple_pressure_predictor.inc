@@ -52,6 +52,29 @@
           hxt5b::s22b_add_rhs<<<(nv+TPB-1)/TPB,TPB>>>(nv,d_s22Rhs2.p,d_rhs2.p);
         if(sstG1.deviatoricMomentum && (git<=5||git%sstG2PrintEvery==0))
           std::printf("NODALS_SST_DEVIATORIC_RHS it=%d norm=[%.12e,%.12e,%.12e] status=PASS\n",git,ured.norm(d_sstDevRhs0.p),ured.norm(d_sstDevRhs1.p),ured.norm(d_sstDevRhs2.p));
+        // NODALS_UNIFIED_FULL_MOMENTUM_SUPG_V1: complete element-interior
+        // residual with matching Picard carrier and matched 64-point tau.
+        // P0 pressure has zero cell-interior gradient; no face jumps included.
+        if(momentumFullSupg){
+          HXT1_CUDA(cudaMemset(d_bad.p,0,sizeof(unsigned long long)));
+          hxt5d::momentum_full_deviatoric_supg_rhs64<<<M.h.ntet,64>>>(
+            d_pts.p,d_tc.p,d_tv.p,d_tg.p,
+            d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
+            d_rhs0.p,d_rhs1.p,d_rhs2.p,M.h.ntet,R,nu,
+            sstG1.kFloor,sstG1.omegaFloor,stage33TauScale,stage33Magic,
+            supgViscosityFdRel,convectionDivFactor,d_bad.p);
+          HXT1_CUDA(cudaGetLastError());HXT1_CUDA(cudaDeviceSynchronize());
+          unsigned long long fullBad=0;
+          HXT1_CUDA(cudaMemcpy(&fullBad,d_bad.p,sizeof(fullBad),cudaMemcpyDeviceToHost));
+          if(fullBad)throw std::runtime_error("Full momentum SUPG RHS invalid cell count="+
+            std::to_string(fullBad));
+          if(git==1 || git%sstG2PrintEvery==0)
+            std::printf("NODALS_MOMENTUM_FULL_SUPG_RHS_ASSEMBLED it=%d cells=%llu "
+              "divCarrierFactor=%.1f strong=FULL_DEVIATORIC_ELEMENT_INTERIOR "
+              "nuGrad=FD_LOCAL_SST bf3Hessian=ANALYTIC pressure=P0_CELL_ZERO "
+              "rhs=PICARD_DEFERRED status=PASS\n",
+              git,(unsigned long long)M.h.ntet,convectionDivFactor);
+        }
         predAuditMark(3);
         double s22d4dR0=0.,s22d4dR1=0.;
         if(stage22d4Live){

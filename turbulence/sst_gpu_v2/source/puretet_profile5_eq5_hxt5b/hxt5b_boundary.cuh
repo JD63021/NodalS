@@ -12,6 +12,7 @@
 #include <map>
 #include "modules/wall/portable/spalding_core.hpp"
 #include "modules/wall/portable/tet_ray_trace.hpp"
+#include "modules/geometry/wall_distance_host.hpp" // shared wall triangle BVH
 
 #include "modules/wall/portable/spalding_vector_core.hpp"
 #include "modules/wall/portable/spalding_active.hpp"
@@ -1127,6 +1128,7 @@ bool spalding_match_profile3(
 
 #include "modules/wall/tet_wall_match_cache.inc"
 #include "modules/wall/tet_wall_ray_cache.inc"
+#include "modules/wall/auto_centroid_sampling.inc" // NODALS_AUTO_CENTROID_SAMPLING_V1
 
 template<class T>
 __device__ __forceinline__

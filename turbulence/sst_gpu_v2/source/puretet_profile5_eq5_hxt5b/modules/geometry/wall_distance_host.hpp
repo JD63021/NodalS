@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <limits>
 #include <numeric>
+#include <utility>
 #include <stdexcept>
 #include <vector>
 namespace nodals { namespace geometry {
@@ -78,6 +79,28 @@ public:
     order_.resize(tri_.size());std::iota(order_.begin(),order_.end(),0);nodes_.reserve(2*tri_.size());build(0,(int)tri_.size());
   }
   double distance(const P3&p)const{double q=std::numeric_limits<double>::infinity();visit(0,p,q);return std::sqrt(q);}
+  // NODALS_AUTO_CENTROID_SAMPLING_V1: nearest triangle ID for adjacent-corner
+  // vs independent/opposite-wall classification. Pure host BVH query.
+  std::pair<double,int> nearest(const P3&p)const{
+    double best=std::numeric_limits<double>::infinity();int which=-1;
+    auto walk=[&](auto&& self,int node)->void{
+      const Node& n=nodes_[(std::size_t)node];
+      if(box_dist2(p,n.lo,n.hi)>=best)return;
+      if(n.left<0){
+        for(int j=n.begin;j<n.end;++j){
+          const int k=order_[(std::size_t)j];const double d=dist_triangle2(p,tri_[(std::size_t)k]);
+          if(d<best){best=d;which=k;}
+        }
+        return;
+      }
+      const Node&a=nodes_[(std::size_t)n.left],&b=nodes_[(std::size_t)n.right];
+      const double da=box_dist2(p,a.lo,a.hi),db=box_dist2(p,b.lo,b.hi);
+      if(da<=db){if(da<best)self(self,n.left);if(db<best)self(self,n.right);}
+      else{if(db<best)self(self,n.right);if(da<best)self(self,n.left);}
+    };
+    walk(walk,0);
+    return {std::sqrt(best),which};
+  }
 };
 template<class Mesh> std::vector<double> vertex_wall_distances(const Mesh&M,const nodals::mesh::Registry&R){
   if(M.h.nhex||!M.h.ntet)throw std::runtime_error("STAGE20 geometric distance currently requires pure tetrahedral HXT1");
