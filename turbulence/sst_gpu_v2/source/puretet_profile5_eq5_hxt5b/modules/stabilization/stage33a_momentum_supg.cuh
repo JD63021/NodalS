@@ -38,7 +38,7 @@ __global__ void stage33a_momentum_supg64(
     const Real* __restrict__ k,const Real* __restrict__ omega,
     Real* __restrict__ momAdd,Real* __restrict__ diagAdd,
     std::uint64_t nc,double radius,double nu,double kFloor,double omegaFloor,
-    double tauScale,double magic,unsigned long long* __restrict__ bad)
+    double tauScale,double magic,int streamlineOnly,unsigned long long* __restrict__ bad)
 {
   constexpr int NW=8;
   const int lane=(int)threadIdx.x&31;
@@ -139,7 +139,7 @@ __global__ void stage33a_momentum_supg64(
         }
         const double st=ax*gx+ay*gy+az*gz;
         stream[w][a]=st;
-        strong[w][a]=st-nuEff[w]*lap;
+        strong[w][a]=streamlineOnly ? st : st-nuEff[w]*lap; // NODALS_SKEW_SD_DIAGNOSTIC_V1
       }
       if(lane==0){
         const double speed2=ax*ax+ay*ay+az*az;

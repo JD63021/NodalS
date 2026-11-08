@@ -1237,6 +1237,7 @@ __global__ void sst_mom_tet(
 // ============================================================
 // STAGE33A_MOM_SUPG: optional GPU warp-per-tet operator
 #include "modules/stabilization/stage33a_momentum_supg.cuh"
+#include "modules/stabilization/momentum_full_residual_supg.cuh" // NODALS_UNIFIED_FULL_MOMENTUM_SUPG_V1
 // HXT5D_SST_MOM_INTERFACE_CACHED_V1
 //
 // Same turbulent hybrid momentum-interface contribution as
