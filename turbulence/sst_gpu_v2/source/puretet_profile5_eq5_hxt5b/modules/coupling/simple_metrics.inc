@@ -32,7 +32,18 @@
             std::printf("SST22C_AXIAL_FORCE_COMPARISON it=%d pressureForce=%.12e wallTractionIntegral=%.12e "
               "difference=%.12e closure=NOT_COMPLETE_CONVECTIVE_AND_DIFFUSIVE_TERMS_NOT_INCLUDED status=PASS\n",
               git,pressureAxial,s22cPostWallAxial,pressureAxial-s22cPostWallAxial);
-          }finalY=ws2.yPlusMean;if(git%sstG2PrintEvery==0 && (!stage22d4Live || stage27AuditPolicy.disabled() || stage27AuditCorrectedAt==git)){hf.push_back(finalF);hy.push_back(finalY);hdp.push_back(finalDp);while((int)hf.size()>sstG2PlateauSamples){hf.erase(hf.begin());hy.erase(hy.begin());hdp.erase(hdp.begin());}}double sf=relSpan(hf),sy=relSpan(hy),sd=relSpan(hdp);bool have=(int)hf.size()>=sstG2PlateauSamples;const nodals::coupling::GateInputs gateInputs={cn,cstatsActive.localMax,sstG2ContAtol,
+          }finalY=ws2.yPlusMean;
+          // NODALS_SST_PLOT_METRICS_V1: report already-computed quantities.
+          // Independent of P1 masking, momentum form, SUPG and plateau mode.
+          if(git%sstG2PrintEvery==0 || git==sstG2Max){
+            std::printf("NODALS_SST_PLOT_METRICS it=%d pressureDrop=%.12e "
+                        "wallDarcy=%.12e wallYPlusMean=%.12e\n",
+                        git,finalDp,finalF,finalY);
+            std::fflush(stdout);
+          }
+
+          metricGate.observe(git,finalF,finalDp,stage27AuditPolicy.disabled() || stage27AuditCorrectedAt==git);
+          if(git%sstG2PrintEvery==0 && (!stage22d4Live || stage27AuditPolicy.disabled() || stage27AuditCorrectedAt==git)){hf.push_back(finalF);hy.push_back(finalY);hdp.push_back(finalDp);while((int)hf.size()>sstG2PlateauSamples){hf.erase(hf.begin());hy.erase(hy.begin());hdp.erase(hdp.begin());}}double sf=relSpan(hf),sy=relSpan(hy),sd=relSpan(hdp);bool have=(int)hf.size()>=sstG2PlateauSamples;const nodals::coupling::GateInputs gateInputs={cn,cstatsActive.localMax,sstG2ContAtol,
             {tr.kRel,tr.omegaRel,tr.nutRel,tr.stats.kFloorFrac,tr.stats.omegaFloorFrac},simpleTol,
             {stage22d4iEnable?s22d4i2Mx:ma0,
              stage22d4iEnable?s22d4i2My:ma1,
@@ -44,6 +55,26 @@
           // and scalar/continuity residuals individually pass.
           if(stage22d4Live && stage27AuditPolicy.checkpoint() &&
              stage27AuditCorrectedAt!=git)g2Converged=false;
+          if(metricGate.active()){
+            const bool healthy=std::isfinite(cn)&&std::isfinite(finalDp)&&
+              std::isfinite(tr.kRel)&&std::isfinite(tr.omegaRel)&&
+              std::isfinite(tr.nutRel)&&std::isfinite(ma0)&&
+              std::isfinite(ma1)&&std::isfinite(ma2)&&
+              tr.stats.kFloorFrac<0.01 && tr.stats.omegaFloorFrac<0.01;
+            const bool residualsOk=!metricGate.requireResiduals||
+              (massok && turbok && momok);
+            g2Converged=healthy && metricGate.passed() && residualsOk;
+            if(git%sstG2PrintEvery==0 || g2Converged){
+              std::printf("NODALS_METRIC_GATE it=%d metric=%s window=%zu/%d "
+                "relativeSpanWall=%.9e relativeSpanDP=%.9e tol=%.9e "
+                "metricOK=%d healthy=%d residualsOK=%d massOK=%d turbOK=%d momOK=%d converged=%d\n",
+                git,metricGate.mode.c_str(),metricGate.drop.size(),metricGate.window,
+                metricGate.wallSpan(),metricGate.dropSpan(),metricGate.tolerance,
+                (int)metricGate.passed(),(int)healthy,(int)residualsOk,
+                (int)massok,(int)turbok,(int)momok,(int)g2Converged);
+            }
+          }
+
           if(stage22d4iEnable)std::printf("STAGE22D4I2_MOM_GATE it=%d "
             "reduced=[%.12e,%.12e,%.12e] tol=%.12e momOK=%d "
             "massOK=%d turbOK=%d physicalOK=%d converged=%d status=PASS\n",
