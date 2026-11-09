@@ -104,6 +104,7 @@ def compact_line(line):
     # clean operator-facing console at the selected residual cadence.
     return line.startswith((
         'NODALS_SST_RESIDUALS ',
+        'NODALS_SST_PLOT_METRICS ',
         'NODALS_SST_G2_VTU_CHECKPOINT ',
         'STAGE31_RESTART_SAVE=',
         'STAGE31_RESTART_LOAD=',
@@ -113,6 +114,7 @@ def compact_line(line):
         'NODALS_SOFTWARE_ERROR ',
         'CUDA_ERROR',
         'NODALS_SST_G2_FINAL ',
+        'NODALS_METRIC_GATE ',
     ))
 
 def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
@@ -162,13 +164,13 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     if convection_form in ('conservative','skew_symmetric'):
         if state!='q1':
             raise ValueError('conservative momentum convection requires sst.state_space=q1')
-        if flag(cp,'sst','compact_p1',False):
-            raise ValueError('conservative momentum convection requires noncompact masked-P1')
+        # Pure compact P1 changes only scalar k/omega transport; skew and conservative momentum
+        # operate on the unchanged P1+BF3 velocity space. Retain other model checks.
         if mode=='m4-hybrid':
             raise ValueError('conservative momentum convection not supported with experimental M4')
     if convection_form=='emac':
-        if state!='q1' or flag(cp,'sst','compact_p1',False):
-            raise ValueError('EMAC momentum requires noncompact masked-P1 scalar state')
+        if state!='q1':
+            raise ValueError('EMAC momentum requires sst.state_space=q1')
         if mode not in ('m3-fgs','m3-sgs'):
             raise ValueError('EMAC momentum currently requires M3 FGS or SGS')
         if flag(cp,'supg','momentum',False):
@@ -185,8 +187,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     if flag(cp,'supg','momentum',False):
         if stress_form!='deviatoric' or convection_form not in ('advective','skew_symmetric','conservative'):
             raise ValueError('Full momentum SUPG is only available with deviatoric stress and advective, skew_symmetric or conservative convection')
-        if state!='q1' or flag(cp,'sst','compact_p1',False):
-            raise ValueError('Full momentum SUPG requires masked-P1/Q1 SST (state_space=q1, compact_p1=false)')
+        if state!='q1':
+            raise ValueError('Full momentum SUPG requires sst.state_space=q1')
         if mode not in ('m3-fgs','m3-sgs'):
             raise ValueError('Full momentum SUPG requires M3 FGS or SGS')
         fd=number(cp,'supg','nu_fd_rel',0.001)
@@ -210,6 +212,16 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     print_every=integer(cp,'output','print_every',10)
     metrics_every=integer(cp,'output','metrics_every',10)
     check_every=integer(cp,'sst','check_every',10)
+    conv_metric=get(cp,'convergence','metric','legacy').strip().lower()
+    if conv_metric not in ('legacy','pressure_drop','wall_traction','both'):
+        raise ValueError('convergence.metric must be legacy, pressure_drop, wall_traction or both')
+    conv_tol=number(cp,'convergence','relative_tolerance',0.01)
+    conv_window=integer(cp,'convergence','window_iterations',25)
+    conv_require_residuals=flag(cp,'convergence','require_residuals',True)
+    if not (0 < conv_tol < 1) or not (2 <= conv_window <= 10000):
+        raise ValueError('convergence tolerance must be (0,1), window_iterations 2..10000')
+    if conv_metric!='legacy' and metrics_every!=1:
+        raise ValueError('convergence.metric requires output.metrics_every=1 for consecutive SIMPLE iterations')
     if print_every<1 or metrics_every<1 or print_every%metrics_every!=0:
         raise ValueError('output.print_every must be a positive multiple of output.metrics_every')
     if check_every>0 and print_every%check_every!=0:
@@ -423,6 +435,12 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
                 raise ValueError(f'Deprecated/restricted momentum SUPG environment key {key}; use [supg] momentum, tau_scale, nu_fd_rel')
             env[key]=v
 
+    # A separate optional physics-plateau gate. Environment is emitted after
+    # user [environment] passthrough so parsed [convergence] is authoritative.
+    env['NODALS_CONV_METRIC']=conv_metric
+    env['NODALS_CONV_RTOL']=fmt(conv_tol)
+    env['NODALS_CONV_WINDOW']=str(conv_window)
+    env['NODALS_CONV_REQUIRE_RESIDUALS']='1' if conv_require_residuals else '0'
     native=[str(args.binary),'--mesh',str(mesh),'--vtu',str(output/'flow_sst.vtu'),
         '--re',fmt(reynolds),'--bulk',fmt(bulk),
         '--sst-g2','1','--sst-g2-start','plug',
@@ -501,6 +519,59 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     return native,env,dict(reynolds=reynolds,bulk=bulk,diameter=diameter,nu=nu,
                            scalar_space=state,momentum=mode,outer_iteration_limit=iterations,
                            wall_sampling=ray_mode,profile_fit_heights=fit_heights)
+
+# NODALS_SST_OPTIONAL_LOG_MONITOR_V1
+# Plotting is an optional observer, never a solver dependency or convergence gate.
+def maybe_launch_plot_monitor(cp, output):
+    try:
+        if not flag(cp, 'output', 'live_monitor', False):
+            return
+        import importlib.util
+        import threading
+        import time
+        refresh = number(cp, 'output', 'monitor_refresh_seconds', 3.0)
+        pressure_scale = number(cp, 'output', 'monitor_pressure_scale', 1.0)
+        if not (0.2 <= refresh <= 3600.0 and pressure_scale > 0):
+            raise ValueError('monitor refresh must be 0.2..3600 s and pressure scale >0')
+        script = ROOT/'tools'/'nodals_live_monitor.py'
+        if not script.is_file():
+            raise FileNotFoundError('monitor script missing: '+str(script))
+        if importlib.util.find_spec('matplotlib') is None:
+            raise RuntimeError('matplotlib not installed; install python3-matplotlib')
+        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            raise RuntimeError('GUI display missing (DISPLAY/WAYLAND_DISPLAY not set)')
+        error_log=output/'nodals_monitor_errors.log'
+        with error_log.open('a') as error_stream:
+            proc = subprocess.Popen(
+                [sys.executable, str(script), '--log', str(output/'terminal.log'),
+                 '--interval', fmt(refresh), '--pressure-scale', fmt(pressure_scale)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=error_stream, start_new_session=True)
+        # Use an actual file (not a PIPE). The GUI can outlive nodals.py and
+        # still report errors without keeping the solver's tee pipe open.
+        def relay_errors():
+            try:
+                with error_log.open('r') as report:
+                    while True:
+                        line=report.readline()
+                        if line:
+                            if line.strip():
+                                print('NODALS_MONITOR_ERROR '+line.rstrip()+' (solver continues)',
+                                      file=sys.stderr,flush=True)
+                        elif proc.poll() is not None:
+                            break
+                        else:
+                            time.sleep(0.5)
+            except Exception:
+                pass
+        threading.Thread(target=relay_errors, daemon=True).start()
+        print('NODALS_MONITOR_STARTED pid='+str(proc.pid)+
+              ' log='+str(output/'terminal.log')+
+              ' errors='+str(error_log)+
+              ' independent=1 solverGate=UNCHANGED',flush=True)
+    except Exception as exc:
+        print('NODALS_MONITOR_ERROR '+str(exc)+'; solver continues unchanged',
+              file=sys.stderr,flush=True)
 
 def run(args):
     args.case=absolute(args.case,Path.cwd())
@@ -607,6 +678,7 @@ def run(args):
     if get(cp,'output','console','compact').strip().lower() not in ('compact','full'):
         raise ValueError('output.console must be compact or full')
     with (out/'terminal.log').open('w') as f:
+        maybe_launch_plot_monitor(cp, out)
         proc=subprocess.Popen(argv,env={**clean_parent,**env},cwd=out,
                               stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
                               text=True,errors='replace',bufsize=1)

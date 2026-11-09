@@ -1,3 +1,4 @@
+#include "../coupling/g2_metric_plateau.hpp"
 // NODALS_FACE_YPLUS30_A_20261105
 #include <memory>
 #include <fstream>
@@ -609,10 +610,9 @@ int main(int argc,char**argv){
         throw std::runtime_error("conservative momentum Picard currently supports pure-tet SST G2");
       const char* st=std::getenv("SST_STATE_SPACE");
       if(st && std::string(st)!="q1")
-        throw std::runtime_error("conservative momentum Picard requires masked-Q1 SST state");
-      const char* cs=std::getenv("SST_COMPACT_P1");
-      if(cs && std::string(cs)=="1")
-        throw std::runtime_error("conservative momentum Picard currently requires masked P1, not compact P1");
+        throw std::runtime_error("skew/conservative/EMAC momentum requires SST_STATE_SPACE=q1");
+      // No scalar-storage restriction: compact Q1 changes only k/omega CSR.
+      // Momentum Picard continues to use the same P1+BF3 velocity operator.
       if(stage33MomentumSupg)
         throw std::runtime_error("momentum SUPG requires an updated strong residual for conservative convection");
     }
@@ -623,7 +623,7 @@ int main(int argc,char**argv){
         throw std::runtime_error("implicit deviatoric stress requires coupled BF3 and F1B");
       const char* ss=std::getenv("SST_STATE_SPACE");
       if(ss && std::string(ss)!="q1")
-        throw std::runtime_error("implicit deviatoric stress requires masked-P1 SST scalars");
+        throw std::runtime_error("implicit deviatoric stress requires SST_STATE_SPACE=q1");
       if(sstG1.deviatoricMomentum)
         throw std::runtime_error("implicit deviatoric volume cannot be combined with legacy explicit deviatoric RHS");
     }
@@ -2291,6 +2291,7 @@ for(int i=0;i<6;++i)
       hxt5d::State TS(nv,(int)M.h.nv,bulk,R,sstG1);hxt4a::Reducer<T> sstRed(p1Compact?(int)M.h.nv:nv);
       stage6_mem::tag(TS.k.p,"sst/k");stage6_mem::tag(TS.omega.p,"sst/omega");stage6_mem::tag(TS.oldK.p,"sst/oldK");stage6_mem::tag(TS.oldW.p,"sst/oldOmega");
       stage6_mem::snapshot("after_SST_state",20);
+      auto metricGate=nodals::coupling::G2MetricPlateau::from_environment();
       std::vector<double>hf,hy,hdp;double finalDp=0,finalF=0,finalY=0;double g2ContActiveL2Initial=-1,g2ContActiveMaxInitial=-1,g2ContGlobalInitial=-1,g2ContPinInitial=-1;
       auto relSpan=[](const std::vector<double>&v){if(v.empty())return std::numeric_limits<double>::infinity();auto mm=std::minmax_element(v.begin(),v.end());double mean=0;for(double x:v)mean+=x;mean/=v.size();return (*mm.second-*mm.first)/std::max(std::abs(mean),1e-300);};
       const char* sstWallPlacement=
