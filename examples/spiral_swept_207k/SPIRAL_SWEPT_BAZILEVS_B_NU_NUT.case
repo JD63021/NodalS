@@ -1,0 +1,159 @@
+# NodalS spiral-coil CFD / adaptive face-y+ test case
+# Source: uploaded Rhino spiral.stp; exact CAD swept circular sections and 24tet/hex unbiased face-centre split.
+# PHYSICAL SETTINGS: Q = 0.0005469756 m3/s; rho = 1000 kg/m3; mu = 0.01460735 Pa.s.
+# NodalS works with rho=1 and kinematic pressure p/rho, so density=1 below by design.
+# Recover pressure drop in pascals: delta_p_Pa = 1000 * NodalS pressureDrop.
+# Kinematic viscosity = 0.01460735/1000 = 1.460735e-5 m2/s.
+# No inherited developed U-bend inlet CSV: uniform flux-matched spiral inlet.
+# Physical tags: 1 inlet at CAD u=end (same original patch_1_0), 2 outlet at CAD u=start (same original patch_2_0), 3 wall.
+# Inlet velocity = Q/A times inward unit normal; use mesh_stats.json for geometry.
+# D=4A/P from the NEW triangulated inlet; Re=U*D/nu, approximately 7970.1.
+
+[mesh]
+format = msh2
+path = spiral_swept_207360_24tet.msh
+diameter = 0.005945879183002638
+
+[physics]
+density = 1
+reynolds = 7970.109205347521
+kinematic_viscosity = 1.460735e-05
+
+[inlet.main]
+mode = velocity
+velocity = (0.05060791124464105, -16.27825265544327, -10.881386928142035)
+
+[outlet.main]
+type = open
+
+[wall.main]
+type = spalding
+
+[initialization]
+mode = potential_flow
+
+[wall_distance]
+method = geometric
+
+[wall_sampling]
+mode = ray_trace
+max_crossings = 4096
+bary_tolerance = 1e-9
+
+[wall_function]
+law = spalding
+samples = 1
+spalding_sample_scale = 0.50
+zero_limit = true
+nitsche_gamma = 1e-6
+face_spalding = true
+tangential_consistency = symmetric_nitsche
+consistency_viscosity = nu_plus_nut
+frozen_wall_cache = true
+shared_wall_state = true
+integral_utau = true
+integral_nq = 12
+
+[omega_wall]
+method = of_auto
+sample_index = 3
+sample_scale = 0.50
+gamma = 1000000
+production = false
+stage41_mode = trace_log
+
+[sst]
+state_space = q1
+compact_p1 = false
+intensity = 0.05
+length_ratio = 0.07
+ur_k = 0.3
+ur_omega = 0.3
+k_solver = fgs-fixed
+omega_solver = fgs-fixed
+k_sweeps = 20
+omega_sweeps = 20
+check_every = 0
+
+[simple]
+max_iterations = 1000
+physical_gate = false
+ur_u = 0.7
+ur_p = 0.3
+simple_tol = 1e-4
+continuity_atol = 1e-8
+plateau_tol = 0.001
+plateau_samples = 5
+
+[solver.u]
+method = m3-fgs
+sweeps = 20
+omega = 0.7
+rtol = 1e-6
+atol = 0
+max_iterations = 800
+restart = 30
+
+[solver.p]
+method = pcg_amg
+rtol = 1e-3
+atol = 1e-12
+max_iterations = 600
+
+[amg]
+hierarchy = cf
+coarsening = pmis
+strength = classical-negative
+interpolation = exti
+theta = 0.25
+terminal = 1000
+smoother = mcgs
+fine_mode = explicit
+fine_sweeps = 1
+coarse_sweeps = 1
+
+[supg]
+momentum = false
+k = false
+omega = false
+tau_scale = 0.05
+k_tau_scale = 0.05
+omega_tau_scale = 0.05
+
+[restart]
+path = 
+
+[output]
+console = compact
+print_every = 10
+metrics_every = 10
+diagnostics_every = 0
+legacy_final_diagnostics = false
+vtu_every = 100
+checkpoint_every = 100
+profile = false
+profile_audit = false
+directory = ../../runs/spiral_bazb_nu_plus_nut
+
+[adaptive_sampling]
+enabled = true
+first_refresh = 200
+refresh_every = 250
+max_refreshes = 2
+target_spalding_yplus = 30
+target_omega_yplus = 30
+min_scale = 0.05
+max_scale = 0.90
+
+[native]
+amg-mcgs-order = symmetric
+amg-mcgs-fine-sweeps = 1
+amg-mcgs-coarse-sweeps = 1
+amg-mcgs-omega = 1.0
+
+[convection]
+form = skew_symmetric
+
+[stress]
+form = deviatoric
+
