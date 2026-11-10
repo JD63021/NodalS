@@ -91,8 +91,8 @@ plateau_tol = 0.001
 plateau_samples = 5
 
 [solver.u]
-method = coupled-fgmres
-sweeps = 20
+method = m3-fgs
+sweeps = 5
 omega = 0.7
 rtol = 1e-4
 atol = 0
@@ -101,7 +101,7 @@ restart = 20
 
 [solver.p]
 method = pcg_amg
-rtol = 1e-3
+rtol = 0.1
 atol = 1e-12
 max_iterations = 600
 
