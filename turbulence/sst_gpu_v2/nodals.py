@@ -189,8 +189,10 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
             raise ValueError('Full momentum SUPG is only available with deviatoric stress and advective, skew_symmetric or conservative convection')
         if state!='q1':
             raise ValueError('Full momentum SUPG requires sst.state_space=q1')
-        if mode not in ('m3-fgs','m3-sgs'):
-            raise ValueError('Full momentum SUPG requires M3 FGS or SGS')
+        if mode not in ('m3-fgs','m3-sgs','coupled-fgmres'):
+            raise ValueError('Full momentum SUPG requires M3 FGS/SGS or coupled FGMRES with generalized Robin')
+        if mode=='coupled-fgmres' and get(cp,'wall_function','boundary_form','existing').strip().lower()!='generalized_robin_nitsche':
+            raise ValueError('Full momentum SUPG coupled FGMRES currently requires generalized_robin_nitsche')
         fd=number(cp,'supg','nu_fd_rel',0.001)
         if not 0 < fd <= 0.01:
             raise ValueError('supg.nu_fd_rel must be in (0,0.01]')
@@ -608,6 +610,36 @@ def maybe_launch_plot_monitor(cp, output):
 
 def run(args):
     args.case=absolute(args.case,Path.cwd())
+    # Canonical adaptive dispatch. Child stages disable only this scheduler
+    # via --set adaptive_sampling.enabled=false, while retaining all physics.
+    # No .case rewriting, CUDA recompile or separate example launcher required.
+    adaptive_cp=read_case(args.case,args.set)
+    if flag(adaptive_cp,'adaptive_sampling','enabled',False):
+        if args.restart:
+            raise ValueError("Adaptive runs manage restarts internally; remove --restart or set adaptive_sampling.enabled=false")
+        if args.prepare_only:
+            raise ValueError("--prepare-only with autosampling requires adaptive_sampling.enabled=false")
+        runner=ROOT/'adaptive_run.py'
+        if not runner.is_file():
+            raise FileNotFoundError("Adaptive scheduler absent: "+str(runner))
+        import subprocess
+        command=[sys.executable,'-u',str(runner),
+            '--root',str(ROOT),'--case',str(args.case),
+            '--binary',str(absolute(args.binary,Path.cwd()))]
+        if args.mesh:command+=['--mesh',str(absolute(args.mesh,Path.cwd()))]
+        if args.output:command+=['--output',str(absolute(args.output,Path.cwd()))]
+        if args.cache:command+=['--cache',str(absolute(args.cache,Path.cwd()))]
+        if args.momentum_solver:command+=['--momentum-solver',args.momentum_solver]
+        for opt in args.native_option:command+=['--native-option',opt]
+        for override in args.set:command+=['--set',override]
+        if args.outer_iterations is not None:
+            command+=['--final-iterations',str(args.outer_iterations)]
+        if args.steps is not None:
+            command+=['--final-iterations',str(args.steps)]
+        if args.dry_run:command.append('--dry-run')
+        print('NODALS_ADAPTIVE_DISPATCH=ON scheduler='+str(runner),flush=True)
+        return subprocess.call(command,cwd=ROOT)
+
     args.binary=absolute(args.binary,Path.cwd())
     if args.restart:args.restart=absolute(args.restart,Path.cwd())
     cp=read_case(args.case,args.set)
