@@ -87,6 +87,7 @@
             f1bFrozenWall?d_f1bWallCross.p:nullptr};
           // NODALS_EMAC_PICARD_V1: pressure-corrected Picard carrier for 9-block EMAC.
           d4op.set_bazb(bazbViscosityMode,nu);
+          d4op.set_genrobin(genrobinViscosityMode,nu,genrobinC);
           d4op.set_emac_picard(momentumEmac,d_u0.p,d_u1.p,d_u2.p,M.h.ntet);
           d4op.set_implicit_dev(implicitDevStress,
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,
@@ -229,6 +230,7 @@
             f1bFrozenWall?d_f1bWallCross.p:nullptr};
           // NODALS_EMAC_PICARD_V1: pressure-corrected Picard carrier for 9-block EMAC.
           d4op.set_bazb(bazbViscosityMode,nu);
+          d4op.set_genrobin(genrobinViscosityMode,nu,genrobinC);
           d4op.set_emac_picard(momentumEmac,d_u0.p,d_u1.p,d_u2.p,M.h.ntet);
           d4op.set_implicit_dev(implicitDevStress,
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,
