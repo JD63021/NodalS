@@ -767,7 +767,7 @@ int main(int argc,char**argv){
         "rhs=FULL_DEVIATORIC_ELEMENT_INTERIOR "
         "conv=%s divFactor=%.1f "
         "bf3=Tt_A_T wall=F2_SPALDING_UNCHANGED "
-        "faceJumpSUPG=NOT_INCLUDED status=EXPERIMENTAL\\n",
+        "faceJumpSUPG=NOT_INCLUDED status=EXPERIMENTAL\n",
         momentumConvectionForm.c_str(),convectionDivFactor);
     const int m3Sweeps=s05b1Integer("NODALS_M3_SWEEPS",m3Mode=="sgs"?5:10,1,60);
     const double m3Omega=std::getenv("NODALS_M3_OMEGA")?
