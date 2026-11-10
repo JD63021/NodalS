@@ -305,12 +305,27 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     if ray_tol<=0:raise ValueError('wall_sampling.bary_tolerance must be positive')
 
     # Bazilevs-B is a momentum-wall-only option. Never mutate omega_wall.method.
+    wall_form=get(cp,'wall_function','boundary_form','existing').strip().lower()
+    if wall_form not in ('existing','generalized_robin_nitsche'):
+        raise ValueError('wall_function.boundary_form: existing or generalized_robin_nitsche')
+    stab_c=number(cp,'wall_function','stabilization_c',15.0)
+    if not math.isfinite(stab_c) or stab_c<=0:
+        raise ValueError('wall_function.stabilization_c must be positive finite')
     bazb=get(cp,'wall_function','tangential_consistency','off').strip().lower()
     if bazb not in ('off','symmetric_nitsche'):
         raise ValueError('wall_function.tangential_consistency must be off or symmetric_nitsche')
     bazb_visc=get(cp,'wall_function','consistency_viscosity','nu').strip().lower()
     if bazb_visc not in ('nu','nu_plus_nut'):
         raise ValueError('wall_function.consistency_viscosity must be nu or nu_plus_nut')
+    if wall_form=='generalized_robin_nitsche':
+        if bazb!='off':
+            raise ValueError('generalized_robin_nitsche requires tangential_consistency=off (exclusive wall operator)')
+        if mode not in ('m3-fgs','m3-sgs','coupled-fgmres') or stress_form!='deviatoric' or state!='q1':
+            raise ValueError('generalized_robin_nitsche requires M3 FGS/SGS or coupled FGMRES, deviatoric stress, q1')
+        if not flag(cp,'wall_function','face_spalding',True) or not flag(cp,'wall_function','frozen_wall_cache',True):
+            raise ValueError('generalized_robin_nitsche requires original F2 face Spalding and F1B cache')
+        if flag(cp,'supg','momentum',False):
+            raise ValueError('generalized_robin_nitsche experiment requires momentum SUPG off')
     if bazb!='off':
         if mode not in ('m3-fgs','m3-sgs','coupled-fgmres') or stress_form!='deviatoric' or state!='q1':
             raise ValueError('symmetric_nitsche requires M3 FGS/SGS or coupled FGMRES, deviatoric momentum and q1 turbulence')
@@ -366,6 +381,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_F1_FACE_LOCAL':'0',
         'NODALS_MOM_WALL_OPERATOR':'original',
         'NODALS_BAZILEVS_B_VISCOSITY':bazb_visc if bazb=='symmetric_nitsche' else 'off',
+        'NODALS_GENROBIN_VISCOSITY':bazb_visc if wall_form=='generalized_robin_nitsche' else 'off',
+        'NODALS_GENROBIN_C':fmt(stab_c),
         'NODALS_P_REFRESH_EVERY':'1',
         'NODALS_F1B_GPU_GATE':'0',
         'STAGE27_WALL_AUDIT_MODE':'off',
