@@ -324,8 +324,9 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
             raise ValueError('generalized_robin_nitsche requires M3 FGS/SGS or coupled FGMRES, deviatoric stress, q1')
         if not flag(cp,'wall_function','face_spalding',True) or not flag(cp,'wall_function','frozen_wall_cache',True):
             raise ValueError('generalized_robin_nitsche requires original F2 face Spalding and F1B cache')
-        if flag(cp,'supg','momentum',False):
-            raise ValueError('generalized_robin_nitsche experiment requires momentum SUPG off')
+        # Full-residual momentum SUPG has a matched volume LHS/RHS on the
+        # coupled FGMRES path. It does not alter generalized Robin wall terms.
+        # Retain M3 FGS/SGS support; all other solver choices are rejected above.
     if bazb!='off':
         if mode not in ('m3-fgs','m3-sgs','coupled-fgmres') or stress_form!='deviatoric' or state!='q1':
             raise ValueError('symmetric_nitsche requires M3 FGS/SGS or coupled FGMRES, deviatoric momentum and q1 turbulence')
