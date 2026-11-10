@@ -714,7 +714,7 @@ int main(int argc,char**argv){
       throw std::runtime_error("numerical slip requires symmetric tangential Nitsche consistency");
     std::printf("NODALS_BAZILEVS_SLIP enabled=%d Cb=%.8g y=h_over_Cb "
       "velocity=PHYSICAL_WALL_QUADRATURE_TRACE spalding=REPLACED_MOMENTUM_ONLY "
-      "omega=UNCHANGED status=CONFIGURED\\n",(int)bazilevsNumericalSlip,bazilevsCb);
+      "omega=UNCHANGED status=CONFIGURED\n",(int)bazilevsNumericalSlip,bazilevsCb);
     // M3 uses assembled nine-block CSR. Coupled FGMRES uses the already
     // BazB-augmented matrix-free S22D4DOperator::apply and reports true residuals.
     // Block/segregated alternatives have not been verified with BazB.
