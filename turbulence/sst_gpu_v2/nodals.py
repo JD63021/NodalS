@@ -312,8 +312,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     if bazb_visc not in ('nu','nu_plus_nut'):
         raise ValueError('wall_function.consistency_viscosity must be nu or nu_plus_nut')
     if bazb!='off':
-        if mode not in ('m3-fgs','m3-sgs') or stress_form!='deviatoric' or state!='q1':
-            raise ValueError('symmetric_nitsche requires M3 FGS/SGS, deviatoric momentum and q1 turbulence')
+        if mode not in ('m3-fgs','m3-sgs','coupled-fgmres') or stress_form!='deviatoric' or state!='q1':
+            raise ValueError('symmetric_nitsche requires M3 FGS/SGS or coupled FGMRES, deviatoric momentum and q1 turbulence')
         if not flag(cp,'wall_function','face_spalding',True) or not flag(cp,'wall_function','frozen_wall_cache',True):
             raise ValueError('symmetric_nitsche requires existing F1B/F2 wall options')
         if flag(cp,'supg','momentum',False):
