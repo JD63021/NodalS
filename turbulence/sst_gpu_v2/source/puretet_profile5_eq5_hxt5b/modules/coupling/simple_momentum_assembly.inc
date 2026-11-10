@@ -156,7 +156,7 @@
           // F2: exactly ONE nonlinear Spalding fit per physical wall face.
           // All q-dependent nu_eff, normal/BF3 terms and omega equation remain
           // unchanged. The face coefficient is frozen for this SIMPLE step.
-          if(f2FaceSpalding){
+          if(f2FaceSpalding && !bazilevsNumericalSlip){
             hxt5d::f2_face_averaged_spalding<<<(BH.wallT.size()+127)/128,128>>>(
               sstG1.tetWallPlans,(int)BH.wallT.size(),sstG1.tetWallQuads,
               sstG1.profileTetMatchPoints,d_tv.p,
@@ -187,7 +187,8 @@
             stage27AuditPolicy.disabled()?d_stage27ProdWallStats.p:nullptr,
             sampledConductance,
             git>stage31Start+1?sstG1.stage27SavedWallFit:nullptr,d_stage27C3ReuseFlags.p,
-            f2FaceSpalding?d_f2FaceFit.p:nullptr
+            (f2FaceSpalding && !bazilevsNumericalSlip)?d_f2FaceFit.p:nullptr,
+            bazilevsNumericalSlip,bazilevsCb
 #if defined(NODALS_P2_STAGE4_COUPLED)
             ,p2MomentumLive?p2Stage4->d_tets.p:nullptr,
             p2MomentumLive?p2Stage4->k.p:nullptr,
@@ -208,7 +209,8 @@
             stage27AuditPolicy.disabled()?d_stage27ProdWallStats.p:nullptr,
             sampledConductance,
             git>stage31Start+1?sstG1.stage27SavedWallFit:nullptr,d_stage27C3ReuseFlags.p,
-            f2FaceSpalding?d_f2FaceFit.p:nullptr
+            (f2FaceSpalding && !bazilevsNumericalSlip)?d_f2FaceFit.p:nullptr,
+            bazilevsNumericalSlip,bazilevsCb
 #if defined(NODALS_P2_STAGE4_COUPLED)
             ,p2MomentumLive?p2Stage4->d_tets.p:nullptr,
             p2MomentumLive?p2Stage4->k.p:nullptr,
