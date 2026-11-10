@@ -1,0 +1,13 @@
+/build/
+/source.mk
+/.m4_backups/
+*.o
+*.d
+*.a
+*.so
+*.log
+*.vtu
+*.vtk
+*.pvtu
+*.zip
+*.tar.gz
