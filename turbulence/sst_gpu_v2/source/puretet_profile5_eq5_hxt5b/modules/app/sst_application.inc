@@ -708,7 +708,7 @@ int main(int argc,char**argv){
          !implicitDevStress || momentumFullSupg))
       throw std::runtime_error("Bazilevs-B requires original sampled wall, F1B, F2, coupled BF3 M3, implicit deviatoric stress, momentum SUPG off");
     std::printf("NODALS_BAZILEVS_B enabled=%d viscosity=%s tangential=NITSCHE_CONSISTENCY_PAIR "
-      "spalding=UNCHANGED omega=UNCHANGED bf3=UNCHANGED solver=M3_CSR status=CONFIGURED\\n",
+      "spalding=UNCHANGED omega=UNCHANGED bf3=UNCHANGED solver=M3_CSR status=CONFIGURED\n",
       (int)(bazbViscosityMode!=0),bazbMode.c_str());
     const bool m3Active=m3Mode!="off";
     if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
