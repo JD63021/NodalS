@@ -701,15 +701,21 @@ int main(int argc,char**argv){
     if(bazbMode!="off" && bazbMode!="nu" && bazbMode!="nu_plus_nut")
       throw std::runtime_error("NODALS_BAZILEVS_B_VISCOSITY must be off, nu, or nu_plus_nut");
     const int bazbViscosityMode=bazbMode=="off"?0:(bazbMode=="nu"?1:2);
-    if(bazbViscosityMode && !(m3Mode=="fgs"||m3Mode=="sgs"))
-      throw std::runtime_error("Bazilevs-B requires M3 FGS or SGS for true coupled 9-block CSR");
+    // M3 uses assembled nine-block CSR. Coupled FGMRES uses the already
+    // BazB-augmented matrix-free S22D4DOperator::apply and reports true residuals.
+    // Block/segregated alternatives have not been verified with BazB.
+    const bool bazbCoupledFgmres=m3Mode=="off" &&
+      s05b1Mode=="inherit" && !s05b3Active;
+    if(bazbViscosityMode && !(m3Mode=="fgs"||m3Mode=="sgs"||bazbCoupledFgmres))
+      throw std::runtime_error("Bazilevs-B requires M3 FGS/SGS or original coupled FGMRES");
     if(bazbViscosityMode && (sampledConductance || !f1bFrozenWall || !f2FaceSpalding ||
          !stage22d4Live || !stage22d4iEnable || stage22d4dMode!="coupled" ||
          !implicitDevStress || momentumFullSupg))
       throw std::runtime_error("Bazilevs-B requires original sampled wall, F1B, F2, coupled BF3 M3, implicit deviatoric stress, momentum SUPG off");
     std::printf("NODALS_BAZILEVS_B enabled=%d viscosity=%s tangential=NITSCHE_CONSISTENCY_PAIR "
-      "spalding=UNCHANGED omega=UNCHANGED bf3=UNCHANGED solver=M3_CSR status=CONFIGURED\n",
-      (int)(bazbViscosityMode!=0),bazbMode.c_str());
+      "spalding=UNCHANGED omega=UNCHANGED bf3=UNCHANGED solver=%s status=CONFIGURED\n",
+      (int)(bazbViscosityMode!=0),bazbMode.c_str(),
+      bazbCoupledFgmres?"COUPLED_MATRIXFREE_FGMRES":"M3_CSR");
     const bool m3Active=m3Mode!="off";
     if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
       throw std::runtime_error("Full momentum SUPG requires M3 FGS or M3 SGS");
