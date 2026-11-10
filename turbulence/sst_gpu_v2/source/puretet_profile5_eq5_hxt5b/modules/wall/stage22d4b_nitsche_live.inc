@@ -107,7 +107,8 @@ __global__ void s22d4_nitsche_tet_component(
     bool sampledConductance,
     const ::nodals::wall::shared27::Record*stage27Saved,
     unsigned char*stage27ReuseFlags,
-    const double*f2FaceFit
+    const double*f2FaceFit,
+    bool bazilevsNumericalSlip,double bazilevsCb
 #if defined(NODALS_P2_STAGE4_COUPLED)
     ,const nodals::p2::Tet10Device *p2cells,const Real *p2k,const Real *p2w
 #endif
@@ -156,7 +157,41 @@ __global__ void s22d4_nitsche_tet_component(
     ::nodals::wall::vector3::Result fit{};
     bool stage27Reused=false;
     const std::size_t stage27Index=(std::size_t)fi*12u+(std::size_t)q;
-    if(f2FaceFit){
+    // Bazilevs et al. 2007, eqs. 14-17: the Nitsche penalty is
+    // derived from the NUMERICAL TANGENTIAL WALL TRACE, not an off-wall ray.
+    // Freeze beta per quadrature point for this SIMPLE/Picard step; downstream
+    // diagonal CSR, F1B, M3 CSR and coupled matrix-free FGMRES all consume
+    // this same frozen coefficient. The omega wall sampling is untouched.
+    if(bazilevsNumericalSlip){
+      V wall{0.,0.,0.};
+      for(int b=0;b<8;++b){
+        const int ib=tvv.g[b], wb=(int)b;
+        const double phi=ca.bw[wb];
+        wall.x+=phi*(double)u0[ib];
+        wall.y+=phi*(double)u1[ib];
+        wall.z+=phi*(double)u2[ib];
+      }
+      const double un=wall.x*n[0]+wall.y*n[1]+wall.z*n[2];
+      const double tx=wall.x-un*n[0],ty=wall.y-un*n[1],tz=wall.z-un*n[2];
+      const double wallSpeed=sqrt(tx*tx+ty*ty+tz*tz);
+      const double firstCellY=h/bazilevsCb;
+      fit.valid=(bazilevsCb>0. && isfinite(bazilevsCb) &&
+          firstCellY>0. && isfinite(firstCellY) &&
+          isfinite(wallSpeed) &&
+          ::nodals::wall::spalding(wallSpeed,firstCellY,nu,
+            fit.uTau,fit.yPlus,fit.beta));
+      if(fit.valid)
+        fit.valid=(fit.beta>0. && isfinite(fit.beta) &&
+                    fit.uTau>=0. && isfinite(fit.uTau));
+      if(!fit.valid){
+        const unsigned long long prev=atomicAdd(bad,1ULL);
+        if(prev<32ULL)printf("NODALS_BAZILEVS_SLIP_INVALID face=%d q=%d "
+             "h=%.17g Cb=%.17g wallSpeed=%.17g beta=%.17g\n",
+             fi,q,h,bazilevsCb,wallSpeed,fit.beta);
+        continue;
+      }
+      fit.fitRms=0.;fit.pointUTauRelSpan=0.;
+    }else if(f2FaceFit){
       fit.beta=f2FaceFit[(std::size_t)3*fi];
       fit.uTau=f2FaceFit[(std::size_t)3*fi+1u];
       fit.yPlus=f2FaceFit[(std::size_t)3*fi+2u];
