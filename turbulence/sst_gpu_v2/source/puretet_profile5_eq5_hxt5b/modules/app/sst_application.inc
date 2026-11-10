@@ -701,6 +701,37 @@ int main(int argc,char**argv){
     if(bazbMode!="off" && bazbMode!="nu" && bazbMode!="nu_plus_nut")
       throw std::runtime_error("NODALS_BAZILEVS_B_VISCOSITY must be off, nu, or nu_plus_nut");
     const int bazbViscosityMode=bazbMode=="off"?0:(bazbMode=="nu"?1:2);
+    const std::string genrobinMode=std::getenv("NODALS_GENROBIN_VISCOSITY")?
+      std::getenv("NODALS_GENROBIN_VISCOSITY"):"off";
+    if(genrobinMode!="off" && genrobinMode!="nu" &&
+       genrobinMode!="nu_plus_nut")
+      throw std::runtime_error("NODALS_GENROBIN_VISCOSITY: off, nu, nu_plus_nut");
+    const int genrobinViscosityMode=genrobinMode=="off"?0:
+      (genrobinMode=="nu"?1:2);
+    const char* genrobinCraw=std::getenv("NODALS_GENROBIN_C");
+    const double genrobinC=genrobinCraw&&*genrobinCraw?
+      std::stod(genrobinCraw):15.0;
+    if(!(genrobinC>0.0) || !std::isfinite(genrobinC))
+      throw std::runtime_error("NODALS_GENROBIN_C must be positive finite");
+    if(genrobinViscosityMode && bazbViscosityMode)
+      throw std::runtime_error("Generalized Robin-Nitsche cannot be combined with Bazilevs-B");
+    const bool genrobinCoupledFgmres=m3Mode=="off" &&
+      s05b1Mode=="inherit" && !s05b3Active;
+    if(genrobinViscosityMode &&
+       !(m3Mode=="fgs" || m3Mode=="sgs" || genrobinCoupledFgmres))
+      throw std::runtime_error("Generalized Robin-Nitsche requires coupled FGMRES or M3 FGS/SGS");
+    if(genrobinViscosityMode &&
+       (sampledConductance || !f1bFrozenWall || !f2FaceSpalding ||
+        !stage22d4Live || !stage22d4iEnable || stage22d4dMode!="coupled" ||
+        !implicitDevStress || momentumFullSupg))
+      throw std::runtime_error(
+        "Generalized Robin-Nitsche requires original F2 Spalding, F1B, BF3, coupled mode, deviatoric stress and momentum SUPG off");
+    if(genrobinViscosityMode)
+      std::printf("NODALS_GENROBIN_CONFIG enabled=1 viscosity=%s Cstab=%.12g "
+        "sampling=ORIGINAL_F2_SPALDING omega=UNCHANGED "
+        "form=CONSISTENT_GENERALIZED_ROBIN_NITSCHE "
+        "schur=ORIGINAL_APPROXIMATION status=EXPERIMENTAL\n",
+        genrobinMode.c_str(),genrobinC);
     // M3 uses assembled nine-block CSR. Coupled FGMRES uses the already
     // BazB-augmented matrix-free S22D4DOperator::apply and reports true residuals.
     // Block/segregated alternatives have not been verified with BazB.
