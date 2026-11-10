@@ -133,7 +133,7 @@ def run():
     # set of solver parameters. Only segment checkpoint/ray controls are injected.
     # Suppress dispatcher recursion in child segments; original .case is never edited.
     common = [sys.executable, '-u', str(driver), 'run', '--case', str(case),
-              '--binary', str(binary), '--set', 'adaptive_sampling.enabled=false']
+              '--binary', str(binary)]
     if a.cache:
         common += ['--cache', str(resolve_path(a.cache, Path.cwd()))]
     if a.momentum_solver:
@@ -144,6 +144,8 @@ def run():
         common += ['--mesh', str(mesh)]
     for override in a.set:
         common += ['--set', override]
+    # MUST remain after all user overrides to suppress self-dispatch in children.
+    common += ['--set', 'adaptive_sampling.enabled=false']
     if not a.dry_run:
         if out.exists() and any(out.iterdir()) and not a.resume:
             raise ValueError(f'Adaptive output is nonempty: {out}; choose a fresh --output or --resume')
