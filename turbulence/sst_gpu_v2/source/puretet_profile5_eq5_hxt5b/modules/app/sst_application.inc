@@ -696,6 +696,20 @@ int main(int argc,char**argv){
       throw std::runtime_error("conservative momentum Picard currently requires M3 or coupled FGMRES, not M4");
     if(implicitDevStress && m3Mode=="m4")
       throw std::runtime_error("implicit deviatoric stress supports M3 FGS/SGS or coupled FGMRES, not experimental M4");
+    const std::string bazbMode=std::getenv("NODALS_BAZILEVS_B_VISCOSITY")?
+      std::getenv("NODALS_BAZILEVS_B_VISCOSITY"):"off";
+    if(bazbMode!="off" && bazbMode!="nu" && bazbMode!="nu_plus_nut")
+      throw std::runtime_error("NODALS_BAZILEVS_B_VISCOSITY must be off, nu, or nu_plus_nut");
+    const int bazbViscosityMode=bazbMode=="off"?0:(bazbMode=="nu"?1:2);
+    if(bazbViscosityMode && !(m3Mode=="fgs"||m3Mode=="sgs"))
+      throw std::runtime_error("Bazilevs-B requires M3 FGS or SGS for true coupled 9-block CSR");
+    if(bazbViscosityMode && (sampledConductance || !f1bFrozenWall || !f2FaceSpalding ||
+         !stage22d4Live || !stage22d4iEnable || stage22d4dMode!="coupled" ||
+         !implicitDevStress || momentumFullSupg))
+      throw std::runtime_error("Bazilevs-B requires original sampled wall, F1B, F2, coupled BF3 M3, implicit deviatoric stress, momentum SUPG off");
+    std::printf("NODALS_BAZILEVS_B enabled=%d viscosity=%s tangential=NITSCHE_CONSISTENCY_PAIR "
+      "spalding=UNCHANGED omega=UNCHANGED bf3=UNCHANGED solver=M3_CSR status=CONFIGURED\\n",
+      (int)(bazbViscosityMode!=0),bazbMode.c_str());
     const bool m3Active=m3Mode!="off";
     if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
       throw std::runtime_error("Full momentum SUPG requires M3 FGS or M3 SGS");
