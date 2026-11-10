@@ -5,6 +5,7 @@
 // The pressure Schur approximation remains component diagonal (CONTROLLED).
 // This header is included INSIDE namespace hxt5d.
 #include "bazilevs_b_tangent.inc"
+#include "generalized_robin_tangent.inc"
 
 __global__ void s22d4d_offblock_action(
     const hxt5b::TetFacePlan*F,int nf,
@@ -195,6 +196,12 @@ struct S22D4DOperator {
   int bazbViscosityMode=0;
   double bazbMolecularNu=0.0;
   void set_bazb(int mode,double nu){bazbViscosityMode=mode;bazbMolecularNu=nu;}
+  // Generalized Robin-Nitsche: physical F2 beta remains the baseline matrix.
+  int genrobinViscosityMode=0;
+  double genrobinMolecularNu=0.0,genrobinC=15.0;
+  void set_genrobin(int mode,double nu,double c){
+    genrobinViscosityMode=mode;genrobinMolecularNu=nu;genrobinC=c;
+  }
   // Physical volume tensor; default OFF leaves the old operator byte-for-byte.
   // NODALS_EMAC_PICARD_V1: frozen-velocity cross-component convection tensor.
   bool emacPicard=false;
@@ -245,6 +252,10 @@ struct S22D4DOperator {
     if(bazbViscosityMode)
       bazb_tangent_action<<<nfaces,32>>>(faces,nfaces,quads,tvel,tgeom,
          coeff,bazbMolecularNu,bazbViscosityMode,nv,physical,y);
+    if(genrobinViscosityMode)
+      genrobin_tangent_action<<<nfaces,32>>>(
+        faces,nfaces,quads,tvel,tgeom,coeff,genrobinMolecularNu,
+        genrobinViscosityMode,genrobinC,nv,physical,y);
     if(emacPicard)
       emac_picard_tet_apply<<<emacNTet,64>>>(
         tvel,tgeom,emacU0,emacU1,emacU2,emacNTet,nv,physical,y);
@@ -951,6 +962,11 @@ inline void m3_build(const S22D4DOperator&op,Real*k,Real*tmp,
     bazb_m3_add<<<op.nfaces,64>>>(op.faces,op.nfaces,op.quads,
        op.tgeom,op.A.tetSlot.p,op.coeff,op.bazbMolecularNu,
        op.bazbViscosityMode,nnz,k,bad);
+  if(op.genrobinViscosityMode)
+    genrobin_m3_add<<<op.nfaces,64>>>(
+       op.faces,op.nfaces,op.quads,op.tgeom,op.A.tetSlot.p,
+       op.coeff,op.genrobinMolecularNu,op.genrobinViscosityMode,
+       op.genrobinC,nnz,k,bad);
   // NODALS_EMAC_PICARD_V1: add EMAC gradient-of-energy and divergence extra blocks.
   // Existing advective A.conv supplies the first term.
   if(op.emacPicard)
