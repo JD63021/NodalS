@@ -622,7 +622,6 @@ def run(args):
         runner=ROOT/'adaptive_run.py'
         if not runner.is_file():
             raise FileNotFoundError("Adaptive scheduler absent: "+str(runner))
-        import subprocess
         command=[sys.executable,'-u',str(runner),
             '--root',str(ROOT),'--case',str(args.case),
             '--binary',str(absolute(args.binary,Path.cwd()))]
