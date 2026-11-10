@@ -304,6 +304,20 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     ray_tol=number(cp,'wall_sampling','bary_tolerance',1e-9)
     if ray_tol<=0:raise ValueError('wall_sampling.bary_tolerance must be positive')
 
+    # Bazilevs-B is a momentum-wall-only option. Never mutate omega_wall.method.
+    bazb=get(cp,'wall_function','tangential_consistency','off').strip().lower()
+    if bazb not in ('off','symmetric_nitsche'):
+        raise ValueError('wall_function.tangential_consistency must be off or symmetric_nitsche')
+    bazb_visc=get(cp,'wall_function','consistency_viscosity','nu').strip().lower()
+    if bazb_visc not in ('nu','nu_plus_nut'):
+        raise ValueError('wall_function.consistency_viscosity must be nu or nu_plus_nut')
+    if bazb!='off':
+        if mode not in ('m3-fgs','m3-sgs') or stress_form!='deviatoric' or state!='q1':
+            raise ValueError('symmetric_nitsche requires M3 FGS/SGS, deviatoric momentum and q1 turbulence')
+        if not flag(cp,'wall_function','face_spalding',True) or not flag(cp,'wall_function','frozen_wall_cache',True):
+            raise ValueError('symmetric_nitsche requires existing F1B/F2 wall options')
+        if flag(cp,'supg','momentum',False):
+            raise ValueError('symmetric_nitsche first experiment requires momentum SUPG off')
     # Exact environment compatibility flags used by the existing, unmodified CUDA solver.
     env={
         'SST_STATE_SPACE':state,
@@ -351,6 +365,7 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_F2_FACE_SPALDING':str(int(flag(cp,'wall_function','face_spalding',True))),
         'NODALS_F1_FACE_LOCAL':'0',
         'NODALS_MOM_WALL_OPERATOR':'original',
+        'NODALS_BAZILEVS_B_VISCOSITY':bazb_visc if bazb=='symmetric_nitsche' else 'off',
         'NODALS_P_REFRESH_EVERY':'1',
         'NODALS_F1B_GPU_GATE':'0',
         'STAGE27_WALL_AUDIT_MODE':'off',
