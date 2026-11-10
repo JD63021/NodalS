@@ -723,9 +723,9 @@ int main(int argc,char**argv){
     if(genrobinViscosityMode &&
        (sampledConductance || !f1bFrozenWall || !f2FaceSpalding ||
         !stage22d4Live || !stage22d4iEnable || stage22d4dMode!="coupled" ||
-        !implicitDevStress || momentumFullSupg))
+        !implicitDevStress))
       throw std::runtime_error(
-        "Generalized Robin-Nitsche requires original F2 Spalding, F1B, BF3, coupled mode, deviatoric stress and momentum SUPG off");
+        "Generalized Robin-Nitsche requires original F2 Spalding, F1B, BF3, coupled mode and deviatoric stress");
     if(genrobinViscosityMode)
       std::printf("NODALS_GENROBIN_CONFIG enabled=1 viscosity=%s Cstab=%.12g "
         "sampling=ORIGINAL_F2_SPALDING omega=UNCHANGED "
@@ -748,8 +748,27 @@ int main(int argc,char**argv){
       (int)(bazbViscosityMode!=0),bazbMode.c_str(),
       bazbCoupledFgmres?"COUPLED_MATRIXFREE_FGMRES":"M3_CSR");
     const bool m3Active=m3Mode!="off";
-    if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
-      throw std::runtime_error("Full momentum SUPG requires M3 FGS or M3 SGS");
+    // Full-residual element-interior SUPG is a scalar-CSR volume term plus
+    // its matched nonlinear/Picard RHS. The coupled FGMRES operator already
+    // consumes this same assembled CSR and adds the independent generalized
+    // Robin face correction before BF3 T^t. Do not allow other combinations
+    // until independently validated.
+    const bool genrobinSupgFgmres=momentumFullSupg &&
+      genrobinViscosityMode && genrobinCoupledFgmres &&
+      stage22d4dMode=="coupled" && !momentumEmac;
+    if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs" &&
+       !genrobinSupgFgmres)
+      throw std::runtime_error(
+        "Full momentum SUPG requires M3 FGS/SGS, or generalized Robin coupled FGMRES");
+    if(genrobinSupgFgmres)
+      std::printf("NODALS_GENROBIN_SUPG enabled=1 "
+        "operator=COUPLED_MATRIXFREE_FGMRES "
+        "lhs=STAGE33A_64Q_SCALAR_CSR_PLUS_GENROBIN_WALL "
+        "rhs=FULL_DEVIATORIC_ELEMENT_INTERIOR "
+        "conv=%s divFactor=%.1f "
+        "bf3=Tt_A_T wall=F2_SPALDING_UNCHANGED "
+        "faceJumpSUPG=NOT_INCLUDED status=EXPERIMENTAL\\n",
+        momentumConvectionForm.c_str(),convectionDivFactor);
     const int m3Sweeps=s05b1Integer("NODALS_M3_SWEEPS",m3Mode=="sgs"?5:10,1,60);
     const double m3Omega=std::getenv("NODALS_M3_OMEGA")?
       std::stod(std::getenv("NODALS_M3_OMEGA")):0.7;
