@@ -122,6 +122,10 @@ def run():
             raise ValueError('Current face-y+ patch requires wall_function.samples=1, omega_wall.sample_index=3, wall_sampling.mode=ray_trace, wall_function.face_spalding=true')
     if out in {Path('/'), Path.home().resolve(), root, root.parent}:
         raise ValueError('Output directory must be a dedicated run directory, not home/root/source')
+    if not a.dry_run and not a.resume and out.exists() and any(out.iterdir()):
+        previous=out
+        out=out.with_name(out.name+'_rerun_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        print('NODALS_ADAPTIVE_OUTPUT_REDIRECT old='+str(previous)+' new='+str(out), flush=True)
     print('NODALS_ADAPTIVE_CASE=' + str(case), flush=True)
     print('NODALS_ADAPTIVE_MESH=' + str(source_mesh), flush=True)
     print('NODALS_ADAPTIVE_OUTPUT=' + str(out), flush=True)
@@ -147,8 +151,6 @@ def run():
     # MUST remain after all user overrides to suppress self-dispatch in children.
     common += ['--set', 'adaptive_sampling.enabled=false']
     if not a.dry_run:
-        if out.exists() and any(out.iterdir()) and not a.resume:
-            raise ValueError(f'Adaptive output is nonempty: {out}; choose a fresh --output or --resume')
         out.mkdir(parents=True, exist_ok=True)
     manifest = {'case': str(case), 'mesh': str(source_mesh), 'root': str(root),
                 'refreshes': refreshes, 'stages': stages, 'final_iterations': final,
