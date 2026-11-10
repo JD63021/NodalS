@@ -4,6 +4,7 @@
 // computed during that outer iteration's Nitsche assembly. No model change.
 // The pressure Schur approximation remains component diagonal (CONTROLLED).
 // This header is included INSIDE namespace hxt5d.
+#include "bazilevs_b_tangent.inc"
 
 __global__ void s22d4d_offblock_action(
     const hxt5b::TetFacePlan*F,int nf,
@@ -189,6 +190,11 @@ struct S22D4DOperator {
   int nfaces; double gamma;
   Real* bf3Scratch; bool bf3FluxMode; bool sampledConductance=false;
   const double*f1bFaceCoupling=nullptr;
+  // Bazilevs-B: additional symmetric tangential consistency operator.
+  // 0 off, 1 molecular nu, 2 frozen nu + nut.
+  int bazbViscosityMode=0;
+  double bazbMolecularNu=0.0;
+  void set_bazb(int mode,double nu){bazbViscosityMode=mode;bazbMolecularNu=nu;}
   // Physical volume tensor; default OFF leaves the old operator byte-for-byte.
   // NODALS_EMAC_PICARD_V1: frozen-velocity cross-component convection tensor.
   bool emacPicard=false;
@@ -236,6 +242,9 @@ struct S22D4DOperator {
     else
       s22d4d_offblock_action<<<nfaces,64>>>(faces,nfaces,quads,tvel,tgeom,
          coeff,nv,physical,y,gamma,bf3FluxMode,sampledConductance);
+    if(bazbViscosityMode)
+      bazb_tangent_action<<<nfaces,32>>>(faces,nfaces,quads,tvel,tgeom,
+         coeff,bazbMolecularNu,bazbViscosityMode,nv,physical,y);
     if(emacPicard)
       emac_picard_tet_apply<<<emacNTet,64>>>(
         tvel,tgeom,emacU0,emacU1,emacU2,emacNTet,nv,physical,y);
@@ -938,6 +947,10 @@ inline void m3_build(const S22D4DOperator&op,Real*k,Real*tmp,
   m3_init_blocks<<<(nnz+255)/256,256>>>(nnz,op.v0,op.v1,op.v2,k);
   m3_add_f1b<<<op.nfaces,64>>>(op.nfaces,op.faces,
     op.A.tetSlot.p,op.f1bFaceCoupling,nnz,k);
+  if(op.bazbViscosityMode)
+    bazb_m3_add<<<op.nfaces,64>>>(op.faces,op.nfaces,op.quads,
+       op.tgeom,op.A.tetSlot.p,op.coeff,op.bazbMolecularNu,
+       op.bazbViscosityMode,nnz,k,bad);
   // NODALS_EMAC_PICARD_V1: add EMAC gradient-of-energy and divergence extra blocks.
   // Existing advective A.conv supplies the first term.
   if(op.emacPicard)
