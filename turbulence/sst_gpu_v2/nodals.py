@@ -308,6 +308,14 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     bazb=get(cp,'wall_function','tangential_consistency','off').strip().lower()
     if bazb not in ('off','symmetric_nitsche'):
         raise ValueError('wall_function.tangential_consistency must be off or symmetric_nitsche')
+    slip_mode=get(cp,'wall_function','penalty_source','offwall_spalding').strip().lower()
+    if slip_mode not in ('offwall_spalding','numerical_slip'):
+        raise ValueError('wall_function.penalty_source must be offwall_spalding or numerical_slip')
+    slip_cb=number(cp,'wall_function','bazilevs_cb',4.0)
+    if not math.isfinite(slip_cb) or slip_cb<=0:
+        raise ValueError('wall_function.bazilevs_cb must be finite and positive')
+    if slip_mode=='numerical_slip' and bazb!='symmetric_nitsche':
+        raise ValueError('numerical_slip requires tangential_consistency=symmetric_nitsche')
     bazb_visc=get(cp,'wall_function','consistency_viscosity','nu').strip().lower()
     if bazb_visc not in ('nu','nu_plus_nut'):
         raise ValueError('wall_function.consistency_viscosity must be nu or nu_plus_nut')
@@ -366,6 +374,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_F1_FACE_LOCAL':'0',
         'NODALS_MOM_WALL_OPERATOR':'original',
         'NODALS_BAZILEVS_B_VISCOSITY':bazb_visc if bazb=='symmetric_nitsche' else 'off',
+        'NODALS_BAZILEVS_NUMERICAL_SLIP':'1' if slip_mode=='numerical_slip' else '0',
+        'NODALS_BAZILEVS_CB':fmt(slip_cb),
         'NODALS_P_REFRESH_EVERY':'1',
         'NODALS_F1B_GPU_GATE':'0',
         'STAGE27_WALL_AUDIT_MODE':'off',
