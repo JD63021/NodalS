@@ -701,6 +701,20 @@ int main(int argc,char**argv){
     if(bazbMode!="off" && bazbMode!="nu" && bazbMode!="nu_plus_nut")
       throw std::runtime_error("NODALS_BAZILEVS_B_VISCOSITY must be off, nu, or nu_plus_nut");
     const int bazbViscosityMode=bazbMode=="off"?0:(bazbMode=="nu"?1:2);
+    const char* slipEnv=std::getenv("NODALS_BAZILEVS_NUMERICAL_SLIP");
+    const std::string slipSwitch=(slipEnv&&*slipEnv)?slipEnv:"0";
+    if(slipSwitch!="0" && slipSwitch!="1")
+      throw std::runtime_error("NODALS_BAZILEVS_NUMERICAL_SLIP must be 0 or 1");
+    const bool bazilevsNumericalSlip=slipSwitch=="1";
+    const char* cbEnv=std::getenv("NODALS_BAZILEVS_CB");
+    const double bazilevsCb=(cbEnv&&*cbEnv)?std::stod(cbEnv):4.0;
+    if(!(bazilevsCb>0.0) || !std::isfinite(bazilevsCb))
+      throw std::runtime_error("NODALS_BAZILEVS_CB must be positive finite");
+    if(bazilevsNumericalSlip && !bazbViscosityMode)
+      throw std::runtime_error("numerical slip requires symmetric tangential Nitsche consistency");
+    std::printf("NODALS_BAZILEVS_SLIP enabled=%d Cb=%.8g y=h_over_Cb "
+      "velocity=PHYSICAL_WALL_QUADRATURE_TRACE spalding=REPLACED_MOMENTUM_ONLY "
+      "omega=UNCHANGED status=CONFIGURED\\n",(int)bazilevsNumericalSlip,bazilevsCb);
     // M3 uses assembled nine-block CSR. Coupled FGMRES uses the already
     // BazB-augmented matrix-free S22D4DOperator::apply and reports true residuals.
     // Block/segregated alternatives have not been verified with BazB.
