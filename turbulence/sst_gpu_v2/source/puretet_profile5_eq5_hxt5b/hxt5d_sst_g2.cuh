@@ -1540,7 +1540,7 @@ for(int d=0;d<3;++d){Real gd=(Real)gg[a][d];gp[q][a][d]=gd;
     }
   }
 #endif
-  for(int a=0;a<4;++a){auto P=pts[tc[f.cell].v[a]];x+=l[a]*P.x;y+=l[a]*P.y;}auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor);nue[q]=(Real)nu+ss.nut;wq[q]=(Real)(hxt5b::QW12[q]*f.area);
+  for(int a=0;a<4;++a){auto P=pts[tc[f.cell].v[a]];x+=l[a]*P.x;y+=l[a]*P.y;}hxt5c::eval_dg_omega_p1(f.cell,l,tg[f.cell],wv,gw);auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,hxt5c::dg_omega_p1_constitutive?hxt5c::stage20_distance(tc,f.cell,l):Real(-1));nue[q]=(Real)nu+ss.nut;wq[q]=(Real)(hxt5b::QW12[q]*f.area);
     Real vx=(Real)inletX,vy=(Real)inletY,vz=(Real)inletZ;
     if(stage27_inlet::profileActive){
       auto conn=tc[f.cell];vx=vy=vz=Real(0);
