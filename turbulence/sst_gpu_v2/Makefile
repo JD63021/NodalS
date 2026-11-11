@@ -55,7 +55,7 @@ $(LIB): $(HOST_OBJ)
 	$(AR) rcs $@ $(HOST_OBJ)
 
 $(BIN): $(CUDA_OBJ) $(LIB)
-	$(NVCC) $(CUDAFLAGS) $(CUDA_OBJ) $(LIB) -o $@
+	$(NVCC) $(CUDAFLAGS) $(CUDA_OBJ) $(LIB) -lcublas -o $@
 	@echo 'Built $(BIN) (no stage installation or hash registration)'
 
 clean:
