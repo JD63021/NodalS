@@ -15,27 +15,54 @@ struct LimiterCounters {
  unsigned long long meanDeficitCells;
  unsigned long long negativeCandidateDofs;
  unsigned long long nonfiniteCells;
+ unsigned long long stalledCells; // local alpha reduced to 0; no positive mass destroyed
+ unsigned long long heavilyBacktrackedCells; // alphaLocal < 0.1 requested alpha
 };
 __global__ void relax_and_limit(int nt,const double*previous,const double*candidate,
                                double*updated,double alpha,double omegaFloor,
                                LimiterCounters*counts){
  const int t=blockIdx.x*blockDim.x+threadIdx.x;
  if(t>=nt)return;
+ // Preserve the previous positivity-constrained DG cell average. If an
+ // inexact block-GS candidate would drive the *under-relaxed cell mean* below
+ // omegaFloor, backtrack the local Picard step rather than replacing the
+ // negative mean with the floor (a hidden nonconservative source).
+ double oldMean=0.,candidateMean=0.;
+ for(int i=0;i<4;++i){
+   const double x=candidate[4*t+i],p=previous[4*t+i];
+   if(!isfinite(x)||!isfinite(p)){
+     atomicAdd(&counts->nonfiniteCells,1ULL);return;
+   }
+   if(x<0.)atomicAdd(&counts->negativeCandidateDofs,1ULL);
+   oldMean+=0.25*p;candidateMean+=0.25*x;
+ }
+ if(!(omegaFloor>0.)||!(alpha>0.&&alpha<=1.)||
+    !isfinite(oldMean)||!isfinite(candidateMean)||
+    oldMean<omegaFloor*(1.-1.e-10)){
+   atomicAdd(&counts->nonfiniteCells,1ULL);return;
+ }
+ double alphaLocal=alpha;
+ const double requestedMean=oldMean+alpha*(candidateMean-oldMean);
+ if(requestedMean<omegaFloor){
+   atomicAdd(&counts->meanDeficitCells,1ULL); // REQUIRED backtrack count
+   if(!(candidateMean<oldMean)){
+     atomicAdd(&counts->nonfiniteCells,1ULL);return;
+   }
+   const double allowed=(oldMean-omegaFloor)/(oldMean-candidateMean);
+   alphaLocal=fmax(0.,fmin(alpha,0.95*fmax(0.,allowed)));
+   if(alphaLocal==0.)atomicAdd(&counts->stalledCells,1ULL);
+   if(alphaLocal<alpha*0.1)
+     atomicAdd(&counts->heavilyBacktrackedCells,1ULL);
+ }
  double w[4],mean=0.,minval=1.e300;
  for(int i=0;i<4;++i){
-   const double x=candidate[4*t+i];
-   if(x<0.)atomicAdd(&counts->negativeCandidateDofs,1ULL);
-   w[i]=previous[4*t+i]+alpha*(x-previous[4*t+i]);
+   w[i]=previous[4*t+i]+alphaLocal*
+        (candidate[4*t+i]-previous[4*t+i]);
    if(!isfinite(w[i])){atomicAdd(&counts->nonfiniteCells,1ULL);return;}
-   mean+=.25*w[i];minval=fmin(minval,w[i]);
+   mean+=0.25*w[i];minval=fmin(minval,w[i]);
  }
- if(!(omegaFloor>0.)||!isfinite(mean)){atomicAdd(&counts->nonfiniteCells,1ULL);return;}
- if(mean<omegaFloor){
-   // Cannot preserve both an inadmissible sub-floor mean and positivity.
-   // Expose it in diagnostics instead of hiding the event.
-   atomicAdd(&counts->meanDeficitCells,1ULL);
-   for(int i=0;i<4;++i)updated[4*t+i]=omegaFloor;
-   return;
+ if(mean<omegaFloor*(1.-1.e-10)){
+   atomicAdd(&counts->nonfiniteCells,1ULL);return;
  }
  double theta=1.;
  if(minval<omegaFloor){
