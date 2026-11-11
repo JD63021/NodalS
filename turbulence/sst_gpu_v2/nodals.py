@@ -435,6 +435,21 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
                 raise ValueError(f'Deprecated/restricted momentum SUPG environment key {key}; use [supg] momentum, tau_scale, nu_fd_rel')
             env[key]=v
 
+    # Omega-only DG convection numerical flux: theta=1 is existing
+    # Lax-Friedrichs/upwind; theta=0 is the nondissipative central trace.
+    # Independent of [convection] form (which configures momentum only).
+    if cp.has_section('omega_dg'):
+        theta=number(cp,'omega_dg','convection_theta',1.0)
+        if not 0.0<=theta<=1.0:
+            raise ValueError('omega_dg.convection_theta must lie in [0,1]')
+        env['NODALS_DG_OMEGA_CONVECTION_THETA']=fmt(theta)
+        if flag(cp,'omega_dg','enabled',False):
+            env['NODALS_DG_OMEGA']='1'
+        else:
+            env['NODALS_DG_OMEGA']='0'
+    elif env.get('NODALS_DG_OMEGA')=='1':
+        # Preserve legacy [environment] DG switch for older experimental cases.
+        env.setdefault('NODALS_DG_OMEGA_CONVECTION_THETA','1')
     # A separate optional physics-plateau gate. Environment is emitted after
     # user [environment] passthrough so parsed [convergence] is authoritative.
     env['NODALS_CONV_METRIC']=conv_metric
