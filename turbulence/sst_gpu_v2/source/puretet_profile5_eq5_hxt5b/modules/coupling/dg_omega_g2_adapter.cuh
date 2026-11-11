@@ -183,9 +183,17 @@ struct CoupledOmegaState {
     HXT1_CUDA(cudaDeviceSynchronize());
     LimiterCounters limited{};
     HXT1_CUDA(cudaMemcpy(&limited,limiterCounters.p,sizeof(limited),cudaMemcpyDeviceToHost));
-    if(limited.nonfiniteCells||limited.meanDeficitCells)
-      throw std::runtime_error("DG omega G2 invalid/subfloor mean; refusing hidden nonconservative repair: "+
-        std::to_string(limited.nonfiniteCells)+"/"+std::to_string(limited.meanDeficitCells));
+    if(limited.nonfiniteCells)
+      throw std::runtime_error("DG omega G2 invalid input or nonfinite update: "+
+        std::to_string(limited.nonfiniteCells));
+    // Mean-deficit cells now trigger positivity-preserving backtracking,
+    // not any mass-creating replacement with an artificial floor.
+    if(outer<=5||outer%10==0)
+      std::printf("DG_OMEGA_G2_POSITIVITY it=%d limited=%llu backtracked=%llu "
+                  "heavilyBacktracked=%llu stalled=%llu negativeCandidates=%llu\n",
+        outer,limited.limitedCells,limited.meanDeficitCells,
+        limited.heavilyBacktrackedCells,limited.stalledCells,
+        limited.negativeCandidateDofs);
     // True DG update norm, not the artificially smoothed vertex projection.
     HXT1_CUDA(cudaMemcpy(change.p,omega.p,omega.n*sizeof(double),cudaMemcpyDeviceToDevice));
     const double minusOne=-1.;
@@ -214,10 +222,10 @@ struct CoupledOmegaState {
     HXT1_CUDA(cudaMemcpy(oldClipCounter,&clips,sizeof(clips),cudaMemcpyHostToDevice));
     if(outer<=5||outer%10==0)
       std::printf("DG_OMEGA_G2_STEP it=%d solver=BLOCK_FGS sweeps=%d colors=%d "
-        "limited=%llu negativeCandidates=%llu omegaFloor=%g alpha=%g "
+        "limited=%llu backtracked=%llu negativeCandidates=%llu omegaFloor=%g alpha=%g "
         "q12Wall=%d updateRel=%.9e source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
         outer,linear.sweeps,linear.ncolors,limited.limitedCells,
-        limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall,
+        limited.meanDeficitCells,limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall,
         lastUpdateRelative);
   }
   PhysicsAudit download_physics_audit()const{
