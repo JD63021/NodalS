@@ -38,6 +38,7 @@ __device__ __forceinline__ void implicit_dev_tet_quadrature(
         gu[d]+=U[0][a]*g;gu[3+d]+=U[1][a]*g;gu[6+d]+=U[2][a]*g;
       }
     }
+    hxt5c::eval_dg_omega_p1((int)cell,l,tg[cell],wv,gw);
     double x=0.,y=0.;
     for(int a=0;a<4;++a){const auto p=pts[tc[cell].v[a]];x+=l[a]*p.x;y+=l[a]*p.y;}
     const auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,
