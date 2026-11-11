@@ -44,8 +44,9 @@ __device__ __forceinline__ void bf3_values(const Cell&g,const double l[4],
     p[e]=value;gp[e]=grad;
   }
 }
-// Volume P1-to-constrained-BF3 columns. Uses exactly the same four
-// SST2003m quadrature locations/coefficient provider as live DG P1 volume.
+// Volume P1-to-constrained-BF3 columns: use the original 24-point
+// tetrahedral integration (not the DG-P1 pilot's four-point rule), because
+// the virtual BF3 trial is cubic and its mixed stiffness requires more points.
 __global__ void masked_q1_volume_bf3(
   int nt,const Cell*c,const nodals_hxt1::TetConn*tc,
   const nodals_hxt1::TetVel*tv,const double*u0,const double*u1,
@@ -56,10 +57,9 @@ __global__ void masked_q1_volume_bf3(
  if(t>=nt)return;
  const Cell g=c[t];
  double matrix[16]{};
- constexpr double qhi=0.58541019662496845446;
- constexpr double qlo=0.13819660112501051518;
- for(int q=0;q<4;++q){
-   double l[4]={qlo,qlo,qlo,qlo};l[q]=qhi;
+ for(int q=0;q<24;++q){
+   double l[4]={hxt5a::h5_tet24_l0[q],hxt5a::h5_tet24_l1[q],
+                hxt5a::h5_tet24_l2[q],hxt5a::h5_tet24_l3[q]};
    double mu=0.,reaction=0.,src=0.;Vec3 u{};
    if(!quadrature_sst(t,l,g,tc,tv,u0,u1,u2,kCG,oldOmegaDG,
                        wallDistance,physics,mu,reaction,src,u,nullptr)){
@@ -67,7 +67,7 @@ __global__ void masked_q1_volume_bf3(
    }
    double pb[4];Vec3 gb[4];
    bf3_values(g,l,pb,gb);
-   const double weight=0.25*g.volume;
+   const double weight=hxt5a::h5_tet24_w[q]*g.volume;
    for(int a=0;a<4;++a)
      for(int b=0;b<4;++b)
        matrix[4*a+b]+=weight*(mu*dot(g.grad[a],gb[b])+
@@ -95,10 +95,10 @@ __global__ void masked_q1_face_bf3(
    const double alpha=opt.theta*fabs(un);
    const double conv[2]={.5*(alpha-un),.5*(alpha+un)};
    double M[2][2][16]{};
-   for(int q=0;q<3;++q){
+   for(int q=0;q<12;++q){
      double ll[4]{0.,0.,0.,0.},lr[4]{0.,0.,0.,0.};
      for(int j=0;j<3;++j){
-       const double value=j==q?2./3.:1./6.;
+       const double value=j==0?hxt5b::QL0[q]:(j==1?hxt5b::QL1[q]:hxt5b::QL2[q]);
        ll[f.vertexL[j]]=value;
        lr[f.vertexR[j]]=value;
      }
@@ -121,7 +121,7 @@ __global__ void masked_q1_face_bf3(
              const double fluxW=.5*B.mu*dot(gb[b],f.normal);
              double value=-fluxW*jv-fluxV*jw+eta*jv*jw;
              value+=conv[sa]*pa*(sa==sb?pb[b]:-pb[b]);
-             M[sa][sb][4*a+b]+=(f.area/3.)*value;
+             M[sa][sb][4*a+b]+=(f.area*hxt5b::QW12[q])*value;
            }
          }
        }
@@ -144,12 +144,12 @@ __global__ void masked_q1_face_bf3(
    const bool inlet=f.boundary==Inlet;
    const bool backflow=f.boundary==Outlet && un<0.;
    double M[16]{};
-   for(int q=0;q<3;++q){
+   for(int q=0;q<12;++q){
      double l[4]{0.,0.,0.,0.};
-     for(int j=0;j<3;++j)l[f.vertexL[j]]=j==q?2./3.:1./6.;
+     for(int j=0;j<3;++j)l[f.vertexL[j]]=j==0?hxt5b::QL0[q]:(j==1?hxt5b::QL1[q]:hxt5b::QL2[q]);
      double pb[4];Vec3 gb[4];
      bf3_values(L,l,pb,gb);
-     const double weight=f.area/3.;
+     const double weight=f.area*hxt5b::QW12[q];
      for(int a=0;a<4;++a)for(int b=0;b<4;++b){
        double v=0.;
        if(inlet){
