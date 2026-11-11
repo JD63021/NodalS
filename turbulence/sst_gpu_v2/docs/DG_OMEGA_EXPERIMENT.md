@@ -79,3 +79,15 @@ Source snapshot used for planning: main as of 2026-11-11.
   ```
 - The large trace penalty may harm conditioning; test realistic gamma here before changing the active wall penalty. A successful constant field does not validate physical wall modeling or sharp omega transport.
 - **No G2 CG-SST path has been modified.** Actual DG omega coupling to the physical wall/SST coefficient kernels remains required.
+
+## Inexact DG linear solve comparison (RTX 3060 U-bend)
+
+User's real full-mesh result with frozen uniform omega=100, nu=1.460734693878e-5, reaction 0.1, traceGamma=1e5:
+- `DG_OMEGA_FULLMESH_CONSISTENCY relative=2.04e-16`: exact manufactured solution satisfies assembled BSR4 equation.
+- GPU FGMRES(20), block Jacobi, rtol=1e-6: 74 iterations, 0.292 s, trueRel=9.846e-7, RMS omega error=23.97, max absolute error=42.32, min omega=57.68. This is *not* acceptable manufactured-solution accuracy despite algebraic stopping.
+- The RHS is stiff-wall-penalty dominated. A tiny `||Ax-b||/||b||` alone does not certify physical accuracy; report the field error separately.
+- User's *real* G2 scalar policy is usually fixed **two GS sweeps**, or FGMRES rtol approximately 0.1, not rtol=1e-6. Benchmark these practical choices before deep solver tuning.
+- Added `dg_omega_gpu_block_gs.cuh`: graph-colored exact 4x4 element-block forward and symmetric GS, ≤5 colors for tetra face adjacency, independently selectable sweeps and relaxation.
+- Fullmesh driver `RUN_FULLMESH.sh` now accepts `--solver block-fgs|block-sgs|fgmres --sweeps 2 --relaxation 1.0 --initial 0|100 --rtol 0.1`, reporting both relative true residual and manufactured field error. Two sweeps are intentionally an *inexact* solve, not required to approximate the exact solution to 0.1%.
+- Need workstation run for CUDA compile and speed; no claim of successful SGS/FGS until verified.
+- **No actual SST G2 integration yet.** This is algebraic operator conditioning and inexact solver benchmarking on real mesh.
