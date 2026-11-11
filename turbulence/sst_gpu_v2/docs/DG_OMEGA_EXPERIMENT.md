@@ -52,3 +52,12 @@ Source snapshot used for planning: main as of 2026-11-11.
 - `vertexL/R[3]` map the same globally sorted face vertices to each tetra's local vertex numbering.
 - Wall targets are values at three physical triangle quadrature points; for the actual U-bend these must be obtained from the established point-3 Spalding / trace-log machinery, not independently approximated.
 - `Cell` coefficients are frozen-element placeholders for the current assembly parity test, **not** a completed quadrature-dependent SST transport model.
+
+## Progress — native mesh and constitutive access
+
+- User has confirmed `DG_OMEGA_GPU_PARITY_ALL_PASS` on RTX 3060, all four flux scenarios, worst tested absolute block-entry difference approximately `1.8e-12`.
+- New `dg_omega_hxt1_topology.hpp` builds BSR4 connectivity from native HXT1 pure tetrahedral mesh and classifies exterior faces from native inlet/outlet tags, assigning remaining exterior faces to wall only in supported single-wall cases.
+- `tests/RUN_TOPOLOGY.sh <HXT1_mesh.bin>` verifies topology, geometry and face incidence; unverified on full benchmark until workstation executes.
+- `dg_omega_field_access.hpp` evaluates truly discontinuous DG-P1 omega and physical gradients from `omegaDG[4*cell+a]`. Its API is explicitly not a CG projection; `tests/RUN_FIELD_ACCESS.sh` verifies independent traces.
+- These are **unintegrated modules**: native G2 SST, k transport, momentum and wall kernels still consume their old CG vectors. Do not turn on DG execution in G2 yet.
+- Remaining steps: quadrature-dependent SST coefficient evaluation, full 5-point trace-log wall target on DG physical-face quadrature, GPU-resident FGMRES (4x4 block preconditioned), G2 constitutive field access across all kernels, restart and adaptive refresh, true residual monitoring, validation. Existing CG path must remain untouched.
