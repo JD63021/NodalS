@@ -1171,7 +1171,7 @@ __global__ void sst_mom_dev_rhs_tet(
     Real gu[9]={0},gk[3]={0},gw[3]={0},kv=0,wv=0;
     for(int a=0;a<8;++a){Real pa=(Real)ph[a];kv+=K[a]*pa;wv+=W[a]*pa;for(int d=0;d<3;++d){Real gd=(Real)gp[a][d];GP[iq][a][d]=gd;gk[d]+=K[a]*gd;gw[d]+=W[a]*gd;gu[d]+=U0[a]*gd;gu[3+d]+=U1[a]*gd;gu[6+d]+=U2[a]*gd;}}
     hxt5c::eval_dg_omega_p1((int)c,l,tg[c],wv,gw);double x=0,y=0;for(int a=0;a<4;++a){auto X=pts[tc[c].v[a]];x+=l[a]*X.x;y+=l[a]*X.y;}
-    auto s=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor);
+    auto s=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,hxt5c::dg_omega_p1_constitutive?hxt5c::stage20_distance(tc,(int)c,l):Real(-1));
     for(int m=0;m<9;++m)GU[iq][m]=gu[m];NUEW[iq]=((Real)nu+s.nut)*(Real)(tg[c].det*qw);
   }
   __syncthreads();
