@@ -91,3 +91,21 @@ User's real full-mesh result with frozen uniform omega=100, nu=1.460734693878e-5
 - Fullmesh driver `RUN_FULLMESH.sh` now accepts `--solver block-fgs|block-sgs|fgmres --sweeps 2 --relaxation 1.0 --initial 0|100 --rtol 0.1`, reporting both relative true residual and manufactured field error. Two sweeps are intentionally an *inexact* solve, not required to approximate the exact solution to 0.1%.
 - Need workstation run for CUDA compile and speed; no claim of successful SGS/FGS until verified.
 - **No actual SST G2 integration yet.** This is algebraic operator conditioning and inexact solver benchmarking on real mesh.
+
+## Native SST physics standalone increment (2026-11-11)
+
+The user has executed three full-mesh algebraic comparisons:
+| solver | solve time | true relative residual | RMS omega error | omega min |
+|--|--:|--:|--:|--:|
+| block-FGS 2 sweeps | 0.005 s | 1.070405e-4 | 97.711 | -92.784 |
+| block-SGS 2 sweeps | 0.007 s | 7.292662e-5 | 97.302 | -83.082 |
+| right-FGMRES rtol=0.1 | 0.023 s | 3.129882e-4 | 99.664 | -99.273 |
+
+**These are cold-start synthetic linear solves from omega=0**, not characteristic of NodalS's warm-started Picard iteration. The relative residual is dominated by the large physical-wall Nitsche gamma=1e5 penalty. Negative field values are unacceptable without protection.
+
+Latest experimental additions:
+- `dg_omega_gpu_limiter.cuh`: underrelaxed update followed by cell-mean preserving Bernstein-P1 positivity scaling (with explicit separate audit of subfloor cell means), and vertex averaging exclusively for visualization. Never feed vertex-averaged omega back into SST.
+- `dg_omega_sst_volume.cuh`: native HXT1 tetra element-local omega, native P1+BF3 velocity (including all four face bubble DOFs), existing vertex-Q1 k, explicit Stage20-style wall distance. Evaluate `nodals::sst2003m::evaluate_at_distance<double>` at four degree-two physical tetra quadrature points. Assemble omega volume diffusion, reaction and source. The result's cell-mean diffusivity/velocity feeds existing DG-P1 face kernel. The complete G2 code still requires 24-point volume quadrature/face coefficient correctness and exact trace-log wall target. **This is not yet G2-coupled**.
+- `tests/dg_omega_sst_smoke.cu`, `tests/RUN_SST_STANDALONE.sh`: use real 199584-tet HXT1 mesh with deliberately synthetic zero velocity, constant k=0.01, initial omegaDG=100, synthetic constant wall distance=0.01. Assemble real SST coefficients on GPU, benchmark warm-started two block-FGS sweeps with omega UR=0.7 and positivity; print audits.
+- This standalone SST test is pending CUDA compilation/execution on the user's workstation. The synthetic wall-distance field is **not** an acceptable substitute for G2 Stage20 wall distance in a U-bend simulation.
+- The CG G2 path is untouched. The next important milestone is a complete G2 coupling that uses DG omega in **all** SST physics, momentum, k and wall sampling. A partial CG projection is not equivalent physics.
