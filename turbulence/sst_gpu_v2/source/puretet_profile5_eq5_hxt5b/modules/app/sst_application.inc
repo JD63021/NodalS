@@ -2836,7 +2836,8 @@ std::printf("NODALS_SST_OMEGA_WALL_CONFIG mode=%s target=%s placement=%s physica
            std::string(std::getenv("NODALS_P2_STAGE5_RUN"))=="1")
           throw std::runtime_error("DG omega cannot run concurrently with P2 pilot");
         TS.dgOmega.reset(new ::nodals::omega_dg_gpu::CoupledOmegaState(
-           M,BH,TS.omegaIn,traceGamma,stage20WallField.allocation));
+           M,BH,TS.omegaIn,traceGamma,
+           reinterpret_cast<const double*>(stage20WallField.allocation)));
         TS.dgOmega->bind_constitutive();
         std::printf("DG_OMEGA_G2_ACTIVE mode=TRUE_DG_P1 k=MASKED_Q1 "
           "u=P1_BF3 pressure=P0 flux=UPWIND+SIPG "
