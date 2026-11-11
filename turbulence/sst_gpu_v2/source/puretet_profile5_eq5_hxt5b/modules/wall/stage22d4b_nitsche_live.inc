@@ -251,6 +251,7 @@ __global__ void s22d4_nitsche_tet_component(
       }
     }
 #endif
+    hxt5c::eval_dg_omega_p1(f.cell,lam,tg[f.cell],wv,gw);
     const auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,
        gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,
        hxt5c::stage20_distance(tc,f.cell,lam));
