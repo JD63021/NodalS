@@ -30,6 +30,7 @@ struct Controls {
   double theta=1.0;
   double traceGamma=100000.0;
   double wallNormalTolerance=1.e-8;
+  bool skipWall=false; // G2 omega: exact 12-point wall closure assembled separately
 };
 __host__ __device__ inline double dot(Vec3 a,Vec3 b) {
   return a.x*b.x+a.y*b.y+a.z*b.z;
@@ -117,6 +118,7 @@ __global__ void faces(int n,const Face*f,const Cell*c,Controls opt,
       }
     }
   }else{
+    if(F.boundary==Wall && opt.skipWall)return;
     const double un=dot(L.u,F.normal);
     if(F.boundary==Wall && fabs(un)>opt.wallNormalTolerance){
       atomicAdd(errors,1u);return;
