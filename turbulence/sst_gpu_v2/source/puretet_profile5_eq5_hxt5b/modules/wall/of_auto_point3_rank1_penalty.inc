@@ -27,6 +27,35 @@
     stage41OmegaTarget=(Real)omegaEq;
   }
   const double nuEff=(double)((Real)nu+ss.sigmaW*ss.nut);
+  // DG omega only: harvest the EXACT existing sample-3 log target and
+  // sigmaW*nu_t diffusivity (from the same five-point Spalding inversion).
+  // No assembly into the old CG omega matrix while this collector is bound.
+  if(equation==OMEGA_EQ && hxt5c::dg_omega_wall_target_q12){
+    if(!hxt5c::dg_omega_wall_mu_q12||
+       !(isfinite((double)stage41OmegaTarget) && stage41OmegaTarget>Real(0)) ||
+       !(isfinite(nuEff) && nuEff>0.)){
+      atomicAdd(bad,1ULL);return;
+    }
+    const std::size_t qi=(std::size_t)fi*12u+(std::size_t)q;
+    hxt5c::dg_omega_wall_target_q12[qi]=(double)stage41OmegaTarget;
+    hxt5c::dg_omega_wall_mu_q12[qi]=nuEff;
+    if(wallStats){
+      const double ww=(double)hxt5b::QW12[q]*f.area*ell;
+      atomicAdd(wallStats+0,ww);
+      atomicAdd(wallStats+1,(double)stage41OmegaTarget*ww);
+      atomicAdd(wallStats+2,(double)(pm.y*ut/nu)*ww);
+      atomicAdd(wallStats+3,(double)wv*ww);
+      atomicAdd(wallStats+5,(double)oa.rey*ww);
+      atomicAdd(wallStats+6,(double)oa.lamFrac*ww);
+      atomicAdd(wallStats+7,(double)oa.omegaVis*ww);
+      atomicAdd(wallStats+8,(double)oa.omegaLog*ww);
+      atomicAdd(wallStats+9,(double)ss.pk*ww);
+      atomicAdd(wallStats+10,(double)oa.pkAuto*ww);
+      atomicAdd(wallStats+11,(double)(oa.nutSpalding/(Real)nu)*ww);
+      atomicAdd(wallStats+12,(double)(ss.nut/(Real)nu)*ww);
+    }
+    return;
+  }
   const double vweight=(double)hxt5b::QW12[q]*f.area*ell;
   const double coeff=penaltyGamma*nuEff/ell*vweight/ell;
   if(!(isfinite(nuEff)&&nuEff>0.0 && isfinite(coeff)&&coeff>0.0 &&
