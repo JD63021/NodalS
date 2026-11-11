@@ -32,3 +32,23 @@ This branch is deliberately isolated from the validated CG/Robin-Nitsche GPU SST
 The presence of a new DG module does not mean the G2 solver has been integrated, compiled or validated. DG must be opt-in and fail-fast until full coupling and checkpoint/restart are implemented. Never mark a result DG unless its native field accesses are verified.
 
 Source snapshot used for planning: main as of 2026-11-11.
+
+## Implementation status — 2026-11-11
+
+- Portable two-tetra C++17 DG-P1 reference: **passed on user's Ubuntu workstation**.
+- New isolated CUDA BSR4 kernels: `modules/transport/dg_omega_bsr4.cuh`.
+- Native parity executable: `modules/transport/tests/dg_omega_gpu_parity.cu`.
+- Run parity: `bash modules/transport/tests/RUN_GPU_PARITY.sh` from the tests directory, or invoke by absolute path.
+- **CUDA kernel parity pending workstation test**. No compiler or RTX GPU is available in the remote code-writing environment.
+- **Not G2-integrated**. Existing `[sst] state_space=q1` behavior remains unchanged.
+- Next: verify GPU matrix/rhs/SpMV/diagonal-block parity, then construct mesh tagging and true DG omega physics coupling; do not run a U-bend as DG until the true field-access path is wired.
+
+## GPU block structure contract
+
+- `rowPtr` and `colInd` index tetrahedra (blocks), not scalar coefficients.
+- `blocks[16 * slot + 4 * localRow + localCol]` stores a dense row-major 4x4 block.
+- Each tetra is a diagonal block; each neighboring tetra contributes one off-diagonal block.
+- Four face block slots `LL, LR, RL, RR` are computed on host and provided to face kernels.
+- `vertexL/R[3]` map the same globally sorted face vertices to each tetra's local vertex numbering.
+- Wall targets are values at three physical triangle quadrature points; for the actual U-bend these must be obtained from the established point-3 Spalding / trace-log machinery, not independently approximated.
+- `Cell` coefficients are frozen-element placeholders for the current assembly parity test, **not** a completed quadrature-dependent SST transport model.
