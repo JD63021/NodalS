@@ -148,3 +148,12 @@ Interior DG face flux in `dg_omega_bsr4.cuh` uses a Rusanov/Lax–Friedrichs dis
 - `[omega_dg] enabled=true` and `convection_theta=0` now mapped by `nodals.py` to native runtime environment variables without editing/rebuilding source for subsequent changes. Native G2 initialization prints `flux=LF_THETA_0+SIPG` and each step prints `convectionTheta=0.000`.
 - NodalS executable must be **rebuilt once** after pulling the implementation that adds the runtime setting.
 - Central convection can have significant oscillations or more positivity limiting, particularly because the current code uses 4-point SST volume quadrature, cell-averaged face coefficients, and only two block-FGS sweeps. Compare limiter/backtrack counts and wall/pressure outputs. A change in visual sharpness alone does not validate higher accuracy.
+
+## Runtime SIPG interior penalty (2026-11-11)
+
+- Existing DG-P1 SIPG interior penalty: `eta_F = 4*C_IP*max(muL/hL,muR/hR)`, `h=3*volume/face_area`, `mu=nu+sigmaW*nut`. Previous hardcoded `C_IP=10`.
+- New case knob: `[omega_dg] sipg_penalty=20` (positive finite, up to 100000). Default 10 preserves prior code behavior.
+- `nodals.py` passes this as `NODALS_DG_OMEGA_SIPG_PENALTY`, native `CoupledOmegaState` parses it at startup; `faceOptions.penaltyC` uses the chosen value on every SIMPLE iteration. `DG_OMEGA_G2_INIT` and `DG_OMEGA_G2_STEP` print `sipgPenalty`.
+- This does **not** change physical-wall `omega_wall.trace_gamma=100000` or the momentum penalty; it changes interior DG omega diffusion face coupling only.
+- Also accepts CLI overrides: `--set omega_dg.sipg_penalty=20 --set omega_dg.convection_theta=0.5`; no permanent case edit needed.
+- Pull + rebuild once, then each penalty experiment requires no new build. Test 10 / 20 / 40 under the same theta and compare limiter/backtracking counts, true DG omega updates, velocity profiles, timings.
