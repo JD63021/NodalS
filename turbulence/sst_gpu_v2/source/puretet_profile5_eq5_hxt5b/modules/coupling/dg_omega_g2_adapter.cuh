@@ -7,6 +7,7 @@
 #include "../transport/dg_omega_sst_volume.cuh"
 #include "../transport/dg_omega_gpu_limiter.cuh"
 #include "../transport/dg_omega_wall_q12.cuh"
+#include "../transport/dg_omega_masked_q1.cuh"
 #include <array>
 #include <map>
 #include <memory>
@@ -23,6 +24,8 @@ struct CoupledOmegaState {
   cublasHandle_t reductionHandle=nullptr;
   double lastUpdateRelative=0.;
   nodals_hxt1::Dev<double> matrix,rhs;
+  nodals_hxt1::Dev<double> maskedSelfPB,maskedCrossL1,maskedFloorMass;
+  nodals_hxt1::Dev<unsigned long long> maskedClippedDofs,maskedClippedCells;
   nodals_hxt1::Dev<double> wallTarget,wallMu;
   nodals_hxt1::Dev<double> cgOutput;
   nodals_hxt1::Dev<unsigned int> cgCounts,error;
@@ -30,6 +33,7 @@ struct CoupledOmegaState {
   nodals_hxt1::Dev<LimiterCounters> limiterCounters;
   std::unique_ptr<DeviceColoring> colors;
   double inletOmega,traceGamma,convectionTheta=1.,sipgPenalty=10.;
+  bool maskedQ1=false;
   const double* wallDistanceDevice=nullptr;
   int nvertex=0,nwall=0;
   CoupledOmegaState(const nodals_hxt1::HostMesh&M,
@@ -62,6 +66,12 @@ struct CoupledOmegaState {
     }
     if(!std::isfinite(sipgPenalty)||sipgPenalty<=0.||sipgPenalty>100000.)
       throw std::runtime_error("DG omega sipg_penalty must lie in (0,100000]");
+    if(const char* raw=std::getenv("NODALS_DG_OMEGA_SPACE")){
+      const std::string space(raw);
+      if(space=="masked_q1")maskedQ1=true;
+      else if(space!="bernstein_p1")
+        throw std::runtime_error("omega_dg.space must be masked_q1 or bernstein_p1");
+    }
     if(sizeof(hxt5c::Real)!=sizeof(double))
       throw std::runtime_error("DG omega G2 requires FP64 NodalS build");
     if(!(omegaIn>0.)||!(gamma>=10.)||!(gamma<=1.e5))
@@ -133,10 +143,18 @@ struct CoupledOmegaState {
     error.allocate_zeros(1);
     physicsCounters.allocate_zeros(1);
     limiterCounters.allocate_zeros(1);
+    if(maskedQ1){
+      maskedSelfPB.allocate_zeros((std::size_t)16*nt);
+      maskedCrossL1.allocate_zeros((std::size_t)4*nt);
+      maskedFloorMass.allocate_zeros(1);
+      maskedClippedDofs.allocate_zeros(1);
+      maskedClippedCells.allocate_zeros(1);
+    }
     colors.reset(new DeviceColoring(color_bsr4(nt,topo.rowPtr,topo.colInd)));
     std::printf("DG_OMEGA_G2_INIT tets=%d DGdofs=%d faceBlocks=%zu colors=%d "
-       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e convectionTheta=%.3f sipgPenalty=%.9g mode=TRUE_DG_P1\n",
-       nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma,convectionTheta,sipgPenalty);
+       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e convectionTheta=%.3f sipgPenalty=%.9g space=%s mode=TRUE_DG_P1\n",
+       nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma,convectionTheta,sipgPenalty,
+       maskedQ1?"MASKED_Q1_DG":"BERNSTEIN_P1_DG");
   }
   ~CoupledOmegaState(){
     hxt5c::bind_dg_omega_wall_q12(nullptr,nullptr);
@@ -199,20 +217,69 @@ struct CoupledOmegaState {
     if(bad||ph.invalid)
       throw std::runtime_error("DG omega G2 invalid volume or wall assembly: "+
         std::to_string(ph.invalid)+" / "+std::to_string(bad));
+    if(maskedQ1){
+      HXT1_CUDA(cudaMemset(maskedSelfPB.p,0,maskedSelfPB.n*sizeof(double)));
+      HXT1_CUDA(cudaMemset(maskedCrossL1.p,0,maskedCrossL1.n*sizeof(double)));
+      HXT1_CUDA(cudaMemset(maskedFloorMass.p,0,sizeof(double)));
+      HXT1_CUDA(cudaMemset(maskedClippedDofs.p,0,sizeof(unsigned long long)));
+      HXT1_CUDA(cudaMemset(maskedClippedCells.p,0,sizeof(unsigned long long)));
+      masked_q1_volume_bf3<<<(nt+127)/128,128>>>(
+        nt,cells.p,tc.p,tv.p,u0,u1,u2,kCG,previous.p,
+        wallDistanceDevice,physical,maskedSelfPB.p,error.p);
+      HXT1_CUDA(cudaGetLastError());
+      masked_q1_face_bf3<<<(nf+127)/128,128>>>(
+        nf,faces.p,cells.p,faceOptions,maskedSelfPB.p,maskedCrossL1.p,error.p);
+      HXT1_CUDA(cudaGetLastError());
+      masked_q1_wall_bf3_q12<<<(nwall+127)/128,128>>>(
+        nwall,wallPlans,cells.p,wallMu.p,traceGamma,maskedSelfPB.p,error.p);
+      HXT1_CUDA(cudaGetLastError());
+      HXT1_CUDA(cudaDeviceSynchronize());
+      HXT1_CUDA(cudaMemcpy(&bad,error.p,sizeof(bad),cudaMemcpyDeviceToHost));
+      if(bad)throw std::runtime_error("DG masked-Q1 mixed BF3 assembly failure: "+std::to_string(bad));
+      masked_q1_row_l1_relax<<<(nt+127)/128,128>>>(
+        nt,row.p,col.p,diagonal.p,matrix.p,rhs.p,previous.p,
+        maskedSelfPB.p,maskedCrossL1.p,O.alphaOmega,error.p);
+      HXT1_CUDA(cudaGetLastError());
+      HXT1_CUDA(cudaDeviceSynchronize());
+      HXT1_CUDA(cudaMemcpy(&bad,error.p,sizeof(bad),cudaMemcpyDeviceToHost));
+      if(bad)throw std::runtime_error("DG masked-Q1 row-L1 relaxation failure: "+std::to_string(bad));
+    }
     MatrixView A{nt,row.p,col.p,diagonal.p,matrix.p};
     const auto linear=block_gs(A,*colors,rhs.p,candidate.p,2,false,1.);
-    relax_and_limit<<<(nt+127)/128,128>>>(
-      nt,previous.p,candidate.p,omega.p,O.alphaOmega,O.omegaFloor,limiterCounters.p);
-    HXT1_CUDA(cudaGetLastError());
-    HXT1_CUDA(cudaDeviceSynchronize());
     LimiterCounters limited{};
-    HXT1_CUDA(cudaMemcpy(&limited,limiterCounters.p,sizeof(limited),cudaMemcpyDeviceToHost));
-    if(limited.nonfiniteCells)
-      throw std::runtime_error("DG omega G2 invalid input or nonfinite update: "+
-        std::to_string(limited.nonfiniteCells));
+    if(maskedQ1){
+      masked_q1_nodal_floor<<<(nt+127)/128,128>>>(
+        nt,candidate.p,omega.p,O.omegaFloor,
+        maskedClippedDofs.p,maskedClippedCells.p,maskedFloorMass.p,error.p);
+      HXT1_CUDA(cudaGetLastError());
+      HXT1_CUDA(cudaDeviceSynchronize());
+      HXT1_CUDA(cudaMemcpy(&bad,error.p,sizeof(bad),cudaMemcpyDeviceToHost));
+      if(bad)throw std::runtime_error("DG masked-Q1 nonfinite nodal value: "+std::to_string(bad));
+      HXT1_CUDA(cudaMemcpy(&limited.limitedCells,maskedClippedCells.p,
+        sizeof(unsigned long long),cudaMemcpyDeviceToHost));
+      unsigned long long dofs=0;
+      double massAdjustment=0.;
+      HXT1_CUDA(cudaMemcpy(&dofs,maskedClippedDofs.p,sizeof(dofs),cudaMemcpyDeviceToHost));
+      HXT1_CUDA(cudaMemcpy(&massAdjustment,maskedFloorMass.p,sizeof(double),cudaMemcpyDeviceToHost));
+      if(outer<=5||outer%10==0)
+        std::printf("DG_OMEGA_MASKED_Q1 it=%d physicalDofs=%d virtualBF3Dofs=%d "
+          "bf3State=FIXED_ZERO rowL1=PHYSICAL_PLUS_MASKED_BF3 "
+          "clipCells=%llu clipDofs=%llu meanDeltaSum=%.9e "
+          "theta=%.3f sipg=%.9g\n",outer,4*nt,4*nt,
+          limited.limitedCells,dofs,massAdjustment,convectionTheta,sipgPenalty);
+    }else{
+      relax_and_limit<<<(nt+127)/128,128>>>(
+        nt,previous.p,candidate.p,omega.p,O.alphaOmega,O.omegaFloor,limiterCounters.p);
+      HXT1_CUDA(cudaGetLastError());
+      HXT1_CUDA(cudaDeviceSynchronize());
+      HXT1_CUDA(cudaMemcpy(&limited,limiterCounters.p,sizeof(limited),cudaMemcpyDeviceToHost));
+      if(limited.nonfiniteCells)
+        throw std::runtime_error("DG omega G2 invalid input or nonfinite update: "+
+          std::to_string(limited.nonfiniteCells));
+    }
     // Mean-deficit cells now trigger positivity-preserving backtracking,
     // not any mass-creating replacement with an artificial floor.
-    if(outer<=5||outer%10==0)
+    if(!maskedQ1 && (outer<=5||outer%10==0))
       std::printf("DG_OMEGA_G2_POSITIVITY it=%d limited=%llu backtracked=%llu "
                   "heavilyBacktracked=%llu stalled=%llu negativeCandidates=%llu\n",
         outer,limited.limitedCells,limited.meanDeficitCells,
@@ -247,10 +314,11 @@ struct CoupledOmegaState {
     if(outer<=5||outer%10==0)
       std::printf("DG_OMEGA_G2_STEP it=%d solver=BLOCK_FGS sweeps=%d colors=%d "
         "limited=%llu backtracked=%llu negativeCandidates=%llu omegaFloor=%g alpha=%g "
-        "q12Wall=%d updateRel=%.9e convectionTheta=%.3f sipgPenalty=%.9g source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
+        "q12Wall=%d updateRel=%.9e convectionTheta=%.3f sipgPenalty=%.9g space=%s source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
         outer,linear.sweeps,linear.ncolors,limited.limitedCells,
         limited.meanDeficitCells,limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall,
-        lastUpdateRelative,convectionTheta,sipgPenalty);
+        lastUpdateRelative,convectionTheta,sipgPenalty,
+       maskedQ1?"MASKED_Q1_DG":"BERNSTEIN_P1_DG");
   }
   PhysicsAudit download_physics_audit()const{
     PhysicsAudit a{};
