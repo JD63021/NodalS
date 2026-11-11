@@ -2815,6 +2815,34 @@ std::printf("NODALS_SST_OMEGA_WALL_CONFIG mode=%s target=%s placement=%s physica
           std::fabs(sum-double(total))<=0.1?"PASS":"WARN");
         std::fflush(stdout);
       };
+      // Experimental omega-only DG G2 integration. The CG implementation is
+      // preserved and remains the default, including all restart protocols.
+      const bool dgOmegaExperiment=std::getenv("NODALS_DG_OMEGA") &&
+          std::string(std::getenv("NODALS_DG_OMEGA"))=="1";
+      if(dgOmegaExperiment){
+        if(M.h.nhex||M.h.ninterface||!M.h.ntet||!stage20WallField.allocation||
+           stage20DistanceMethod!="geometric")
+          throw std::runtime_error("DG omega G2 requires pure-tet and Stage20 geometric wall-distance field");
+        if(sstG1.omegaWallMode!=hxt5c::OMEGA_WALL_OF_AUTO ||
+           s41mode!="trace_log" || sstG1.ofProduction ||
+           hxt5c::sst_state_space_mode_host()!=hxt5c::SST_STATE_Q1 ||
+           !sstG1.sharedSpaldingWallState)
+          throw std::runtime_error("DG omega G2 requires masked-Q1, of_auto trace_log, shared Spalding5 and wall production OFF");
+        if(p1Compact)
+          throw std::runtime_error("DG omega G2: compact_p1 pilot is not the validated masked-Q1 baseline");
+        if(stage31Start!=0||!stage31RestartPath.empty()||stage31Every>0)
+          throw std::runtime_error("DG omega G2 checkpoint compatibility not implemented; set STAGE31_CHECKPOINT_EVERY=0, no restart");
+        if(std::getenv("NODALS_P2_STAGE5_RUN") &&
+           std::string(std::getenv("NODALS_P2_STAGE5_RUN"))=="1")
+          throw std::runtime_error("DG omega cannot run concurrently with P2 pilot");
+        TS.dgOmega.reset(new ::nodals::omega_dg_gpu::CoupledOmegaState(
+           M,BH,TS.omegaIn,traceGamma,stage20WallField.allocation));
+        TS.dgOmega->bind_constitutive();
+        std::printf("DG_OMEGA_G2_ACTIVE mode=TRUE_DG_P1 k=MASKED_Q1 "
+          "u=P1_BF3 pressure=P0 flux=UPWIND+SIPG "
+          "solver=2_BLOCK_FGS wall=EXACT_SPALDING_POINT3_Q12 "
+          "distance=GEOMETRIC checkpoint=DISABLED physics=ELEMENT_LOCAL\n");
+      }
       for(int git=stage31Start+1;git<=sstG2Max;++git){
 #if defined(NODALS_P2_STAGE4_COUPLED)
         // Fresh P2 has valid P2 k/w at iteration 1 (lift of uniform inlet),
