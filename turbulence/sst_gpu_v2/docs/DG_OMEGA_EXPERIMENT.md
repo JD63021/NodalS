@@ -136,3 +136,15 @@ The real-mesh warm SST pilot passed on RTX 3060:
   make -C turbulence/sst_gpu_v2 -j4 NVCC=/usr/local/cuda-12.2/bin/nvcc CUDA_ARCH=sm_86
   ```
 - First native test should disable Stage31 restart and adaptive sampling, run 3–5 outer iterations, confirm `DG_OMEGA_G2_INIT`, `DG_OMEGA_G2_ACTIVE`, `DG_OMEGA_G2_STEP`, no field nonfinites, valid wall stats. Retain and compare the original CG baseline.
+
+## Runtime omega DG convection flux (central/upwind blend)
+
+Interior DG face flux in `dg_omega_bsr4.cuh` uses a Rusanov/Lax–Friedrichs dissipation coefficient `alpha=theta*abs(u_face dot n)`, where `u_face=(u_L+u_R)/2`.
+- `theta=1`: current full upwind LF (default; positive dissipation).
+- `theta=0`: central, no LF jump dissipation. Interior SIPG **diffusion** remains enabled.
+- `theta=0.5`: half LF dissipation.
+- Only omega transport changes. Momentum `[convection] form` and k scalar transport are unchanged.
+- Inlet/outlet convective flux retains its established upwind/backflow handling for stability and prescribed boundary conditions.
+- `[omega_dg] enabled=true` and `convection_theta=0` now mapped by `nodals.py` to native runtime environment variables without editing/rebuilding source for subsequent changes. Native G2 initialization prints `flux=LF_THETA_0+SIPG` and each step prints `convectionTheta=0.000`.
+- NodalS executable must be **rebuilt once** after pulling the implementation that adds the runtime setting.
+- Central convection can have significant oscillations or more positivity limiting, particularly because the current code uses 4-point SST volume quadrature, cell-averaged face coefficients, and only two block-FGS sweeps. Compare limiter/backtrack counts and wall/pressure outputs. A change in visual sharpness alone does not validate higher accuracy.
