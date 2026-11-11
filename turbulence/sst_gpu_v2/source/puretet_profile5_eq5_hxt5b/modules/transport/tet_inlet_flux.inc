@@ -6,6 +6,7 @@ __global__ void sst_inlet_tet(
   __shared__ Real U0[8],U1[8],U2[8],K[8],W[8],PH[12][8],GP[12][8][3],NUE[12],WQ[12],QIN[12];if(threadIdx.x<8){int g=T.g[threadIdx.x];U0[threadIdx.x]=u0[g];U1[threadIdx.x]=u1[g];U2[threadIdx.x]=u2[g];K[threadIdx.x]=k[g];W[threadIdx.x]=omega[g];}__syncthreads();
   if(threadIdx.x<12){int q=(int)threadIdx.x,a0=hxt4a::h4_tet_face[f.lf][0],a1=hxt4a::h4_tet_face[f.lf][1],a2=hxt4a::h4_tet_face[f.lf][2];double l[4]={0,0,0,0};l[a0]=hxt5b::QL0[q];l[a1]=hxt5b::QL1[q];l[a2]=hxt5b::QL2[q];double ph[8],gr[8][3],gp[8][3];hxt2::tet_basis(l[0],l[1],l[2],l[3],ph,gr);hxt2::tet_phys_grad(gr,tg[f.cell],gp);
     Real gu[9]={0,0,0,0,0,0,0,0,0},gk[3]={0,0,0},gw[3]={0,0,0},kv=0,wv=0;for(int a=0;a<8;++a){Real pa=(Real)ph[a];PH[q][a]=pa;kv+=K[a]*pa;wv+=W[a]*pa;for(int d=0;d<3;++d){Real gd=(Real)gp[a][d];GP[q][a][d]=gd;gk[d]+=K[a]*gd;gw[d]+=W[a]*gd;gu[d]+=U0[a]*gd;gu[3+d]+=U1[a]*gd;gu[6+d]+=U2[a]*gd;}}
+    hxt5c::eval_dg_omega_p1(f.cell,l,tg[f.cell],wv,gw);
     double x=0,y=0;for(int a=0;a<4;++a){auto X=pts[tc[f.cell].v[a]];x+=l[a]*X.x;y+=l[a]*X.y;}LocalSST ss=local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,stage20_distance(tc,f.cell,l));Real extra=(equation==K_EQ?ss.sigmaK:ss.sigmaW)*ss.nut;NUE[q]=(Real)nu+extra;WQ[q]=(Real)(hxt5b::QW12[q]*f.area);
     Real vx=(Real)inletX,vy=(Real)inletY,vz=(Real)inletZ;
     if(stage27_inlet::profileActive){
