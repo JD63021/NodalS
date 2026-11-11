@@ -92,8 +92,10 @@ __device__ __forceinline__ bool quadrature_sst(
  react=s.reactOmega;
  src=s.srcOmega;
  v={u[0],u[1],u[2]};
- if(s.omegaFloored)atomicAdd(&audit->omegaFloored,1ULL);
- if(s.kFloored)atomicAdd(&audit->kFloored,1ULL);
+ if(audit){
+   if(s.omegaFloored)atomicAdd(&audit->omegaFloored,1ULL);
+   if(s.kFloored)atomicAdd(&audit->kFloored,1ULL);
+ }
  return isfinite(mu)&&isfinite(react)&&isfinite(src)&&mu>=opt.nu;
 }
 __global__ void sst_dg_omega_volume(
