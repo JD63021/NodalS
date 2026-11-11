@@ -157,3 +157,27 @@ Interior DG face flux in `dg_omega_bsr4.cuh` uses a Rusanov/Lax–Friedrichs dis
 - This does **not** change physical-wall `omega_wall.trace_gamma=100000` or the momentum penalty; it changes interior DG omega diffusion face coupling only.
 - Also accepts CLI overrides: `--set omega_dg.sipg_penalty=20 --set omega_dg.convection_theta=0.5`; no permanent case edit needed.
 - Pull + rebuild once, then each penalty experiment requires no new build. Test 10 / 20 / 40 under the same theta and compare limiter/backtracking counts, true DG omega updates, velocity profiles, timings.
+
+## Final experimental mode: masked-Q1 DG (2026-11-11; GPU compilation pending)
+
+The previous DG omega experiment used **4 local Bernstein/Lagrange P1 physical coefficients**, with a mean-preserving Bernstein positivity scaling limiter and a simple post-solve under-relaxation. **At degree one Bernstein P1 and Lagrange P1 are mathematically identical.** Merely renaming the basis would not make a distinct numerical experiment.
+
+The new `[omega_dg] space=masked_q1` option retains 4 independent element-local P1 omega DOFs and unchanged DG SIPG/convective face fluxes, but reproduces the reference masked-Q1 scalar *row-L1 relaxation mechanism*:
+1. Form mixed physical-P1-test / constrained BF3-trial element columns using **exact NodalS BF3 polynomials** `27 * product(other three barycentric coordinates)` at the 4-point SST volume rule; likewise include SIPG/LF interior face, inlet/outlet, and original Q12 Spalding physical-wall trace terms.
+2. BF3 values are **fixed exactly zero**. Sum mixed contributions per true matrix column before taking absolute values. The virtual BF3 column count is 4 per tet but they **are not active unknowns** (no 8x8 physical matrix).
+3. Compute `rowL1=sum_j |A_P1,P1[i,j]| + sum_m |A_P1,BF3[i,m]|`. Apply fixed-point-preserving `Delta=(1/alphaOmega-1)*rowL1` to physical diagonal and `rhs+=Delta*oldOmegaDG`, as in the original NodalS masked-Q1 row-L1 relaxation. Run same existing 2 block-FGS sweeps with **no additional post-solve UR**.
+4. Replace Bernstein mean-preserving theta-limiter with the original Q1-style vertex floor `max(omega, omegaFloor)` and audit the number of modified DOFs/cells plus sum of *unweighted cell-mean increments*. This **can alter local scalar mass** and is not a DG-conservative positivity limiter. Test its physical behavior; do not claim automatic exact conservation.
+5. The converged physical equation has the **same DG-P1 solution space and physical SIPG/LF operator**, unlike the original continuous masked-Q1 solver; the experiment changes nonlinear stabilization and limiting, not the approximation order.
+
+Usage:
+```ini
+[omega_dg]
+enabled = true
+space = masked_q1
+convection_theta = 0.5
+sipg_penalty = 10
+```
+
+Existing `space=bernstein_p1` (default) retains the old DG limiter and update path. Both choices keep independent knobs for `convection_theta` and `sipg_penalty`. The validated **CG** solver is still the default when `[omega_dg] enabled=false`.
+
+On RTX 3060 run `git pull --ff-only`, rebuild `make -C turbulence/sst_gpu_v2 -j4 NVCC=/usr/local/cuda-12.2/bin/nvcc CUDA_ARCH=sm_86`, then start from the editable U-bend case with `--set omega_dg.space=masked_q1`, `--steps 5` and `--set output.checkpoint_every=0`. Check `DG_OMEGA_G2_INIT ... space=MASKED_Q1_DG` and `DG_OMEGA_MASKED_Q1` diagnostics. **Integrated CUDA compilation / this new mode's runtime have not yet been verified.** No promise that masking alone cures theta/penalty sensitivity.
