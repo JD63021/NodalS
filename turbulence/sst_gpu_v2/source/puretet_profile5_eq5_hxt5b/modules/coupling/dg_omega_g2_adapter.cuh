@@ -120,7 +120,7 @@ struct CoupledOmegaState {
     if(reductionHandle)cublasDestroy(reductionHandle);
   }
   void bind_constitutive()const{
-    hxt5c::bind_dg_omega_p1(omega.p);
+    hxt5c::bind_dg_omega_p1(reinterpret_cast<const hxt5c::Real*>(omega.p));
   }
   void prepare_wall_capture(){
     HXT1_CUDA(cudaMemset(wallTarget.p,0,wallTarget.n*sizeof(double)));
