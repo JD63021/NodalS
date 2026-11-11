@@ -9,6 +9,7 @@
 #include <vector>
 #include <chrono> // M3 coupled CSR fixed-sweep timing
 #include "puretet_exp2_core.hpp"
+#include "modules/coupling/dg_omega_g2_adapter.cuh"
 
 // TRUE_Q1_TRANSPORT_V1
 // G2: fully coupled SST-2003m feedback for the existing HXT5B SIMPLE loop.
