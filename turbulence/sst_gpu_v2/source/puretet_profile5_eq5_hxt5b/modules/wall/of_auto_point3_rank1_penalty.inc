@@ -45,6 +45,15 @@
       atomicAdd(wallStats+1,(double)stage41OmegaTarget*ww);
       atomicAdd(wallStats+2,(double)(pm.y*ut/nu)*ww);
       atomicAdd(wallStats+3,(double)wv*ww);
+      // True physical-wall trace diagnostic from the DG polynomial.
+      // Do not measure the visualization-only CG vertex average.
+      double lamWall[4]={0.,0.,0.,0.};
+      lamWall[hxt4a::h4_tet_face[f.lf][0]]=hxt5b::QL0[q];
+      lamWall[hxt4a::h4_tet_face[f.lf][1]]=hxt5b::QL1[q];
+      lamWall[hxt4a::h4_tet_face[f.lf][2]]=hxt5b::QL2[q];
+      Real wTrace=Real(0),dwTrace[3]={Real(0),Real(0),Real(0)};
+      hxt5c::eval_dg_omega_p1(f.cell,lamWall,tg[f.cell],wTrace,dwTrace);
+      atomicAdd(wallStats+4,(double)wTrace*ww);
       atomicAdd(wallStats+5,(double)oa.rey*ww);
       atomicAdd(wallStats+6,(double)oa.lamFrac*ww);
       atomicAdd(wallStats+7,(double)oa.omegaVis*ww);
