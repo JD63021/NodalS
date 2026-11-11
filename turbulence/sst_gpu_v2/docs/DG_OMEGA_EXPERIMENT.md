@@ -109,3 +109,30 @@ Latest experimental additions:
 - `tests/dg_omega_sst_smoke.cu`, `tests/RUN_SST_STANDALONE.sh`: use real 199584-tet HXT1 mesh with deliberately synthetic zero velocity, constant k=0.01, initial omegaDG=100, synthetic constant wall distance=0.01. Assemble real SST coefficients on GPU, benchmark warm-started two block-FGS sweeps with omega UR=0.7 and positivity; print audits.
 - This standalone SST test is pending CUDA compilation/execution on the user's workstation. The synthetic wall-distance field is **not** an acceptable substitute for G2 Stage20 wall distance in a U-bend simulation.
 - The CG G2 path is untouched. The next important milestone is a complete G2 coupling that uses DG omega in **all** SST physics, momentum, k and wall sampling. A partial CG projection is not equivalent physics.
+
+## First integrated native G2 SIMPLE dispatch — source committed, **not compiled** (2026-11-11)
+
+The real-mesh warm SST pilot passed on RTX 3060:
+- 199584 tets / 798336 DG unknowns, assembly 0.0149 s, warm-started block FGS(2) 0.0031 s.
+- Under-relaxed DG omega range 93.7592..100.002; limitedCells=0, subfloorMean=0.
+- True initial scalar residual 3.7745e-5, post-sweep 4.6033e-5 (slight *increase*); do not interpret 2 sweeps as algebraic convergence.
+
+**The experimental SIMPLE-loop integration is now in source, awaiting first workstation CUDA compile and run:**
+- `NODALS_DG_OMEGA=1` opt-in in native G2 application, all defaults remain CG.
+- Persistent independent `omegaDG[4*tet+localVertex]`, 4x4 BSR4 SIPG/upwind, two warm block-FGS sweeps, omega UR and mean-preserving positivity.
+- DG constitutive binding for actual tetrahedral k equation, standard/deviatoric momentum, implicit deviatoric stress, inlet momentum operator, wall function interior samples, physical momentum wall and SST statistics; no averaged CG field may be used in those patched providers.
+- Physical 12-quadrature-point adaptive point3 omega target and effective diffusivity captured from **the original five-point Spalding** source; actual symmetric DG wall Nitsche replaces CG omega wall assembly. Interior face penalty C_IP=10, *distinct from physical wall trace gamma*.
+- Stage20 actual geometric wall distance is mandatory, including DG omega volume and DG momentum constitutive feedback. G2 nonlinear relative omega update uses the true DG degrees of freedom.
+- The existing CG omega buffer is projected from DG **only** for VTU/legacy output; Stage31 restart is not compatible and is **explicitly rejected** until DG checkpoint support is written.
+- G2 gate currently requires pure-tet HXT1; `sst.state_space=q1` and `compact_p1=false`; `omega_wall.method=of_auto` and `stage41_mode=trace_log`, `omega_wall.production=false`; shared Spalding wall state; geometric wall distance.
+- Runtime `STAGE31_CHECKPOINT_EVERY=0` is mandatory for an initial no-restart test. Do not run the adaptive checkpoint scheduler in this branch until DG checkpoint is implemented.
+- The branch Makefiles now link cuBLAS for full 4*ntet DG omega update norms.
+- **Important**: The new omega volume uses 4-point tetra quadrature for nonlinear SST coefficients and cell-mean mu on interior faces, whereas the reference CG volume uses 24-point quadrature; this is a distinct numerical approximation to be evaluated once an integrated run works.
+- This is an experimental attempt; **GPU compilation, native CLI dispatch, wall launch, nonlinear convergence and physical U-bend validation have not been verified yet.**
+- Build integrated binary:
+  ```bash
+  cd ~/NodalS_DG_OMEGA
+  git pull --ff-only
+  make -C turbulence/sst_gpu_v2 -j4 NVCC=/usr/local/cuda-12.2/bin/nvcc CUDA_ARCH=sm_86
+  ```
+- First native test should disable Stage31 restart and adaptive sampling, run 3–5 outer iterations, confirm `DG_OMEGA_G2_INIT`, `DG_OMEGA_G2_ACTIVE`, `DG_OMEGA_G2_STEP`, no field nonfinites, valid wall stats. Retain and compare the original CG baseline.
