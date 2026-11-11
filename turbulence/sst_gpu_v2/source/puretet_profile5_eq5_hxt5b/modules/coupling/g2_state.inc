@@ -1,4 +1,5 @@
 struct State {
+  std::unique_ptr<::nodals::omega_dg_gpu::CoupledOmegaState> dgOmega;
   Dev<Real> k,omega,oldK,oldW,rhs;
   Dev<double> stats,wallStats;
   Dev<unsigned long long> clipK,clipW,diagAudit;
