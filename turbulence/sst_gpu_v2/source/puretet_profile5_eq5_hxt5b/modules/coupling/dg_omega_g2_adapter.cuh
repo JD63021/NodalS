@@ -19,7 +19,9 @@ struct CoupledOmegaState {
   nodals_hxt1::Dev<Cell> cells;
   nodals_hxt1::Dev<Face> faces;
   nodals_hxt1::Dev<int> row,col,diagonal,wallFaceIndex,cellVertices;
-  nodals_hxt1::Dev<double> omega,previous,candidate;
+  nodals_hxt1::Dev<double> omega,previous,candidate,change;
+  cublasHandle_t reductionHandle=nullptr;
+  double lastUpdateRelative=0.;
   nodals_hxt1::Dev<double> matrix,rhs;
   nodals_hxt1::Dev<double> wallTarget,wallMu;
   nodals_hxt1::Dev<double> cgOutput;
@@ -96,6 +98,8 @@ struct CoupledOmegaState {
     omega.upload(initial);
     previous.upload(initial);
     candidate.upload(initial);
+    change.allocate_zeros(initial.size());
+    blas_ok(cublasCreate(&reductionHandle),"DG omega G2 reduction handle");
     matrix.allocate_zeros((std::size_t)16*topo.nblocks());
     rhs.allocate_zeros(initial.size());
     wallTarget.allocate_zeros((std::size_t)12*nwall);
@@ -109,6 +113,11 @@ struct CoupledOmegaState {
     std::printf("DG_OMEGA_G2_INIT tets=%d DGdofs=%d faceBlocks=%zu colors=%d "
        "wallFaces=%d inletOmega=%.9e traceGamma=%.9e mode=TRUE_DG_P1\n",
        nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma);
+  }
+  ~CoupledOmegaState(){
+    hxt5c::bind_dg_omega_wall_q12(nullptr,nullptr);
+    hxt5c::bind_dg_omega_p1(nullptr);
+    if(reductionHandle)cublasDestroy(reductionHandle);
   }
   void bind_constitutive()const{
     hxt5c::bind_dg_omega_p1(omega.p);
@@ -177,6 +186,19 @@ struct CoupledOmegaState {
     if(limited.nonfiniteCells||limited.meanDeficitCells)
       throw std::runtime_error("DG omega G2 invalid/subfloor mean; refusing hidden nonconservative repair: "+
         std::to_string(limited.nonfiniteCells)+"/"+std::to_string(limited.meanDeficitCells));
+    // True DG update norm, not the artificially smoothed vertex projection.
+    HXT1_CUDA(cudaMemcpy(change.p,omega.p,omega.n*sizeof(double),cudaMemcpyDeviceToDevice));
+    const double minusOne=-1.;
+    blas_ok(cublasDaxpy(reductionHandle,(int)omega.n,&minusOne,
+                       previous.p,1,change.p,1),"DG omega subtract previous");
+    double updateNorm=0.,fieldNorm=0.;
+    blas_ok(cublasDnrm2(reductionHandle,(int)omega.n,change.p,1,&updateNorm),
+            "DG omega update norm");
+    blas_ok(cublasDnrm2(reductionHandle,(int)omega.n,omega.p,1,&fieldNorm),
+            "DG omega field norm");
+    lastUpdateRelative=updateNorm/std::max(fieldNorm,1.e-300);
+    if(!std::isfinite(lastUpdateRelative))
+      throw std::runtime_error("DG omega nonfinite true field update norm");
     // Project to CG vertex values ONLY for existing VTU/checkpoint outputs.
     HXT1_CUDA(cudaMemset(cgOutput.p,0,cgOutput.n*sizeof(double)));
     HXT1_CUDA(cudaMemset(cgCounts.p,0,cgCounts.n*sizeof(unsigned int)));
@@ -193,9 +215,10 @@ struct CoupledOmegaState {
     if(outer<=5||outer%10==0)
       std::printf("DG_OMEGA_G2_STEP it=%d solver=BLOCK_FGS sweeps=%d colors=%d "
         "limited=%llu negativeCandidates=%llu omegaFloor=%g alpha=%g "
-        "q12Wall=%d source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
+        "q12Wall=%d updateRel=%.9e source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
         outer,linear.sweeps,linear.ncolors,limited.limitedCells,
-        limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall);
+        limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall,
+        lastUpdateRelative);
   }
   PhysicsAudit download_physics_audit()const{
     PhysicsAudit a{};
