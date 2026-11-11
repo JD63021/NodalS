@@ -443,6 +443,10 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         if not 0.0<=theta<=1.0:
             raise ValueError('omega_dg.convection_theta must lie in [0,1]')
         env['NODALS_DG_OMEGA_CONVECTION_THETA']=fmt(theta)
+        sipg_penalty=number(cp,'omega_dg','sipg_penalty',10.0)
+        if not 0.0<sipg_penalty<=100000.0:
+            raise ValueError('omega_dg.sipg_penalty must lie in (0,100000]')
+        env['NODALS_DG_OMEGA_SIPG_PENALTY']=fmt(sipg_penalty)
         if flag(cp,'omega_dg','enabled',False):
             env['NODALS_DG_OMEGA']='1'
         else:
@@ -450,6 +454,7 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     elif env.get('NODALS_DG_OMEGA')=='1':
         # Preserve legacy [environment] DG switch for older experimental cases.
         env.setdefault('NODALS_DG_OMEGA_CONVECTION_THETA','1')
+        env.setdefault('NODALS_DG_OMEGA_SIPG_PENALTY','10')
     # A separate optional physics-plateau gate. Environment is emitted after
     # user [environment] passthrough so parsed [convergence] is authoritative.
     env['NODALS_CONV_METRIC']=conv_metric
