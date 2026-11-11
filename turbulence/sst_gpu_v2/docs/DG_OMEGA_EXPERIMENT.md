@@ -176,8 +176,11 @@ enabled = true
 space = masked_q1
 convection_theta = 0.5
 sipg_penalty = 10
+sweeps = 2
 ```
 
 Existing `space=bernstein_p1` (default) retains the old DG limiter and update path. Both choices keep independent knobs for `convection_theta` and `sipg_penalty`. The validated **CG** solver is still the default when `[omega_dg] enabled=false`.
 
 On RTX 3060 run `git pull --ff-only`, rebuild `make -C turbulence/sst_gpu_v2 -j4 NVCC=/usr/local/cuda-12.2/bin/nvcc CUDA_ARCH=sm_86`, then start from the editable U-bend case with `--set omega_dg.space=masked_q1`, `--steps 5` and `--set output.checkpoint_every=0`. Check `DG_OMEGA_G2_INIT ... space=MASKED_Q1_DG` and `DG_OMEGA_MASKED_Q1` diagnostics. **Integrated CUDA compilation / this new mode's runtime have not yet been verified.** No promise that masking alone cures theta/penalty sensitivity.
+
+The [omega_dg] sweeps field permits 1..30 forward colored 4x4 block-GS sweeps, default 2; alter via --set omega_dg.sweeps=4 without recompilation. More sweeps may change how much fixed-point row-L1 damping is required; keep this explicit in any comparison. Native startup logs space/sweeps/penalty/theta.
