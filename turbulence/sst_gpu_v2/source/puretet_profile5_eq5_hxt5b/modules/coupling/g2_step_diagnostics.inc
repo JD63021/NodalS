@@ -1,5 +1,5 @@
   hxt5c::field_diff_kernel<<<(A.n+hxt4b::TPB-1)/hxt4b::TPB,hxt4b::TPB>>>(A.n,S.k.p,S.oldK.p,A.tmp.p);double dk=red.norm(A.tmp.p),nk=red.norm(S.k.p);hxt5c::field_diff_kernel<<<(A.n+hxt4b::TPB-1)/hxt4b::TPB,hxt4b::TPB>>>(A.n,S.omega.p,S.oldW.p,A.tmp.p);double dw=red.norm(A.tmp.p),nw=red.norm(S.omega.p);
-  StepResult R;R.kRel=dk/std::max(nk,1e-300);R.omegaRel=dw/std::max(nw,1e-300);R.stats=hxt5c::collect_stats(M.h.nhex,M.h.ntet,pts,hc,tc,hv,tv,tg,u0,u1,u2,S.k.p,S.omega.p,radius,nu,O,S.stats,bad);R.nutRel=S.prevMeanNut>0?std::abs(R.stats.meanNutOverNu-S.prevMeanNut)/std::max(R.stats.meanNutOverNu,1e-300):std::numeric_limits<double>::infinity();S.prevMeanNut=R.stats.meanNutOverNu;R.kLinear=lk;R.omegaLinear=lw;
+  StepResult R;R.kRel=dk/std::max(nk,1e-300);R.omegaRel=S.dgOmega?S.dgOmega->lastUpdateRelative:(dw/std::max(nw,1e-300));R.stats=hxt5c::collect_stats(M.h.nhex,M.h.ntet,pts,hc,tc,hv,tv,tg,u0,u1,u2,S.k.p,S.omega.p,radius,nu,O,S.stats,bad);R.nutRel=S.prevMeanNut>0?std::abs(R.stats.meanNutOverNu-S.prevMeanNut)/std::max(R.stats.meanNutOverNu,1e-300):std::numeric_limits<double>::infinity();S.prevMeanNut=R.stats.meanNutOverNu;R.kLinear=lk;R.omegaLinear=lw;
   // PURETET_AB5 all-five mismatch is measured on the pre-solve old field.
   if(M.h.ntet>0 && M.h.nhex==0 && O.omegaWallMode==hxt5c::OMEGA_WALL_PROFILE5_EQ_SST &&
      (outer<=3 || outer%5==0)){
