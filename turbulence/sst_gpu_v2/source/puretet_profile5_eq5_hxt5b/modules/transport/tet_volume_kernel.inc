@@ -18,6 +18,7 @@ __global__ void sst_tet_volume(
     double ph[8],gr[8][3],gp[8][3];hxt2::tet_basis(l[0],l[1],l[2],l[3],ph,gr);hxt2::tet_phys_grad(gr,tg[c],gp);
     Real gu[9]={0,0,0,0,0,0,0,0,0},gk[3]={0,0,0},gw[3]={0,0,0},kv=0,wv=0;
     for(int a=0;a<8;++a){Real pa=(Real)ph[a];PH[iq][a]=pa;kv+=K[a]*pa;wv+=W[a]*pa;for(int d=0;d<3;++d){Real gd=(Real)gp[a][d];GP[iq][a][d]=gd;gk[d]+=K[a]*gd;gw[d]+=W[a]*gd;gu[d]+=U0[a]*gd;gu[3+d]+=U1[a]*gd;gu[6+d]+=U2[a]*gd;}}
+    hxt5c::eval_dg_omega_p1((int)c,l,tg[c],wv,gw);
     double xq=0,yq=0;for(int a=0;a<4;++a){auto X=pts[tc[c].v[a]];xq+=l[a]*X.x;yq+=l[a]*X.y;}
     LocalSST ss=local_sst((Real)xq,(Real)yq,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,stage20_distance(tc,(int)c,l));Real wt=(Real)(tg[c].det*qw);
     const auto tcfs=nodals::transport::volume_coefficients<Real>(equation,K_EQ,wt,ss);DW[iq]=tcfs.diffusion;RW[iq]=tcfs.reaction;SW[iq]=tcfs.source;SP[iq]=tcfs.omegaProductionAudit;SC[iq]=tcfs.omegaCrossAudit;
