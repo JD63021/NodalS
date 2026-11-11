@@ -42,7 +42,7 @@ __device__ __forceinline__ void implicit_dev_tet_quadrature(
     double x=0.,y=0.;
     for(int a=0;a<4;++a){const auto p=pts[tc[cell].v[a]];x+=l[a]*p.x;y+=l[a]*p.y;}
     const auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,
-      gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor);
+      gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor,hxt5c::dg_omega_p1_constitutive?hxt5c::stage20_distance(tc,(int)cell,l):Real(-1));
     NUW[tid]=((Real)nu+ss.nut)*(Real)(tg[cell].det*hxt5a::h5_tet24_w[tid]);
   }
   __syncthreads();
