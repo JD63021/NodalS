@@ -34,6 +34,7 @@ struct CoupledOmegaState {
   std::unique_ptr<DeviceColoring> colors;
   double inletOmega,traceGamma,convectionTheta=1.,sipgPenalty=10.;
   bool maskedQ1=false;
+  int dgSweeps=2;
   const double* wallDistanceDevice=nullptr;
   int nvertex=0,nwall=0;
   CoupledOmegaState(const nodals_hxt1::HostMesh&M,
@@ -72,6 +73,18 @@ struct CoupledOmegaState {
       else if(space!="bernstein_p1")
         throw std::runtime_error("omega_dg.space must be masked_q1 or bernstein_p1");
     }
+    if(const char* raw=std::getenv("NODALS_DG_OMEGA_SWEEPS")){
+      try {
+        const std::string value(raw);
+        std::size_t end=0;
+        dgSweeps=std::stoi(value,&end);
+        if(end!=value.size())throw std::runtime_error("trailing characters");
+      }catch(const std::exception&){
+        throw std::runtime_error("omega_dg.sweeps must be an integer 1..30");
+      }
+    }
+    if(dgSweeps<1||dgSweeps>30)
+      throw std::runtime_error("omega_dg.sweeps must be an integer 1..30");
     if(sizeof(hxt5c::Real)!=sizeof(double))
       throw std::runtime_error("DG omega G2 requires FP64 NodalS build");
     if(!(omegaIn>0.)||!(gamma>=10.)||!(gamma<=1.e5))
@@ -152,9 +165,9 @@ struct CoupledOmegaState {
     }
     colors.reset(new DeviceColoring(color_bsr4(nt,topo.rowPtr,topo.colInd)));
     std::printf("DG_OMEGA_G2_INIT tets=%d DGdofs=%d faceBlocks=%zu colors=%d "
-       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e convectionTheta=%.3f sipgPenalty=%.9g space=%s mode=TRUE_DG_P1\n",
+       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e convectionTheta=%.3f sipgPenalty=%.9g space=%s sweeps=%d mode=TRUE_DG_P1\n",
        nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma,convectionTheta,sipgPenalty,
-       maskedQ1?"MASKED_Q1_DG":"BERNSTEIN_P1_DG");
+       maskedQ1?"MASKED_Q1_DG":"BERNSTEIN_P1_DG",dgSweeps);
   }
   ~CoupledOmegaState(){
     hxt5c::bind_dg_omega_wall_q12(nullptr,nullptr);
@@ -245,7 +258,7 @@ struct CoupledOmegaState {
       if(bad)throw std::runtime_error("DG masked-Q1 row-L1 relaxation failure: "+std::to_string(bad));
     }
     MatrixView A{nt,row.p,col.p,diagonal.p,matrix.p};
-    const auto linear=block_gs(A,*colors,rhs.p,candidate.p,2,false,1.);
+    const auto linear=block_gs(A,*colors,rhs.p,candidate.p,dgSweeps,false,1.);
     LimiterCounters limited{};
     if(maskedQ1){
       masked_q1_nodal_floor<<<(nt+127)/128,128>>>(
