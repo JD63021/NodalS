@@ -20,6 +20,7 @@
       gk[d]+=ka*gd;gw[d]+=wa*gd;
     }
   }
+  hxt5c::eval_dg_omega_p1(pm.cell,l,tg[pm.cell],wv,gw);
   double x=0.0,y=0.0;
   for(int a=0;a<4;++a){
     const auto X=pts[tc[pm.cell].v[a]];
