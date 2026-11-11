@@ -29,7 +29,7 @@ struct CoupledOmegaState {
   nodals_hxt1::Dev<PhysicsAudit> physicsCounters;
   nodals_hxt1::Dev<LimiterCounters> limiterCounters;
   std::unique_ptr<DeviceColoring> colors;
-  double inletOmega,traceGamma;
+  double inletOmega,traceGamma,convectionTheta=1.;
   const double* wallDistanceDevice=nullptr;
   int nvertex=0,nwall=0;
   CoupledOmegaState(const nodals_hxt1::HostMesh&M,
@@ -38,6 +38,18 @@ struct CoupledOmegaState {
       :topo(build_topology(M)),inletOmega(omegaIn),traceGamma(gamma),
        wallDistanceDevice(distanceDevice){
     if(!wallDistanceDevice)throw std::runtime_error("DG omega G2 requires geometric Stage20 wall distance");
+    if(const char* raw=std::getenv("NODALS_DG_OMEGA_CONVECTION_THETA")){
+      try {
+        std::size_t end=0;
+        const std::string value(raw);
+        convectionTheta=std::stod(value,&end);
+        if(end!=value.size())throw std::runtime_error("trailing characters");
+      } catch(const std::exception&) {
+        throw std::runtime_error("DG omega convection_theta must be a finite number in [0,1]");
+      }
+    }
+    if(!std::isfinite(convectionTheta)||convectionTheta<0.||convectionTheta>1.)
+      throw std::runtime_error("DG omega convection_theta must lie in [0,1]");
     if(sizeof(hxt5c::Real)!=sizeof(double))
       throw std::runtime_error("DG omega G2 requires FP64 NodalS build");
     if(!(omegaIn>0.)||!(gamma>=10.)||!(gamma<=1.e5))
@@ -111,8 +123,8 @@ struct CoupledOmegaState {
     limiterCounters.allocate_zeros(1);
     colors.reset(new DeviceColoring(color_bsr4(nt,topo.rowPtr,topo.colInd)));
     std::printf("DG_OMEGA_G2_INIT tets=%d DGdofs=%d faceBlocks=%zu colors=%d "
-       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e mode=TRUE_DG_P1\n",
-       nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma);
+       "wallFaces=%d inletOmega=%.9e traceGamma=%.9e convectionTheta=%.3f mode=TRUE_DG_P1\n",
+       nt,4*nt,topo.nblocks(),colors->host.ncolors,nwall,omegaIn,traceGamma,convectionTheta);
   }
   ~CoupledOmegaState(){
     hxt5c::bind_dg_omega_wall_q12(nullptr,nullptr);
@@ -158,7 +170,7 @@ struct CoupledOmegaState {
     HXT1_CUDA(cudaGetLastError());
     Controls faceOptions;
     faceOptions.penaltyC=10.;
-    faceOptions.theta=1.;
+    faceOptions.theta=convectionTheta;
     faceOptions.skipWall=true;
     // Upwind inflow and SIPG interior; wall handled by original Q12 closure.
     ::nodals::omega_dg_gpu::faces<<<(nf+127)/128,128>>>(
@@ -223,10 +235,10 @@ struct CoupledOmegaState {
     if(outer<=5||outer%10==0)
       std::printf("DG_OMEGA_G2_STEP it=%d solver=BLOCK_FGS sweeps=%d colors=%d "
         "limited=%llu backtracked=%llu negativeCandidates=%llu omegaFloor=%g alpha=%g "
-        "q12Wall=%d updateRel=%.9e source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
+        "q12Wall=%d updateRel=%.9e convectionTheta=%.3f source=SST2003M_TRUE_DG feedback=ELEMENT_LOCAL\n",
         outer,linear.sweeps,linear.ncolors,limited.limitedCells,
         limited.meanDeficitCells,limited.negativeCandidateDofs,O.omegaFloor,O.alphaOmega,nwall,
-        lastUpdateRelative);
+        lastUpdateRelative,convectionTheta);
   }
   PhysicsAudit download_physics_audit()const{
     PhysicsAudit a{};
