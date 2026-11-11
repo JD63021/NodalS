@@ -61,3 +61,21 @@ Source snapshot used for planning: main as of 2026-11-11.
 - `dg_omega_field_access.hpp` evaluates truly discontinuous DG-P1 omega and physical gradients from `omegaDG[4*cell+a]`. Its API is explicitly not a CG projection; `tests/RUN_FIELD_ACCESS.sh` verifies independent traces.
 - These are **unintegrated modules**: native G2 SST, k transport, momentum and wall kernels still consume their old CG vectors. Do not turn on DG execution in G2 yet.
 - Remaining steps: quadrature-dependent SST coefficient evaluation, full 5-point trace-log wall target on DG physical-face quadrature, GPU-resident FGMRES (4x4 block preconditioned), G2 constitutive field access across all kernels, restart and adaptive refresh, true residual monitoring, validation. Existing CG path must remain untouched.
+
+## Full-mesh verified geometry / new device FGMRES — 2026-11-11
+
+- User confirmed actual U-bend HXT1 topology: 199584 tets, 387792 interior faces, 22176 walls, 288 inlet, 288 outlet, 975168 BSR4 blocks, 212224900 bytes predicted (about 202.39 MiB, matrix+topology estimate).
+- User confirmed GPU matrix parity and DG cell-local field-access tests pass.
+- Newly committed `modules/transport/dg_omega_gpu_fgmres.cuh`: right-preconditioned GPU BSR4 FGMRES, CUDA SpMV, device Krylov vectors, cuBLAS norms/dots/axpys, second Gram-Schmidt pass and true residual per restart; 4x4 element-block Jacobi.
+- Newly committed `modules/transport/tests/dg_omega_fullmesh_smoke.cu` and `RUN_FULLMESH.sh`: real HXT1 topology, assembled frozen-coefficient diffusion+reaction, constant omega=100 manufactured solution, zero velocity, same trace_gamma 1e5. Validates exact constant solution consistency, FGMRES true residual, finite omega field, error and memory/timing.
+- This test is **pending compilation and execution on the user's workstation**. It is *not* a k-omega SST time/outer iteration.
+- Example:
+  ```bash
+  cd ~/NodalS_DG_OMEGA
+  git pull --ff-only
+  ROOT=turbulence/sst_gpu_v2/source/puretet_profile5_eq5_hxt5b/modules/transport
+  MESH=/home/jd/NodalS_GPU_GENROBIN_ADAPTIVE/turbulence/sst_gpu_v2/.cache/meshes/377e0b095dd01eed708b/HXT1_mesh.bin
+  bash "$ROOT/tests/RUN_FULLMESH.sh" "$MESH" --rtol 1e-6 --restart 20 --max 250
+  ```
+- The large trace penalty may harm conditioning; test realistic gamma here before changing the active wall penalty. A successful constant field does not validate physical wall modeling or sharp omega transport.
+- **No G2 CG-SST path has been modified.** Actual DG omega coupling to the physical wall/SST coefficient kernels remains required.
