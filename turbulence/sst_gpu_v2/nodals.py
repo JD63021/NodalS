@@ -439,6 +439,10 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     # Lax-Friedrichs/upwind; theta=0 is the nondissipative central trace.
     # Independent of [convection] form (which configures momentum only).
     if cp.has_section('omega_dg'):
+        space=get(cp,'omega_dg','space','bernstein_p1').strip().lower()
+        if space not in ('bernstein_p1','masked_q1'):
+            raise ValueError('omega_dg.space must be bernstein_p1 or masked_q1')
+        env['NODALS_DG_OMEGA_SPACE']=space
         theta=number(cp,'omega_dg','convection_theta',1.0)
         if not 0.0<=theta<=1.0:
             raise ValueError('omega_dg.convection_theta must lie in [0,1]')
@@ -455,6 +459,7 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         # Preserve legacy [environment] DG switch for older experimental cases.
         env.setdefault('NODALS_DG_OMEGA_CONVECTION_THETA','1')
         env.setdefault('NODALS_DG_OMEGA_SIPG_PENALTY','10')
+        env.setdefault('NODALS_DG_OMEGA_SPACE','bernstein_p1')
     # A separate optional physics-plateau gate. Environment is emitted after
     # user [environment] passthrough so parsed [convergence] is authoritative.
     env['NODALS_CONV_METRIC']=conv_metric
