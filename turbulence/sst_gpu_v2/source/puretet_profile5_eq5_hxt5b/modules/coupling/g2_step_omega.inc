@@ -13,7 +13,11 @@
        S.omegaIn,bulk,radius,nu,gamma,wallSampleFraction,O,outer,ifCache,calibratedOmega);
     S.dgOmega->finish_wall_capture();
     S.dgOmega->advance(outer,tc,tv,tg,O.tetWallPlans,
-       u0,u1,u2,S.k.p,O,radius,nu,S.omega.p,S.clipW.p);
+       reinterpret_cast<const double*>(u0),
+       reinterpret_cast<const double*>(u1),
+       reinterpret_cast<const double*>(u2),
+       reinterpret_cast<const double*>(S.k.p),
+       O,radius,nu,reinterpret_cast<double*>(S.omega.p),S.clipW.p);
     lw.works=2;
     lw.r0=lw.rn=lw.rel=std::numeric_limits<double>::quiet_NaN();
     lw.ok=false; // two fixed FGS sweeps: inner residual is NOT measured
