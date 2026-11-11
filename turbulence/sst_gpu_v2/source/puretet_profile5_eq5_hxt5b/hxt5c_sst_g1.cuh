@@ -27,6 +27,31 @@
 namespace hxt5c {
 using Real=hxt4b::Real;
 using nodals_hxt1::Dev;
+// Omega-only DG-P1 constitutive binding. Null preserves the validated CG path.
+// A DG-enabled G2 iteration MUST bind the current 4*ntet field before momentum.
+// Each call overwrites CG omega value and gradient at the physical quadrature
+// point; vertex-averaged omega is never a constitutive input when this is set.
+__device__ const Real* dg_omega_p1_constitutive=nullptr;
+inline void bind_dg_omega_p1(const Real*deviceField){
+  HXT1_CUDA(cudaMemcpyToSymbol(dg_omega_p1_constitutive,
+                              &deviceField,sizeof(deviceField)));
+}
+__device__ __forceinline__ void eval_dg_omega_p1(
+  int cell,const double lambda[4],const nodals_hxt1::TetGeom&tet,
+  Real&value,Real grad[3]){
+  if(!dg_omega_p1_constitutive)return;
+  value=Real(0);grad[0]=grad[1]=grad[2]=Real(0);
+  const double r[4][3]={{-1.,-1.,-1.},{1.,0.,0.},{0.,1.,0.},{0.,0.,1.}};
+  for(int a=0;a<4;++a){
+    const Real w=dg_omega_p1_constitutive[(std::size_t)4*cell+a];
+    value+=Real(lambda[a])*w;
+    for(int d=0;d<3;++d){
+      const double g=r[a][0]*tet.invJ[d]+
+                      r[a][1]*tet.invJ[3+d]+r[a][2]*tet.invJ[6+d];
+      grad[d]+=Real(g)*w;
+    }
+  }
+}
 #include "modules/geometry/wall_distance_device.cuh"
 #include "puretet_omega_source_audit_exp1.hpp"
 
