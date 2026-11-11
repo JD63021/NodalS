@@ -28,11 +28,14 @@ struct CoupledOmegaState {
   nodals_hxt1::Dev<LimiterCounters> limiterCounters;
   std::unique_ptr<DeviceColoring> colors;
   double inletOmega,traceGamma;
+  const double* wallDistanceDevice=nullptr;
   int nvertex=0,nwall=0;
   CoupledOmegaState(const nodals_hxt1::HostMesh&M,
                     const hxt5b::BoundaryHost&BH,
-                    double omegaIn,double gamma)
-      :topo(build_topology(M)),inletOmega(omegaIn),traceGamma(gamma){
+                    double omegaIn,double gamma,const double*distanceDevice)
+      :topo(build_topology(M)),inletOmega(omegaIn),traceGamma(gamma),
+       wallDistanceDevice(distanceDevice){
+    if(!wallDistanceDevice)throw std::runtime_error("DG omega G2 requires geometric Stage20 wall distance");
     if(sizeof(hxt5c::Real)!=sizeof(double))
       throw std::runtime_error("DG omega G2 requires FP64 NodalS build");
     if(!(omegaIn>0.)||!(gamma>=10.)||!(gamma<=1.e5))
@@ -123,11 +126,11 @@ struct CoupledOmegaState {
       const nodals_hxt1::Dev<nodals_hxt1::TetGeom>&tg,
       const hxt5b::TetFacePlan*wallPlans,
       const double*u0,const double*u1,const double*u2,
-      const double*kCG,const double*wallDistance,
+      const double*kCG,
       const hxt5c::Options&O,double radius,double nu,
       double*cgOmegaOutput,unsigned long long*oldClipCounter){
     const int nt=(int)topo.cells.size(), nf=(int)topo.faces.size();
-    if(!wallPlans||!wallDistance||!kCG||!cgOmegaOutput||!oldClipCounter)
+    if(!wallPlans||!wallDistanceDevice||!kCG||!cgOmegaOutput||!oldClipCounter)
       throw std::runtime_error("DG omega G2 missing native wall/k/velocity buffers");
     HXT1_CUDA(cudaMemcpy(previous.p,omega.p,omega.n*sizeof(double),cudaMemcpyDeviceToDevice));
     HXT1_CUDA(cudaMemcpy(candidate.p,omega.p,omega.n*sizeof(double),cudaMemcpyDeviceToDevice));
@@ -142,7 +145,7 @@ struct CoupledOmegaState {
     physical.deviatoricProduction=(int)O.deviatoricProduction;
     sst_dg_omega_volume<<<(nt+127)/128,128>>>(
       nt,cells.p,tc.p,tv.p,u0,u1,u2,kCG,previous.p,
-      wallDistance,diagonal.p,matrix.p,rhs.p,physical,physicsCounters.p);
+      wallDistanceDevice,diagonal.p,matrix.p,rhs.p,physical,physicsCounters.p);
     HXT1_CUDA(cudaGetLastError());
     Controls faceOptions;
     faceOptions.penaltyC=10.;
