@@ -67,7 +67,8 @@ __global__ void masked_q1_volume_bf3(
    }
    double pb[4];Vec3 gb[4];
    bf3_values(g,l,pb,gb);
-   const double weight=hxt5a::h5_tet24_w[q]*g.volume;
+   // h5_tet24_w is reference-tet weighted (sum=1/6): detJ=6*volume.
+   const double weight=hxt5a::h5_tet24_w[q]*(6.*g.volume);
    for(int a=0;a<4;++a)
      for(int b=0;b<4;++b)
        matrix[4*a+b]+=weight*(mu*dot(g.grad[a],gb[b])+
