@@ -32,6 +32,16 @@ using nodals_hxt1::Dev;
 // Each call overwrites CG omega value and gradient at the physical quadrature
 // point; vertex-averaged omega is never a constitutive input when this is set.
 __device__ const Real* dg_omega_p1_constitutive=nullptr;
+// Optional DG wall-target collection from the existing five-point Spalding
+// omega target calculation. The arrays follow BH.wallT order and Q12 order.
+// The original CG wall Nitsche assembly remains unchanged when unbound.
+__device__ double* dg_omega_wall_target_q12=nullptr;
+__device__ double* dg_omega_wall_mu_q12=nullptr;
+inline void bind_dg_omega_wall_q12(double*target,double*mu){
+  HXT1_CUDA(cudaMemcpyToSymbol(dg_omega_wall_target_q12,&target,sizeof(target)));
+  HXT1_CUDA(cudaMemcpyToSymbol(dg_omega_wall_mu_q12,&mu,sizeof(mu)));
+}
+
 inline void bind_dg_omega_p1(const Real*deviceField){
   HXT1_CUDA(cudaMemcpyToSymbol(dg_omega_p1_constitutive,
                               &deviceField,sizeof(deviceField)));
