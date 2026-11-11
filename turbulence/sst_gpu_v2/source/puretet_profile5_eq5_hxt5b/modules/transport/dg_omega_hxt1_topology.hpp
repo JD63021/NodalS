@@ -57,9 +57,9 @@ inline Cell geometry(const nodals_hxt1::HostMesh&M,int t) {
   }
   const Vec3 e1=subtract(x[1],x[0]),e2=subtract(x[2],x[0]),e3=subtract(x[3],x[0]);
   const double determinant=dot(e1,cross(e2,e3));
-  if(!std::isfinite(determin)||std::fabs(determin)<1.e-30)throw std::runtime_error("DG topology degenerate tetra");
+  if(!std::isfinite(determinant)||std::fabs(determinant)<1.e-30)throw std::runtime_error("DG topology degenerate tetra");
   Cell c{};
-  c.volume=std::fabs(determin)/6.;
+  c.volume=std::fabs(determinant)/6.;
   c.grad[1]=scale(cross(e2,e3),1./determinant);
   c.grad[2]=scale(cross(e3,e1),1./determinant);
   c.grad[3]=scale(cross(e1,e2),1./determinant);
