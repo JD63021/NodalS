@@ -2841,10 +2841,10 @@ std::printf("NODALS_SST_OMEGA_WALL_CONFIG mode=%s target=%s placement=%s physica
         TS.dgOmega->bind_constitutive();
         std::printf("DG_OMEGA_G2_ACTIVE mode=TRUE_DG_P1 space=%s k=MASKED_Q1 "
           "u=P1_BF3 pressure=P0 flux=LF_THETA_%g+SIPG "
-          "solver=2_BLOCK_FGS wall=EXACT_SPALDING_POINT3_Q12 "
+          "solver=%d_BLOCK_FGS wall=EXACT_SPALDING_POINT3_Q12 "
           "distance=GEOMETRIC checkpoint=DISABLED physics=ELEMENT_LOCAL\n",
           TS.dgOmega->maskedQ1?"MASKED_Q1_DG":"BERNSTEIN_P1_DG",
-          TS.dgOmega->convectionTheta);
+          TS.dgOmega->convectionTheta,TS.dgOmega->dgSweeps);
       }
       for(int git=stage31Start+1;git<=sstG2Max;++git){
 #if defined(NODALS_P2_STAGE4_COUPLED)
