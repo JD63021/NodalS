@@ -137,7 +137,8 @@ int main(int argc,char**argv){
      nt,old.p,candidate.p,solution.p,alpha,opt.omegaFloor,limit.p);
    dg::cuda_ok(cudaGetLastError(),"DG omega positivity limiter launch");
    dg::cuda_ok(cudaDeviceSynchronize(),"DG omega limiter synchronize");
-   auto lim=limit.recv()[0],w=solution.recv();
+   const auto lim=limit.recv()[0];
+   const auto w=solution.recv();
    if(lim.nonfiniteCells)throw std::runtime_error("DG omega nonlinear update nonfinite");
    double minW=1e300,maxW=-1e300,meanW=0.;
    for(double x:w){
