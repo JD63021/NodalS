@@ -147,6 +147,7 @@
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,
             d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
             M.h.ntet,R,nu,sstG1.kFloor,sstG1.omegaFloor);
+          i2op.set_option_a_shear(optionA,d_optionANu.p);
           i2op.apply(d_s22d4i2X.p,d_s22d4i2Au.p);  // T^T * Arel * T * x
           // dp still holds the unrelaxed pressure correction. The actual
           // pressure update was p_new = p_old - alphaP*dp.
