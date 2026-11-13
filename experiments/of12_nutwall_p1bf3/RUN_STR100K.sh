@@ -23,7 +23,7 @@ BIN="$APP/build/nodals_sst"
 OUT_ROOT="${OUT_ROOT:-$HOME/NodalS_SST_LOCAL_RUNS/OF12_NUTWALL_STR100K_20261113}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT="$OUT_ROOT/${MODE}_${STEPS}steps_${STAMP}"
-mkdir -p "$OUT_ROOT"
+mkdir -p "$OUT"
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
  NVCC="${NVCC:-/usr/local/cuda-12.8/bin/nvcc}"
