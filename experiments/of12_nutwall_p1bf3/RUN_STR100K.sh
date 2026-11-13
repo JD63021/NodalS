@@ -21,7 +21,8 @@ MESH="$PKG/mesh/PIPE50_STRUCTURED_100K_TET.msh"
 APP="$ROOT/turbulence/sst_gpu_v2"
 BIN="$APP/build/nodals_sst"
 OUT_ROOT="${OUT_ROOT:-$HOME/NodalS_SST_LOCAL_RUNS/OF12_NUTWALL_STR100K_20261113}"
-OUT="$OUT_ROOT/${MODE}_${STEPS}steps"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+OUT="$OUT_ROOT/${MODE}_${STEPS}steps_${STAMP}"
 mkdir -p "$OUT_ROOT"
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -45,7 +46,7 @@ python3 -u "$APP/nodals.py" run \
  --case "$CASE" --mesh "$MESH" --output "$OUT" \
  --binary "$BIN" --steps "$STEPS" \
  --set "wall_function.momentum_bc=$WALL_BC" \
- 2>&1 | tee "$OUT_ROOT/${MODE}_${STEPS}steps_console.log"
+ 2>&1 | tee "$OUT/console.log"
 
 if [[ "$MODE" == option_a ]]; then
  if ! grep -q 'NODALS_OPTION_A enabled=1' "$OUT/terminal.log"; then
