@@ -304,6 +304,10 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
     ray_tol=number(cp,'wall_sampling','bary_tolerance',1e-9)
     if ray_tol<=0:raise ValueError('wall_sampling.bary_tolerance must be positive')
 
+    # Isolated native Option-A experiment. No silent fallback to the old Robin wall.
+    momentum_wall_bc=get(cp,'wall_function','momentum_bc','robin').strip().lower()
+    if momentum_wall_bc not in ('robin','of12_noslip'):
+        raise ValueError('wall_function.momentum_bc must be robin or of12_noslip')
     # Exact environment compatibility flags used by the existing, unmodified CUDA solver.
     env={
         'SST_STATE_SPACE':state,
@@ -351,6 +355,7 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_F2_FACE_SPALDING':str(int(flag(cp,'wall_function','face_spalding',True))),
         'NODALS_F1_FACE_LOCAL':'0',
         'NODALS_MOM_WALL_OPERATOR':'original',
+        'NODALS_OPTION_A_OF12_NOSLIP':str(int(momentum_wall_bc=='of12_noslip')),
         'NODALS_P_REFRESH_EVERY':'1',
         'NODALS_F1B_GPU_GATE':'0',
         'STAGE27_WALL_AUDIT_MODE':'off',
