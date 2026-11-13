@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Isolated Re72600 pipe A/B experiment, 99,552 structured tetrahedra.
-# Usage: bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh [baseline|option_a] [STEPS]
+# Usage: bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh [baseline|option_a|noslip_sst] [STEPS]
 set -euo pipefail
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 MODE="${1:-baseline}"
 STEPS="${2:-10}"
-[[ "$MODE" == baseline || "$MODE" == option_a ]] ||
- { echo "MODE must be baseline or option_a" >&2; exit 2; }
+[[ "$MODE" == baseline || "$MODE" == option_a || "$MODE" == noslip_sst ]] ||
+ { echo "MODE must be baseline, option_a, or noslip_sst" >&2; exit 2; }
 [[ "$STEPS" =~ ^[0-9]+$ ]] && ((STEPS>0)) ||
  { echo "STEPS must be positive integer" >&2; exit 2; }
 BRANCH="$(git -C "$ROOT" branch --show-current)"
@@ -39,6 +39,7 @@ sha256sum "$BIN" "$MESH" "$CASE"
 
 WALL_BC=robin
 [[ "$MODE" == option_a ]] && WALL_BC=of12_noslip
+[[ "$MODE" == noslip_sst ]] && WALL_BC=strong_noslip_sst
 echo "Using wall_function.momentum_bc=$WALL_BC"
 # Keep A/B settings exactly the same. Only wall_function.momentum_bc differs.
 # Prefix each run's log with a clear MODEL selection; native prints optionA flag.
@@ -62,7 +63,7 @@ if ((NATIVE_RC != 0)); then
  fi
 fi
 
-if [[ "$MODE" == option_a ]]; then
+if [[ "$MODE" == option_a || "$MODE" == noslip_sst ]]; then
  if ! grep -q 'NODALS_OPTION_A enabled=1' "$OUT/terminal.log"; then
    echo "FAIL: native solver did not confirm Option A wall model" >&2; exit 6
  fi
