@@ -22,6 +22,7 @@ using nodals_hxt1::Dev;
 struct BF3BernsteinFace {int v0,v1,v2;};
 #include "modules/coupling/g2_state.inc"
 #include "modules/coupling/bernstein_bf3_tet.inc"
+#include "modules/wall/option_a_of12_noslip.cuh"
 #include "modules/wall/stage22d4b_nitsche_live.inc"
 #include "modules/wall/stage22d4c_wall_diagnostics.inc"
 #include "modules/wall/stage22d4i_constraint.inc"
@@ -1226,7 +1227,7 @@ __global__ void sst_mom_tet(
   // PERF_V4_TET24_MOMENTUM_VOLUME
   __shared__ Real U0[8],U1[8],U2[8],K[8],W[8],GP[24][8][3],NW[24];
   if(threadIdx.x<8){int g=tv[c].g[threadIdx.x];U0[threadIdx.x]=u0[g];U1[threadIdx.x]=u1[g];U2[threadIdx.x]=u2[g];K[threadIdx.x]=k[g];W[threadIdx.x]=omega[g];}__syncthreads();
-  int iq=(int)threadIdx.x;if(iq<24){double l[4]={hxt5a::h5_tet24_l0[iq],hxt5a::h5_tet24_l1[iq],hxt5a::h5_tet24_l2[iq],hxt5a::h5_tet24_l3[iq]};double qw=hxt5a::h5_tet24_w[iq];double ph[8],gr[8][3],gp[8][3];hxt2::tet_basis(l[0],l[1],l[2],l[3],ph,gr);hxt2::tet_phys_grad(gr,tg[c],gp);Real gu[9]={0},gk[3]={0},gw[3]={0},kv=0,wv=0;for(int a=0;a<8;++a){Real pa=(Real)ph[a];kv+=K[a]*pa;wv+=W[a]*pa;for(int d=0;d<3;++d){Real gd=(Real)gp[a][d];GP[iq][a][d]=gd;gk[d]+=K[a]*gd;gw[d]+=W[a]*gd;gu[d]+=U0[a]*gd;gu[3+d]+=U1[a]*gd;gu[6+d]+=U2[a]*gd;}}double x=0,y=0;for(int a=0;a<4;++a){auto X=pts[tc[c].v[a]];x+=l[a]*X.x;y+=l[a]*X.y;}auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor);NW[iq]=ss.nut*(Real)(tg[c].det*qw);}__syncthreads();
+  int iq=(int)threadIdx.x;if(iq<24){double l[4]={hxt5a::h5_tet24_l0[iq],hxt5a::h5_tet24_l1[iq],hxt5a::h5_tet24_l2[iq],hxt5a::h5_tet24_l3[iq]};double qw=hxt5a::h5_tet24_w[iq];double ph[8],gr[8][3],gp[8][3];hxt2::tet_basis(l[0],l[1],l[2],l[3],ph,gr);hxt2::tet_phys_grad(gr,tg[c],gp);Real gu[9]={0},gk[3]={0},gw[3]={0},kv=0,wv=0;for(int a=0;a<8;++a){Real pa=(Real)ph[a];kv+=K[a]*pa;wv+=W[a]*pa;for(int d=0;d<3;++d){Real gd=(Real)gp[a][d];GP[iq][a][d]=gd;gk[d]+=K[a]*gd;gw[d]+=W[a]*gd;gu[d]+=U0[a]*gd;gu[3+d]+=U1[a]*gd;gu[6+d]+=U2[a]*gd;}}double x=0,y=0;for(int a=0;a<4;++a){auto X=pts[tc[c].v[a]];x+=l[a]*X.x;y+=l[a]*X.y;}auto ss=hxt5c::local_sst((Real)x,(Real)y,(Real)radius,(Real)nu,gu,kv,wv,gk,gw,(Real)kFloor,(Real)omegaFloor);NW[iq]=(option_a_effective_nu((int)c, (Real)nu+ss.nut)-(Real)nu)*(Real)(tg[c].det*qw);}__syncthreads();
   for(int p=(int)threadIdx.x;p<64;p+=(int)blockDim.x){int a=p/8,b=p%8;Real v=0;for(int q=0;q<24;++q){Real gd=GP[q][a][0]*GP[q][b][0]+GP[q][a][1]*GP[q][b][1]+GP[q][a][2]*GP[q][b][2];v+=NW[q]*gd;}atomicAdd(turb+slot[c*64ull+(std::size_t)p],v);if(a==b)atomicAdd(diagRTurb+tv[c].g[a],v);}
 }
 
