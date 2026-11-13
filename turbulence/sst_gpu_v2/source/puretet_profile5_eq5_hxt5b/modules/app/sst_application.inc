@@ -583,6 +583,12 @@ int main(int argc,char**argv){
     const bool optionA=optionARaw && std::string(optionARaw)=="1";
     if(optionARaw && std::string(optionARaw)!="0" && !optionA)
       throw std::runtime_error("NODALS_OPTION_A_OF12_NOSLIP must be 0 or 1");
+    const char* optionAShearRaw=std::getenv("NODALS_OPTION_A_SHEAR_ACTIVE");
+    const bool optionAShearActive=optionA &&
+      (!optionAShearRaw || std::string(optionAShearRaw)=="1");
+    if(optionAShearRaw && std::string(optionAShearRaw)!="0" &&
+       std::string(optionAShearRaw)!="1")
+      throw std::runtime_error("NODALS_OPTION_A_SHEAR_ACTIVE must be 0 or 1");
     // Stage SC1: experimental off-wall sampled tangential conductance.
     // Default preserves the exact Stage41 wall-trace operator.
     const std::string sampledWallMode=std::getenv("NODALS_MOM_WALL_OPERATOR")?
@@ -827,8 +833,9 @@ int main(int argc,char**argv){
            ++ownerCount[(std::size_t)wf.cell]!=1)
           throw std::runtime_error("OPTION_A requires one and only one wall face per owner tet");
       }
-      std::printf("NODALS_OPTION_A enabled=1 wallFaces=%zu wallTets=%zu model=NO_SLIP_CELLWISE_NU_REPLACEMENT stress=IMPLICIT_DEVIATORIC noRobin=1 validation=EXPERIMENTAL\n",
-        BH.wallT.size(),BH.wallT.size());
+      std::printf("NODALS_OPTION_A enabled=1 wallFaces=%zu wallTets=%zu model=%s stress=IMPLICIT_DEVIATORIC noRobin=1 validation=EXPERIMENTAL\n",
+        BH.wallT.size(),BH.wallT.size(),
+        optionAShearActive?"NO_SLIP_SHEAR_REPLACEMENT_V2":"NO_SLIP_ORDINARY_SST_CONTROL");
     }
     auto fixed=hxt5b::plug_initial(M,inlet23);
     double plugVertexErr=0.0,plugEnrichMax=0.0;
