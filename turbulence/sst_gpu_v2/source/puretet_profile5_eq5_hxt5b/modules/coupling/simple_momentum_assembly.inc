@@ -32,7 +32,7 @@
             double st[3]={};
             HXT1_CUDA(cudaMemcpy(st,d_optionAStats.p,sizeof(st),cudaMemcpyDeviceToHost));
             if(!(st[0]>0.))throw std::runtime_error("OPTION_A zero sampled wall area");
-            std::printf("NODALS_OPTION_A_WALL it=%d wallFaces=%zu wallArea=%.10e meanUtau2=%.10e meanNuWallOverNu=%.10e clipMolecular=ON model=REPLACE_CELL_NU status=PASS\\n",
+            std::printf("NODALS_OPTION_A_WALL it=%d wallFaces=%zu wallArea=%.10e meanUtau2=%.10e meanNuWallOverNu=%.10e clipMolecular=ON model=REPLACE_CELL_NU status=PASS\n",
               git,BH.wallT.size(),st[0],st[1]/st[0],st[2]/st[0]);
           }
         }
