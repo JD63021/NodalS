@@ -22,6 +22,22 @@
             HXT1_CUDA(cudaGetLastError());
           }
           } // legacy correction; I3A correction is in the other branch.
+          if(optionA){
+            HXT1_CUDA(cudaMemset(d_optionAStats.p,0,sizeof(double)));
+            hxt5d::option_a_audit_wall_dofs<<<(BH.wallT.size()+127)/128,128>>>(
+              sstG1.tetWallPlans,(int)BH.wallT.size(),d_tv.p,
+              d_u0.p,d_u1.p,d_u2.p,d_optionAStats.p);
+            HXT1_CUDA(cudaGetLastError());
+            double sumSq=0.;
+            HXT1_CUDA(cudaMemcpy(&sumSq,d_optionAStats.p,sizeof(double),
+                                cudaMemcpyDeviceToHost));
+            const double rms=std::sqrt(std::max(0.,sumSq)/
+                   std::max(1.,12.*BH.wallT.size()));
+            if(!std::isfinite(rms) || rms>1.e-12*std::max(1.,fabs(bulk)))
+              throw std::runtime_error("OPTION_A strong wall velocity not zero after SIMPLE correction");
+            if(git==1 || git%sstG2PrintEvery==0)
+              std::printf("NODALS_OPTION_A_NOSLIP_AUDIT it=%d wallDofRMS=%.12e status=PASS\n",git,rms);
+          }
 
           hxt4a::B_apply(B,d_u0.p,d_u1.p,d_u2.p,d_cont.p);
           hxt5b::addsrc<<<(np+TPB-1)/TPB,TPB>>>(np,d_contSource.p,d_cont.p);
