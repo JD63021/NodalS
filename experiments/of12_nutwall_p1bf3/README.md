@@ -1,9 +1,6 @@
 # Experimental Option A: OpenFOAM-like no-slip wall-layer conductance (P1+BF3)
 
-**Status, 2026-11-13:** ISOLATED DESIGN + LOCAL BASELINE-PREFLIGHT. The native GPU
-Option-A wall operator is **not yet wired**. No modified turbulent solve has been run,
-and no performance / Moody accuracy improvement is claimed. The baseline branch
-remains unchanged. Do not treat a run using the existing Robin kernel as an Option-A run.
+**Status (2026-11-13):** The native Option-A GPU wall operator has now been wired into the isolated GitHub branch, but it has NOT been compiled or run on the user's CUDA workstation. No numerical improvement is claimed. The existing Robin model is unchanged when the new mode is off. This first version uses an isotropic replacement of viscosity in the wall-owner tetrahedron, not an exact OpenFOAM finite-volume face operator.
 
 ## Objective
 
@@ -80,3 +77,47 @@ Run the isolated workstation discovery + baseline preflight with
 `bash experiments/of12_nutwall_p1bf3/PREPARE_LOCAL.sh`.
 Set `RUN_BASELINE=1` only when a known-good *existing* solver binary is found;
 this is still the original Robin model, not Option A.
+
+
+## Structured 99,552-tetrahedron Re72600 trial (current reference)
+
+Use the already-prepared folder:
+
+    ~/Downloads/PIPE50_STRUCTURED_RE72600_100K_20261113/
+
+The mesh has 11,712 wall triangles, each with a UNIQUE owner tetrahedron
+(validated directly from the uploaded Gmsh mesh connectivity).
+
+Run in the existing experimental worktree:
+
+    cd ~/NodalS_OF12_WALL
+    git pull --ff-only
+    bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh baseline 10
+    bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh option_a 10
+
+The runner builds a branch-local sm_86 CUDA executable. The two runs use
+the same source case and exact mesh; they differ only by
+    --set wall_function.momentum_bc=robin
+or
+    --set wall_function.momentum_bc=of12_noslip
+
+Option A cannot silently fall back: the launcher verifies the executable
+printed 'NODALS_OPTION_A enabled=1'. If compilation fails, retain the
+compiler log and stop; do not run using an older Robin-only executable.
+
+Implementation: wall P1 vertices and BF3 face bubbles are fixed to zero
+for all velocity components. Scalar k/omega retain their original free
+wall masks. The original tangential Robin and wall-normal Nitsche
+contributions, including cached F1B and matrix-free cross-actions,
+are disabled. F2 five-point Spalding still supplies u_tau.
+The owner tet uses nu_eff_wall = max(nu, u_tau^2 / |P_t grad_n u|)
+in the SST momentum turbulent diffusion and the implicit deviatoric
+volume operator. The existing molecular base is kept, and no additional
+Robin face force is applied.
+
+LIMITATION: this is a cellwise isotropic wall-layer viscosity replacement;
+it modifies more of the first tetrahedron than the FV wall-face flux.
+The one-dimensional analytical patch test passes, but native GPU
+compilation, actual 3D patch tests, no-slip audit and pressure-drop
+comparison are PENDING. Do not infer accurate wall shear from the old
+Robin-based wall diagnostic; inspect the new NODALS_OPTION_A_WALL output.
