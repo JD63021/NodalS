@@ -770,8 +770,10 @@ int main(int argc,char**argv){
     // D4D configuration is printed after the existing gamma is parsed.
     if(liveFlag && !stage22d4Live)
       throw std::runtime_error("STAGE22D4B enable accepts only SST22D4_NITSCHE_ENABLE=1");
-    const double s22d4Gamma=std::getenv("SST22D4_GAMMA_N")?
-      std::stod(std::getenv("SST22D4_GAMMA_N")):30.0;
+    // With strong no-slip the old wall-normal weak penalty and all cross
+    // component F1B/Schur wall actions must vanish, not just the face matrix.
+    const double s22d4Gamma=optionA ? 0.0 : (std::getenv("SST22D4_GAMMA_N")?
+      std::stod(std::getenv("SST22D4_GAMMA_N")):30.0);
     if(stage22d4iEnable)std::printf(
       "STAGE22D4I2_CONFIG gammaStab=%.12e constrained=BF3_MEAN_FACE_FLUX_ZERO "
       "momentum=Tt_A_T_PLUS_NORMAL_PENALTY normalConsistency=OFF "
