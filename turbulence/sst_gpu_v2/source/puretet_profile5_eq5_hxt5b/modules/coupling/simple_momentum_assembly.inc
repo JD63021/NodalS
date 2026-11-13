@@ -182,7 +182,7 @@
           // F2: exactly ONE nonlinear Spalding fit per physical wall face.
           // All q-dependent nu_eff, normal/BF3 terms and omega equation remain
           // unchanged. The face coefficient is frozen for this SIMPLE step.
-          if(f2FaceSpalding && !optionA){
+          if(f2FaceSpalding && !optionAShearActive){
             hxt5d::f2_face_averaged_spalding<<<(BH.wallT.size()+127)/128,128>>>(
               sstG1.tetWallPlans,(int)BH.wallT.size(),sstG1.tetWallQuads,
               sstG1.profileTetMatchPoints,d_tv.p,
