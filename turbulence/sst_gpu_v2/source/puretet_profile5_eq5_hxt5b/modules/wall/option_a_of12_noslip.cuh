@@ -9,15 +9,8 @@
 //
 // Only meaningful for meshes with at most one physical wall face per tet.
 // Caller validates that uniqueness and that the scalar fixed mask is separate.
-static __device__ const Real* option_a_nueff_per_tet = nullptr;
 static __device__ int option_a_noslip_device = 0;
 
-__device__ __forceinline__ Real option_a_effective_nu(int c, Real from_sst){
-  const Real* a=option_a_nueff_per_tet;
-  if(!a) return from_sst;
-  const Real x=a[c];
-  return x>Real(0) ? x : from_sst;
-}
 
 // Each face owns exactly one tet. Compute one face-averaged viscous wall
 // conductance from the lagged full-vector wall-normal FE gradient and the
