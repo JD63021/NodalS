@@ -816,7 +816,8 @@ int main(int argc,char**argv){
       if(!stage22d4Live || !stage22d4iEnable || !f2FaceSpalding ||
          !sstG2 || M.h.nhex || M.h.ninterface || M.h.ntet==0 ||
          !implicitDevStress || sstG1.deviatoricMomentum ||
-         momentumFullSupg || momentumEmac || sstG1.stateSpace!=hxt5c::SST_STATE_Q1)
+         momentumFullSupg || momentumEmac ||
+         hxt5c::sst_state_space_mode_host()!=hxt5c::SST_STATE_Q1)
         throw std::runtime_error("OPTION_A requires pure-tet SST G2, vector M3/FGMRES, F2 Spalding, implicit deviatoric stress, masked Q1 and SUPG OFF");
       std::vector<unsigned char> ownerCount((std::size_t)M.h.ntet,0);
       for(const auto &wf:BH.wallT){
