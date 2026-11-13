@@ -154,3 +154,60 @@ validated on NVIDIA hardware**. Start with 10 or 20 iterations and inspect
 `NODALS_OPTION_A_WALL`, `NODALS_OPTION_A_NOSLIP_AUDIT`, and M3 parity
 before another longer run. Do not restart the v1 checkpoint using the V2
 formulation; the frozen nonlinear state may be incompatible.
+
+
+## Isolate the V2 instability (post-run, 2026-11-13)
+
+Both V1 (isotropic owner-tet viscosity) and V2 (wall-normal/tangential shear
+replacement) showed diverging momentum residuals by about iteration 200.
+The native 1000-step V2 attempt was interrupted by the native failure;
+do not reuse it as a converged initial condition.
+
+The exact cause is NOT established by the selected console lines. In
+particular, a tensor-level positivity test is not a nonlinear SIMPLE
+stability result. The M3 pressure Schur currently uses a scalar rAU/row-L1
+surrogate assembled before the full nine-block M3 and Option-A shear
+correction; the surrogate is not the diagonal inverse of the complete V2
+momentum operator. This has always been an approximation in the original
+M3 design, but could now be materially less accurate and needs auditing.
+
+A new **diagnostic-only** wall mode, `strong_noslip_sst`, keeps all the
+Option-A strong velocity constraints, the old Robin/Nitsche terms disabled,
+and the identical ordinary SST and deviatoric volume operator but
+**disables the new Spalding V2 shear correction**. This is not an alternative
+turbulent wall function or a recommendation for a coarse pipe mesh. Its
+sole purpose is to isolate whether the instability comes from the
+boundary/pressure implementation or the nonlinear wall-viscosity term.
+
+Run the control from a FRESH initialization, never from the diverged
+V2 restart:
+
+    cd ~/NodalS_OF12_WALL
+    git pull --ff-only
+    bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh noslip_sst 250
+
+Expected native marker:
+
+    NODALS_OPTION_A enabled=1 ... model=NO_SLIP_ORDINARY_SST_CONTROL
+
+The selected `strong_noslip_sst` mode still uses the existing
+F2 Spalding fit for the inherited scalar turbulence wall closure,
+but no `option_a_build_wall_nu` or `option_a_shear_add_m3/apply`
+is used in the momentum solve. The velocity-only no-slip wall mask
+and post-SIMPLE wall trace audit stay enabled.
+
+Interpretation:
+- If no-slip ordinary SST is also unstable, inspect no-slip/inlet
+  compatibility, BF3 constraints, B/rAU/Bt Schur and fixed-sweep momentum.
+- If no-slip ordinary SST survives the region where V2 fails, inspect
+  u_tau/gwall scaling, coefficient variation, matrix-free/CSR parity and
+  pressure preconditioner mismatch BEFORE experimenting with wall-law
+  tuning.
+- A stable result from the control does not validate no-slip turbulent
+  friction at y+~40: this is just a diagnostic calculation.
+
+To collect the existing V2 wall-model/Schur data:
+
+    RUN="$HOME/NodalS_SST_LOCAL_RUNS/OF12_NUTWALL_STR100K_20261113/option_a_1000steps_20261113_150436"
+    grep -E 'NODALS_OPTION_A_WALL|NODALS_OPTION_A_NOSLIP_AUDIT|NODALS_M3_OPERATOR_PARITY|STAGE22D4I3A_IDENTITY|STAGE22D4I3A_PRESSURE|NODALS_OPTION_A_UNBOUNDED_FACE|NODALS_M3_' "$RUN/terminal.log" | tail -90
+
