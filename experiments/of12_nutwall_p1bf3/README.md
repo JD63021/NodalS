@@ -121,3 +121,36 @@ The one-dimensional analytical patch test passes, but native GPU
 compilation, actual 3D patch tests, no-slip audit and pressure-drop
 comparison are PENDING. Do not infer accurate wall shear from the old
 Robin-based wall diagnostic; inspect the new NODALS_OPTION_A_WALL output.
+
+
+## V2 correction after the diverging 1000-step attempt (2026-11-13)
+
+The original Option A v1 failed at approximately it=220 with growing momentum
+residuals. It had replaced **the complete isotropic viscosity** inside
+11,712 wall-owner tetrahedra, whereas the intended OF-like model should
+alter only their wall-normal shear. The prior full-tetra replacement is
+**retired** from experimental compilation (existing checkpoint remains
+unchanged).
+
+The V2 formulation retains original SST diffusion and the complete
+implicit deviatoric tensor, and adds a **signed replacement**, not another
+wall penalty:
+
+    g(U) = (I-n*n^T) ((grad U + grad U^T) n)
+    delta_a(U,V) = integral_owner_tet (nu_wall - nu_eff_SST) g(U).g(V) dV
+
+The scalar case remains masked Q1, and its wall masks are never replaced
+by the velocity strong-no-slip mask. The V2 correction is implemented in
+both the M3 nine-block CSR and the reference matrix-free operator, before
+BF3 T/Tt elimination. The original wall Robin and normal Nitsche terms
+remain zero in Option A. This produces a positive total viscous shear
+coefficient nu_wall even when nu_wall < nu_eff_SST.
+
+A wall-face fail-fast rejects a non-finite or excessive (>1e6*nu) fitted
+nuwall coefficient; this is **not** a silently clipped modelling choice.
+
+**Important**: As of this source commit, V2 is **not yet compiled or
+validated on NVIDIA hardware**. Start with 10 or 20 iterations and inspect
+`NODALS_OPTION_A_WALL`, `NODALS_OPTION_A_NOSLIP_AUDIT`, and M3 parity
+before another longer run. Do not restart the v1 checkpoint using the V2
+formulation; the frozen nonlinear state may be incompatible.
