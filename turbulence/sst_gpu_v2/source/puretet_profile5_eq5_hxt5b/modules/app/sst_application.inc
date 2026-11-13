@@ -1565,10 +1565,11 @@ int main(int argc,char**argv){
     Dev<T>d_optionANu(std::vector<T>(optionA?(std::size_t)M.h.ntet:1u,Real(0)));
     Dev<double>d_optionAStats(std::vector<double>(3u,0.));
     if(optionA){
-      const Real* wallNuPtr=d_optionANu.p;
+      // V2 no longer substitutes a scalar viscosity throughout wall-owner
+      // tetrahedra. The viscosity array is passed explicitly to the
+      // normal-tangential shear correction in both M3 CSR and matrix-free
+      // momentum operators. Only the no-slip boundary toggle uses a symbol.
       const int optionAOne=1;
-      HXT1_CUDA(cudaMemcpyToSymbol(hxt5d::option_a_nueff_per_tet,
-                                  &wallNuPtr,sizeof(wallNuPtr)));
       HXT1_CUDA(cudaMemcpyToSymbol(hxt5d::option_a_noslip_device,
                                   &optionAOne,sizeof(optionAOne)));
     }
