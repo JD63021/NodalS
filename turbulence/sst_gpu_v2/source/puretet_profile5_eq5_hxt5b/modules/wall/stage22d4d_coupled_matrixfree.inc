@@ -189,6 +189,12 @@ struct S22D4DOperator {
   int nfaces; double gamma;
   Real* bf3Scratch; bool bf3FluxMode; bool sampledConductance=false;
   const double*f1bFaceCoupling=nullptr;
+  // Option A v2: same tangential-shear replacement in CSR AND matrix-free.
+  bool optionAShear=false;
+  const Real*optionAWallNu=nullptr;
+  void set_option_a_shear(bool enabled,const Real*wallNu) {
+    optionAShear=enabled;optionAWallNu=enabled?wallNu:nullptr;
+  }
   // Physical volume tensor; default OFF leaves the old operator byte-for-byte.
   // NODALS_EMAC_PICARD_V1: frozen-velocity cross-component convection tensor.
   bool emacPicard=false;
@@ -242,6 +248,11 @@ struct S22D4DOperator {
     if(implicitDev)
       implicit_dev_tet_apply<<<devNTet,64>>>(devPoints,devTetConn,devTetVel,devTetGeom,
         devU0,devU1,devU2,devK,devOmega,devNTet,
+        devRadius,devNu,devKFloor,devOmegaFloor,nv,physical,y);
+    if(optionAShear)
+      option_a_shear_apply<<<nfaces,64>>>(faces,nfaces,
+        devPoints,devTetConn,devTetVel,devTetGeom,
+        devU0,devU1,devU2,devK,devOmega,optionAWallNu,
         devRadius,devNu,devKFloor,devOmegaFloor,nv,physical,y);
     if(bf3FluxMode)
       s22d4i_Tt_apply<<<(nfaces+255)/256,256>>>(nfaces,faces,tvel,y,y+nv,y+2*(std::size_t)nv);
@@ -951,6 +962,13 @@ inline void m3_build(const S22D4DOperator&op,Real*k,Real*tmp,
       op.devPoints,op.devTetConn,op.devTetVel,op.devTetGeom,
       op.A.tetSlot.p,op.devU0,op.devU1,op.devU2,op.devK,op.devOmega,
       op.devNTet,op.devRadius,op.devNu,op.devKFloor,op.devOmegaFloor,
+      nnz,k);
+  if(op.optionAShear)
+    option_a_shear_add_m3<<<op.nfaces,64>>>(op.faces,op.nfaces,
+      op.devPoints,op.devTetConn,op.devTetVel,op.devTetGeom,
+      op.A.tetSlot.p,op.devU0,op.devU1,op.devU2,
+      op.devK,op.devOmega,op.optionAWallNu,
+      op.devRadius,op.devNu,op.devKFloor,op.devOmegaFloor,
       nnz,k);
   HXT1_CUDA(cudaMemcpy(tmp,k,bytes,cudaMemcpyDeviceToDevice));
   m3_right_transform<<<op.nfaces,128>>>(op.nfaces,op.faces,op.tvel,
