@@ -1,27 +1,12 @@
-// OPTION_A_OF12_NOSLIP_V1 -- experimental, pure-tet P1+BF3 only.
-//
-// Independent from the existing Robin wall: impose strong no-slip on every
-// wall-vertex and wall-face BF3 coefficient, then REPLACE the local volume
-// viscosity of the first wall-adjacent tet. There is NO Robin/Neumann boundary
-// force. This is a first isotropic cellwise wall-layer replacement, not an
-// exact finite-volume face stencil. Deviatoric components use the same
-// effective viscosity through the existing implicit-dev operator.
-//
-// Only meaningful for meshes with at most one physical wall face per tet.
-// Caller validates that uniqueness and that the scalar fixed mask is separate.
+// OPTION_A_OF12_NOSLIP_V2: experimental strong no-slip + shear-only replacement.
+// Velocity wall vertex/face-BF3 DOFs are exactly fixed; scalar fields unchanged.
+// F2 five-point Spalding supplies u_tau. For unique wall-owner tetrahedra
+// nu_wall=max(nu,u_tau^2/|P_t grad_n U|). Unlike v1, this coefficient is used
+// ONLY in the wall-normal tangential deviatoric shear subspace via the V2
+// correction operator; unrelated volume gradient directions use SST nu_eff.
+// A fail-fast prevents unbounded viscosity from low-gradient cancellation.
 static __device__ int option_a_noslip_device = 0;
 
-
-// Each face owns exactly one tet. Compute one face-averaged viscous wall
-// conductance from the lagged full-vector wall-normal FE gradient and the
-// five-point Spalding friction velocity. No arbitrary sample length is used:
-// G is the physical wall-normal gradient of the actual P1+BF3 basis.
-//
-// With exact no-slip, the tangential dev(2S) wall traction is
-//   t_w/rho = nu_eff_wall * P_t (grad U . n).
-// Hence the equivalent viscosity magnitude is u_tau^2 / |P_t grad_n U|.
-// Its nonnegative turbulent part replaces, rather than adds to,
-// nu_t(k,omega) in the entire wall-owner tet for this initial experiment.
 __global__ void option_a_build_wall_nu(
     const hxt5b::TetFacePlan* faces,int nf,
     const nodals_hxt1::TetVel* tv,
@@ -78,7 +63,16 @@ __global__ void option_a_build_wall_nu(
     if(utau>1.e-8){atomicAdd(bad,1ULL);return;}
     nw=nu;
   }else nw=fmax(nu,utau*utau/g);
-  if(!(nw>=nu && isfinite(nw))){atomicAdd(bad,1ULL);return;}
+  // Prevent an almost-cancelled face-gradient from silently creating a
+  // catastrophically large finite matrix coefficient. This is a diagnostic
+  // failure threshold, NOT a clipped viscosity model or tuning parameter.
+  if(!(nw>=nu && isfinite(nw)) || nw/nu>1.e6){
+    const auto prior=atomicAdd(bad,1ULL);
+    if(prior<12ULL)
+      printf("NODALS_OPTION_A_UNBOUNDED_FACE face=%d utau=%.8e g=%.8e nuwall=%.8e ratio=%.8e\\n",
+             fi,utau,g,nw,nw/nu);
+    return;
+  }
   wallNu[f.cell]=(Real)nw; // unique face-owner tet is asserted on host.
   if(stats){
     atomicAdd(stats+0,f.area);
