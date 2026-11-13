@@ -42,15 +42,29 @@ WALL_BC=robin
 echo "Using wall_function.momentum_bc=$WALL_BC"
 # Keep A/B settings exactly the same. Only wall_function.momentum_bc differs.
 # Prefix each run's log with a clear MODEL selection; native prints optionA flag.
+set +e
 python3 -u "$APP/nodals.py" run \
  --case "$CASE" --mesh "$MESH" --output "$OUT" \
  --binary "$BIN" --steps "$STEPS" \
  --set "wall_function.momentum_bc=$WALL_BC" \
  2>&1 | tee "$OUT/console.log"
+NATIVE_RC=${PIPESTATUS[0]}
+set -e
+
+# A fixed 10-step smoke test normally finishes without nonlinear convergence.
+# rc=3 is acceptable ONLY if the expected final iteration was completed.
+if ((NATIVE_RC != 0)); then
+ if ((NATIVE_RC==3)) && grep -q "NODALS_SST_G2_FINAL iterations=$STEPS " "$OUT/terminal.log"; then
+   echo "SMOKE_EXECUTED mode=$MODE steps=$STEPS nativeExit=3 result=NOT_CONVERGED"
+ else
+   echo "ERROR: unexpected native exit $NATIVE_RC (not a completed $STEPS-step smoke)" >&2
+   exit "$NATIVE_RC"
+ fi
+fi
 
 if [[ "$MODE" == option_a ]]; then
  if ! grep -q 'NODALS_OPTION_A enabled=1' "$OUT/terminal.log"; then
    echo "FAIL: native solver did not confirm Option A wall model" >&2; exit 6
  fi
 fi
-echo "COMPLETE $MODE: $OUT"
+echo "RUN_FINISHED mode=$MODE outcome=EXECUTED_NOT_NECESSARILY_CONVERGED path=$OUT"
