@@ -91,7 +91,7 @@
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,
             d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
             M.h.ntet,R,nu,sstG1.kFloor,sstG1.omegaFloor);
-          d4op.set_option_a_shear(optionA,d_optionANu.p);
+          d4op.set_option_a_shear(optionAShearActive,d_optionANu.p);
           if(stage22d4iEnable){
             hxt5d::s22d4i_Q_apply<<<(BH.wallT.size()+255)/256,256>>>(
                (int)BH.wallT.size(),sstG1.tetWallPlans,d_tv.p,
