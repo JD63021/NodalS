@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Isolated Re72600 pipe A/B experiment, 99,552 structured tetrahedra.
+# Usage: bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh [baseline|option_a] [STEPS]
+set -euo pipefail
+ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+MODE="${1:-baseline}"
+STEPS="${2:-10}"
+[[ "$MODE" == baseline || "$MODE" == option_a ]] ||
+ { echo "MODE must be baseline or option_a" >&2; exit 2; }
+[[ "$STEPS" =~ ^[0-9]+$ ]] && ((STEPS>0)) ||
+ { echo "STEPS must be positive integer" >&2; exit 2; }
+BRANCH="$(git -C "$ROOT" branch --show-current)"
+[[ "$BRANCH" == "exp/of12-nutwall-p1bf3-20261113" ]] ||
+ { echo "Wrong branch: $BRANCH" >&2; exit 2; }
+PKG="${PKG:-$HOME/Downloads/PIPE50_STRUCTURED_RE72600_100K_20261113}"
+[[ -d "$PKG" ]] || { echo "Missing extracted structured mesh package: $PKG" >&2; exit 3; }
+CASE="$PKG/cases/PIPE50_STR100K_RE72600_5PT.case"
+MESH="$PKG/mesh/PIPE50_STRUCTURED_100K_TET.msh"
+[[ -f "$CASE" && -f "$MESH" ]] ||
+ { echo "Missing case or mesh in $PKG" >&2; exit 3; }
+APP="$ROOT/turbulence/sst_gpu_v2"
+BIN="$APP/build/nodals_sst"
+OUT_ROOT="${OUT_ROOT:-$HOME/NodalS_SST_LOCAL_RUNS/OF12_NUTWALL_STR100K_20261113}"
+OUT="$OUT_ROOT/${MODE}_${STEPS}steps"
+mkdir -p "$OUT_ROOT"
+
+if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
+ NVCC="${NVCC:-/usr/local/cuda-12.8/bin/nvcc}"
+ [[ -x "$NVCC" ]] || NVCC="$(command -v nvcc)"
+ echo "Compiling on isolated branch: $APP"
+ make -C "$APP" -j2 NVCC="$NVCC" CUDA_ARCH=sm_86
+fi
+[[ -x "$BIN" ]] || { echo "Compiled binary missing: $BIN" >&2; exit 4; }
+echo "MODE=$MODE STEPS=$STEPS"
+echo "CASE=$CASE MESH=$MESH"
+echo "BRANCH=$BRANCH COMMIT=$(git -C "$ROOT" rev-parse HEAD)"
+sha256sum "$BIN" "$MESH" "$CASE"
+
+WALL_BC=robin
+[[ "$MODE" == option_a ]] && WALL_BC=of12_noslip
+echo "Using wall_function.momentum_bc=$WALL_BC"
+# Keep A/B settings exactly the same. Only wall_function.momentum_bc differs.
+# Prefix each run's log with a clear MODEL selection; native prints optionA flag.
+python3 -u "$APP/nodals.py" run \
+ --case "$CASE" --mesh "$MESH" --output "$OUT" \
+ --binary "$BIN" --steps "$STEPS" \
+ --set "wall_function.momentum_bc=$WALL_BC" \
+ 2>&1 | tee "$OUT_ROOT/${MODE}_${STEPS}steps_console.log"
+
+if [[ "$MODE" == option_a ]]; then
+ if ! grep -q 'NODALS_OPTION_A enabled=1' "$OUT/terminal.log"; then
+   echo "FAIL: native solver did not confirm Option A wall model" >&2; exit 6
+ fi
+fi
+echo "COMPLETE $MODE: $OUT"
