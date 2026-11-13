@@ -69,7 +69,7 @@ __global__ void option_a_build_wall_nu(
   if(!(nw>=nu && isfinite(nw)) || nw/nu>1.e6){
     const auto prior=atomicAdd(bad,1ULL);
     if(prior<12ULL)
-      printf("NODALS_OPTION_A_UNBOUNDED_FACE face=%d utau=%.8e g=%.8e nuwall=%.8e ratio=%.8e\\n",
+      printf("NODALS_OPTION_A_UNBOUNDED_FACE face=%d utau=%.8e g=%.8e nuwall=%.8e ratio=%.8e\n",
              fi,utau,g,nw,nw/nu);
     return;
   }
