@@ -211,3 +211,48 @@ To collect the existing V2 wall-model/Schur data:
     RUN="$HOME/NodalS_SST_LOCAL_RUNS/OF12_NUTWALL_STR100K_20261113/option_a_1000steps_20261113_150436"
     grep -E 'NODALS_OPTION_A_WALL|NODALS_OPTION_A_NOSLIP_AUDIT|NODALS_M3_OPERATOR_PARITY|STAGE22D4I3A_IDENTITY|STAGE22D4I3A_PRESSURE|NODALS_OPTION_A_UNBOUNDED_FACE|NODALS_M3_' "$RUN/terminal.log" | tail -90
 
+
+
+## Failed strong no-slip SST control and true-residual diagnostic (2026-11-13)
+
+The `noslip_sst 250` run on the 99,552-tet wall-function-type mesh
+failed around it=170. The measured axial momentum residual went from
+0.034 (it=100) to 1.16 (it=150) to 802 (it=170). No experimental
+Spalding shear correction was active, so that correction is **not
+necessary** to trigger this failure.
+
+**Important limitation:** a no-slip SST computation with *no modeled
+wall momentum friction* on a coarse (nominal y+~40) mesh is not a
+well-resolved reference experiment. Failure alone does not establish a
+bug in strong no-slip or BF3 constraints.
+
+The current case solver is `m3-fgs` with only two fixed colored sweeps
+per SIMPLE iteration. The M3 path reports `R.ok=true` after its
+requested sweeps and does **not** enforce a converged momentum residual.
+Likewise its I3A pressure Schur uses a componentwise row-L1 surrogate,
+not an inverse of the complete nine-block velocity operator.
+
+To test whether under-solving momentum is contributing, leave
+wall treatment, physical settings and pressure correction unchanged
+and run the existing **full coupled FGMRES** momentum solver:
+
+    cd ~/NodalS_OF12_WALL
+    git pull --ff-only
+    MOMENTUM_SOLVER=coupled-fgmres bash experiments/of12_nutwall_p1bf3/RUN_STR100K.sh noslip_sst 40
+
+The new `MOMENTUM_SOLVER` environment choice is passed to
+`nodals.py --momentum-solver`. It changes the linear algorithm ONLY,
+not the boundary formulation. It generates a new run directory, and the
+existing Robin solver and failed checkpoints are untouched.
+
+Inspect `STAGE22D4D_COUPLED_KRYLOV` entries: `converged=1` and
+`trueRel` are essential diagnostics, not an optional best-effort
+fixed-sweep result. If FGMRES cannot solve the frozen momentum operator,
+inspect assembly and DOF constraints before another long SIMPLE run.
+If it does solve but outer SIMPLE still diverges, the likely next focus
+is pressure Schur accuracy and unresolved wall-layer physics, not
+another change to the Spalding fit. A coarse-wall high-Re simulation
+still needs a correct wall-modelled conductance for physical validity.
+
+The exact failure mechanism has **not** yet been identified, and no
+GPU test has been run for this new momentum-solver selection.
