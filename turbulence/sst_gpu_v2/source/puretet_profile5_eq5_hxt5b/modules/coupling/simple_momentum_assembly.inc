@@ -10,7 +10,7 @@
           HXT1_CUDA(cudaMemcpy(d_s22d4i2Old.p+nv,d_u1.p,nbyte,cudaMemcpyDeviceToDevice));
           HXT1_CUDA(cudaMemcpy(d_s22d4i2Old.p+2*(std::size_t)nv,d_u2.p,nbyte,cudaMemcpyDeviceToDevice));
         }
-        if(optionA){
+        if(optionAShearActive){
           HXT1_CUDA(cudaMemset(d_optionANu.p,0,(std::size_t)M.h.ntet*sizeof(T)));
           HXT1_CUDA(cudaMemset(d_optionAStats.p,0,3*sizeof(double)));
           HXT1_CUDA(cudaMemset(d_bad.p,0,sizeof(unsigned long long)));
