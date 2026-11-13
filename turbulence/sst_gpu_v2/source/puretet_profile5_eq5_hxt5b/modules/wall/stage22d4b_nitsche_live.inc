@@ -266,7 +266,7 @@ __global__ void s22d4_nitsche_tet_component(
     }
     if(frozenCoeff){
       const std::size_t iq=(std::size_t)fi*12u+(std::size_t)q;
-      frozenCoeff[2u*iq]=nueff;frozenCoeff[2u*iq+1u]=fit.beta;
+      frozenCoeff[2u*iq]=nueff;frozenCoeff[2u*iq+1u]=option_a_noslip_device ? 0.0 : fit.beta;
     }
     // Stage3.A: each quadrature thread owns one (face,q). Gather its
     // off-component lagged wall RHS locally before a single global write
@@ -278,12 +278,12 @@ __global__ void s22d4_nitsche_tet_component(
       for(int b=0;b<8;++b){
         const int ib=tvv.g[b];
         const double pb=ca.bw[b],dnb=dn[b];
-        const double normalQ=bf3FluxMode ? ca.w*nueff*(gammaN/h*pa*pb) :
-  ca.w*nueff*(-pa*dnb-dna*pb+gammaN/h*pa*pb);
+        const double normalQ=option_a_noslip_device ? 0.0 : (bf3FluxMode ? ca.w*nueff*(gammaN/h*pa*pb) :
+  ca.w*nueff*(-pa*dnb-dna*pb+gammaN/h*pa*pb));
         // Opt-in: tangential friction acts on the SAME normal-column Picard
         // functional used by the frozen beta fit, not on the wall trace.
         // The normal BF3 constraint and penalty still use wall traces.
-        const double robin=ca.w*fit.beta*
+        const double robin=ca.w*(option_a_noslip_device ? 0.0 : fit.beta)*
           (sampledConductance?ca.bp[a]*ca.bp[b]:pa*pb);
         const int position=slot[(std::size_t)f.cell*64u+(std::size_t)(a*8+b)];
         // Stage3.B: the exact normal/tangential tensor is a diagonal
