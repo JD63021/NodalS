@@ -93,3 +93,25 @@ __global__ void option_a_build_wall_nu(
     atomicAdd(stats+2,f.area*(nw/nu));
   }
 }
+
+
+// Post-pressure-correction audit of the exact constrained P1+BF3 wall trace.
+// Each wall face has three P1 vertex DOFs and one independent BF3 face DOF.
+__global__ void option_a_audit_wall_dofs(
+    const hxt5b::TetFacePlan*faces,int nf,
+    const nodals_hxt1::TetVel*tv,
+    const Real*ux,const Real*uy,const Real*uz,double*sumSq)
+{
+  const int fi=(int)blockIdx.x*blockDim.x+(int)threadIdx.x;
+  if(fi>=nf)return;
+  const auto f=faces[fi];
+  const auto t=tv[f.cell];
+  double v2=0.;
+  for(int k=0;k<4;++k){
+    const int a=k==3 ? 4+(int)f.lf : hxt2::c_tet_face[(int)f.lf][k];
+    const int gid=t.g[a];
+    const double x=(double)ux[gid],y=(double)uy[gid],z=(double)uz[gid];
+    v2+=x*x+y*y+z*z;
+  }
+  atomicAdd(sumSq,v2);
+}
