@@ -41,6 +41,18 @@ WALL_BC=robin
 [[ "$MODE" == option_a ]] && WALL_BC=of12_noslip
 [[ "$MODE" == noslip_sst ]] && WALL_BC=strong_noslip_sst
 echo "Using wall_function.momentum_bc=$WALL_BC"
+# Diagnostics: FGMRES uses the same physics but insists on a true momentum
+# residual, unlike M3 fixed sweeps. This overrides only solver.u.method.
+MOMENTUM_SOLVER="${MOMENTUM_SOLVER:-}"
+SOLVER_ARGS=()
+if [[ -n "$MOMENTUM_SOLVER" ]]; then
+ case "$MOMENTUM_SOLVER" in
+  coupled-fgmres|m3-fgs|m3-sgs) ;;
+  *) echo "Bad MOMENTUM_SOLVER=$MOMENTUM_SOLVER" >&2; exit 2 ;;
+ esac
+ SOLVER_ARGS=(--momentum-solver "$MOMENTUM_SOLVER")
+fi
+echo "MOMENTUM_SOLVER=${MOMENTUM_SOLVER:-case_default}"
 # Keep A/B settings exactly the same. Only wall_function.momentum_bc differs.
 # Prefix each run's log with a clear MODEL selection; native prints optionA flag.
 set +e
@@ -48,6 +60,7 @@ python3 -u "$APP/nodals.py" run \
  --case "$CASE" --mesh "$MESH" --output "$OUT" \
  --binary "$BIN" --steps "$STEPS" \
  --set "wall_function.momentum_bc=$WALL_BC" \
+ "${SOLVER_ARGS[@]}" \
  2>&1 | tee "$OUT/console.log"
 NATIVE_RC=${PIPESTATUS[0]}
 set -e
