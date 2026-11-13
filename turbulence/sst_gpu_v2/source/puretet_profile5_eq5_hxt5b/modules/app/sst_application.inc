@@ -577,6 +577,12 @@ int main(int argc,char**argv){
     const bool stage22d4iEnable=std::getenv("SST22D4I_BF3") &&
       std::string(std::getenv("SST22D4I_BF3"))=="1";
     const bool stage22d4Live=liveFlag && std::string(liveFlag)=="1";
+    // Experimental standalone Option A: native wall-modelled no-slip with
+    // face-fitted Spalding u_tau and wall-tet viscosity replacement.
+    const char* optionARaw=std::getenv("NODALS_OPTION_A_OF12_NOSLIP");
+    const bool optionA=optionARaw && std::string(optionARaw)=="1";
+    if(optionARaw && std::string(optionARaw)!="0" && !optionA)
+      throw std::runtime_error("NODALS_OPTION_A_OF12_NOSLIP must be 0 or 1");
     // Stage SC1: experimental off-wall sampled tangential conductance.
     // Default preserves the exact Stage41 wall-trace operator.
     const std::string sampledWallMode=std::getenv("NODALS_MOM_WALL_OPERATOR")?
@@ -806,6 +812,21 @@ int main(int argc,char**argv){
         "wall=SYMMETRIC_NORMAL_NITSCHE_PLUS_TANGENTIAL_SPALDING "
         "viscosity=SST_NU_EFF wallXY=UNCLAMPED experiment=1 status=PASS\n",s22d4Gamma);
     }
+    if(optionA){
+      if(!stage22d4Live || !stage22d4iEnable || !f2FaceSpalding ||
+         !sstG2 || M.h.nhex || M.h.ninterface || M.h.ntet==0 ||
+         !implicitDevStress || sstG1.deviatoricMomentum ||
+         momentumFullSupg || momentumEmac || sstG1.stateSpace!=hxt5c::SST_STATE_Q1)
+        throw std::runtime_error("OPTION_A requires pure-tet SST G2, vector M3/FGMRES, F2 Spalding, implicit deviatoric stress, masked Q1 and SUPG OFF");
+      std::vector<unsigned char> ownerCount((std::size_t)M.h.ntet,0);
+      for(const auto &wf:BH.wallT){
+        if(wf.cell<0 || (std::size_t)wf.cell>=ownerCount.size() ||
+           ++ownerCount[(std::size_t)wf.cell]!=1)
+          throw std::runtime_error("OPTION_A requires one and only one wall face per owner tet");
+      }
+      std::printf("NODALS_OPTION_A enabled=1 wallFaces=%zu wallTets=%zu model=NO_SLIP_CELLWISE_NU_REPLACEMENT stress=IMPLICIT_DEVIATORIC noRobin=1 validation=EXPERIMENTAL\n",
+        BH.wallT.size(),BH.wallT.size());
+    }
     auto fixed=hxt5b::plug_initial(M,inlet23);
     double plugVertexErr=0.0,plugEnrichMax=0.0;
     for(std::uint64_t v=0;v<M.h.nv;++v){
@@ -842,9 +863,21 @@ int main(int argc,char**argv){
       "BF3FaceFluxCorrection=%d interiorProjection=NOT_EXACT_DIV_FREE "
       "status=PASS\n",initialVelocity.c_str(),(int)stage27PotentialStart,
       (int)stage27PotentialStart);
+    const std::vector<unsigned char>optionAScalarFixedMask=fixed.mask;
+    if(optionA){
+      std::size_t ndofs=0;
+      for(std::size_t i=0;i<fixed.mask.size();++i){
+        if(BH.wallMask[i]){
+          fixed.mask[i]=1;
+          fixed.u0[i]=fixed.u1[i]=fixed.u2[i]=Real(0);
+          ++ndofs;
+        }
+      }
+      std::printf("NODALS_OPTION_A_NOSLIP wallDofs=%zu components=3 wallTrace=EXACT zeroVelocity=1\n",ndofs);
+    }
     std::vector<unsigned char>clampXY=fixed.mask;
     if(!stage22Vector)for(std::size_t i=0;i<clampXY.size();++i)if(BH.wallMask[i])clampXY[i]=1;
-    Dev<unsigned char>d_fixed(fixed.mask),d_clampXY(clampXY),d_wallMask(BH.wallMask);
+    Dev<unsigned char>d_fixed(fixed.mask),d_scalarFixed(optionAScalarFixedMask),d_clampXY(clampXY),d_wallMask(BH.wallMask);
     Dev<T>d_u0(fixed.u0),d_u1(fixed.u1),d_u2(fixed.u2);
     auto VH=build_velocity_csr(M,IP);auto VC=color_free_rows(VH,fixed.mask);GpuCSR A(VH,VC);
     const char* p1Raw=std::getenv("SST_COMPACT_P1");
@@ -1526,6 +1559,16 @@ int main(int argc,char**argv){
     // F2: three face scalars [beta,uTau,yPlus] per wall triangle.
     Dev<double>d_f2FaceFit(std::vector<double>(
       f2FaceSpalding ? (std::size_t)3*BH.wallT.size() : 1u,0.));
+    Dev<T>d_optionANu(std::vector<T>(optionA?(std::size_t)M.h.ntet:1u,Real(0)));
+    Dev<double>d_optionAStats(std::vector<double>(3u,0.));
+    if(optionA){
+      const Real* wallNuPtr=d_optionANu.p;
+      const int optionAOne=1;
+      HXT1_CUDA(cudaMemcpyToSymbol(hxt5d::option_a_nueff_per_tet,
+                                  &wallNuPtr,sizeof(wallNuPtr)));
+      HXT1_CUDA(cudaMemcpyToSymbol(hxt5d::option_a_noslip_device,
+                                  &optionAOne,sizeof(optionAOne)));
+    }
     // F1B: 64 FP64 cross-component coefficients per physical wall face.
     // Allocated only when enabled; otherwise one unused scalar element.
     Dev<double>d_f1bWallCross(std::vector<double>(
