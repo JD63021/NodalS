@@ -5,7 +5,7 @@ Status: **experimental**. Geometry/host conversion previously checked in uploade
 
 - `generate_hybrid_pipe.py`: creates mesh/HXT0.npz, exact previous 99,216-cell 3,744 HEX + 95,472 TET discretization near D=0.889m, L=44.45m with 96 angular and 39 axial segments.
 - `enable_hybrid_local.py`: small opt-in patch for **the user's latest local November-14 SST app**. It does NOT replace the workstation's local source with the older GitHub main source.
-- `cases/PIPE50_RE1M_HYBRID_99K_ONEPOINT.case`: editable Re1M case, one-point HEX Spalding wall, OF_AUTO with sample_log target, volume k/omega SST, old segregated hybrid momentum path.
+- `PIPE50_RE1M_HYBRID_99K_ONEPOINT.case`: editable Re1M case, one-point HEX Spalding wall, OF_AUTO with sample_log target, volume k/omega SST, old segregated hybrid momentum path.
 - `RUN.sh`: local generation + source isolation + preflight, then first five CUDA steps only.
 
 `tools/prepare_hxt1.py` is already in the user's November-14 local app.  No mesh binary or chat artifact download is needed.
