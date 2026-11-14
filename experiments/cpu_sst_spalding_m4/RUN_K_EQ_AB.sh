@@ -19,7 +19,11 @@ UR_TAG="base"
 if [[ -n "${M4_DIAG_UR_U:-}" ]]; then UR_TAG="uru${M4_DIAG_UR_U}"; fi
 GD_TAG="gd0"
 if [[ -n "${M4_GRAD_DIV_GAMMA:-}" ]]; then GD_TAG="gd${M4_GRAD_DIV_GAMMA}"; fi
-RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_"$GD_TAG"_$(date +%Y%m%d_%H%M%S)"
+GD_FORM_TAG="${M4_GRAD_DIV_FORM:-volume}"
+[[ "$GD_FORM_TAG" == volume || "$GD_FORM_TAG" == constraint_p0 ]] || {
+  echo 'M4_GRAD_DIV_FORM must be volume or constraint_p0' >&2; exit 2;
+}
+RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_"$GD_TAG"_"$GD_FORM_TAG"_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN"
 CASE="$RUN/experiment.case"
 python3 - "$BASE_CASE" "$CASE" "$MODE" "$STEPS" <<'PY'
@@ -44,6 +48,12 @@ if "M4_GRAD_DIV_GAMMA" in os.environ:
         raise SystemExit("M4_GRAD_DIV_GAMMA must be finite and nonnegative (m2/s)")
     put("momentum","grad_div_gamma",format(gd,".12g"))
     print("K_EQ_GRADDIV_AUDIT gamma=%.12g units=m2/s enabled=%d"%(gd,gd>0))
+form=os.environ.get("M4_GRAD_DIV_FORM","volume")
+if form not in ("volume","constraint_p0"):
+    raise SystemExit("M4_GRAD_DIV_FORM must be volume or constraint_p0")
+put("momentum","grad_div_form",form)
+print("K_EQ_GRADDIV_FORM form=%s rhsCorrection=%s"%
+      (form,"DG_INLET_MAPPED" if form=="constraint_p0" else "ZERO_POINTWISE_DIV_TARGET"))
 put("solver.u","method","fgmres")
 put("solver.u","rtol","1e-5")
 put("solver.u","atol","1e-10")
