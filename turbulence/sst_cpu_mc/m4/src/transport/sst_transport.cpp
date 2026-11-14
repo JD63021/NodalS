@@ -324,7 +324,12 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
        r.y,cfg_.nu,Ut,ut,a.k,a.omega,ss,
        cfg_.kFloor,cfg_.omegaFloor,0.4,9.025013499434122,
        0.075,cfg_.omegaOfReBlend,10.0,1);
-   const double target=cfg_.omegaStage41=="sample_log"?oa.omegaLog:oa.omegaTarget;
+   // Isolation only: retain the dynamic omega sampler for diagnostic Rey/lamFrac
+    // but hold the prescribed omega sample_log target at a fixed uTau.
+    const double fixedUTau=cfg_.debugFixedTargetUTau;
+    const double target=fixedUTau>0 ?
+      fixedUTau/(std::sqrt(0.09)*0.4*r.y):
+      (cfg_.omegaStage41=="sample_log"?oa.omegaLog:oa.omegaTarget);
    const double nuEff=cfg_.nu+ss.sigmaW*ss.nut;
    // GPU stage41 exact normalization:
    // coeff=gamma*(nuEff/ell)*(area*QW[q]*ell)/ell.
@@ -348,8 +353,9 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
   }
   if(!(sumA>0))throw std::runtime_error("offwall omega received no wall rays");
   if(rank_==0 && (omegaAdvanceCount_==1||omegaAdvanceCount_%20==0))
-   std::printf("NODALS_CPU_M4_OMEGA_POINT mode=%s gamma=%.8g penaltyLength=%.12e sampleY=%.12e samples=%d targetMean=%.12e targetMin=%.12e targetMax=%.12e viscousBlendMean=%.12e reyMean=%.12e status=PASS\n",
-       cfg_.omegaStage41.c_str(),gamma,ell,cfg_.omegaY3,nsamples,
+   std::printf("NODALS_CPU_M4_OMEGA_POINT mode=%s wallTargetUTau=%s gamma=%.8g penaltyLength=%.12e sampleY=%.12e samples=%d targetMean=%.12e targetMin=%.12e targetMax=%.12e viscousBlendMean=%.12e reyMean=%.12e status=PASS\n",
+       cfg_.omegaStage41.c_str(),cfg_.debugFixedTargetUTau>0?"FIXED":"SPALDING_DYNAMIC",
+        gamma,ell,cfg_.omegaY3,nsamples,
        sumTarget/sumA,smallestTarget,largestTarget,sumViscous/sumA,sumRey/sumA);
  }
  // Optional offwall equilibrium k at exactly the SAME third ray sample as omega.
@@ -368,7 +374,8 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    const Carrier a=carrier(m_,r.hitCell,r.bary,gp,ph,u,k,omega,distance_,enrich_);
    const auto ss=physics(a,cfg_);
    const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
-   const double target=spalding_log_equilibrium_k(ut,cfg_.kFloor);
+   const double target=spalding_log_equilibrium_k(
+    cfg_.debugFixedTargetUTau>0?cfg_.debugFixedTargetUTau:ut,cfg_.kFloor);
    const double nuEff=cfg_.nu+ss.sigmaK*ss.nut;
    const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
    const double area=std::sqrt(dot(av,av));
@@ -451,7 +458,8 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
   for(const RayPoint&r:wallPoints_){
    const auto&t=m_.tets[(size_t)r.hitCell];
    const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
-   const double target=spalding_log_equilibrium_k(ut,cfg_.kFloor);
+   const double target=spalding_log_equilibrium_k(
+    cfg_.debugFixedTargetUTau>0?cfg_.debugFixedTargetUTau:ut,cfg_.kFloor);
    double actual=0;for(int a=0;a<4;++a)actual+=r.bary[a]*current[(size_t)t.v[a]];
    const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
    const double wt=std::sqrt(dot(av,av))*QW[r.q];
@@ -461,8 +469,9 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
   }
   if(!(areaSum>0))throw std::runtime_error("k point audit has zero wall area");
   if(rank_==0)
-   std::printf("NODALS_CPU_M4_K_POINT mode=%s gamma=%.8g sampleIndex=%d sampleY=%.12e penaltyLength=%.12e samples=%d targetMean=%.12e actualMean=%.12e targetMin=%.12e targetMax=%.12e relativeMeanAbsError=%.12e yPlusMean=%.12e uTauMean=%.12e status=DIAGNOSTIC\n",
-    cfg_.kWallMethod.c_str(),cfg_.kWallMethod=="no_flux"?0.:cfg_.kWallGamma,
+   std::printf("NODALS_CPU_M4_K_POINT mode=%s wallTargetUTau=%s gamma=%.8g sampleIndex=%d sampleY=%.12e penaltyLength=%.12e samples=%d targetMean=%.12e actualMean=%.12e targetMin=%.12e targetMax=%.12e relativeMeanAbsError=%.12e yPlusMean=%.12e uTauMean=%.12e status=DIAGNOSTIC\n",
+    cfg_.kWallMethod.c_str(),cfg_.debugFixedTargetUTau>0?"FIXED":"SPALDING_DYNAMIC",
+    cfg_.kWallMethod=="no_flux"?0.:cfg_.kWallGamma,
     cfg_.kWallSampleIndex,cfg_.omegaY3,cfg_.kWallPenaltyLength,nsamples,
     meanTarget/areaSum,meanActual/areaSum,targetMin,targetMax,
     meanAbsError/std::max(meanTarget,1e-300),meanYPlus/areaSum,meanUTau/areaSum);
