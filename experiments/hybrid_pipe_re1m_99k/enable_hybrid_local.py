@@ -134,7 +134,7 @@ def main():
                'nu':nu,'diameter':diameter,'density':1.0}
         env['STAGE31_INPUT_FINGERPRINT']=hashlib.sha256(
             json.dumps(fixed,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-    if args.restart and not mesh_sha and not get(cp,'restart','input_fingerprint'):""")
+    if args.restart and not mesh_sha and not hybrid and not get(cp,'restart','input_fingerprint'):""")
     print("HYBRID_EXPERIMENT_PATCH_APPLIED=PASS; STAGE31_BINARY_MESH_FINGERPRINT=ON")
 
 if __name__=="__main__":main()
