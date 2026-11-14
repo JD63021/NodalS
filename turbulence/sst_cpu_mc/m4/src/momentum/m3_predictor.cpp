@@ -10,6 +10,8 @@
 #include "../transport/sst_transport.hpp"
 #include "../enrichment/enrichment_momentum.hpp"
 #include "../enrichment/grad_div_rank_one.hpp"
+#include "../enrichment/constraint_augmentation.hpp"
+#include "../pressure/discrete_constraint_row.hpp"
 namespace nodals::cpu_mc::m3 {
 namespace {
 const double Q0[12]={.063089014491502,.063089014491502,.873821971016996,.249286745170910,.249286745170910,.501426509658180,.053145049844816,.053145049844816,.310352451033785,.310352451033785,.636502499121399,.636502499121399};
@@ -171,7 +173,8 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
    if(k_&&omega_&&wallDistance_)
     nodals::cpu_mc::m4::momentum_turbulent_deviatoric(K,m,c,lag_,*k_,*omega_,*wallDistance_,config,enrich_);
    convection(K,geom,lag_,ent,enrich_,c);
-   if(config.gradDivGamma>0) add_grad_div_unenriched(K,geom,config.gradDivGamma);
+   if(config.gradDivGamma>0&&config.gradDivForm=="volume")
+     add_grad_div_unenriched(K,geom,config.gradDivGamma);
   }
   // For enriched cells, the complete PP/PE/EP/EE volume block is integrated
   // together with the same quadrature and the same frozen nu+nut.
@@ -227,6 +230,31 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
       }
     }
    }
+  }
+  // Exact algebraic P0 augmentation of the SAME B and DG source as
+  // Schur::continuity(): B u + source = 0. The RHS term below is essential
+  // at inlet cells with source != 0. Never mix this with volume grad-div.
+  if(config.gradDivGamma>0&&config.gradDivForm=="constraint_p0"){
+    if(!(enrich_&&enrich_->enabled))
+      throw std::runtime_error("constraint_p0 requires enriched strong no-slip path");
+    if(!(t.volume>0.0&&std::isfinite(t.volume)))
+      throw std::runtime_error("constraint_p0 invalid cell pressure mass volume");
+    const auto row=nodals::cpu_mc::m4::build_discrete_constraint_row(
+      m,c,config.inlet,enrich_);
+    std::array<std::array<double,3>,12> bvec{};
+    for(int a=0;a<12;++a){
+      if(row.entity[a]!=augmented[a])
+        throw std::runtime_error("constraint_p0 B entity ordering mismatch");
+      const auto v=row.physical[a];
+      bvec[a]={v.x,v.y,v.z};
+    }
+    nodals::cpu_mc::m4::RHS36 rhsAug{};
+    nodals::cpu_mc::m4::add_constraint_augmentation<12>(
+      Kextra,rhsAug,bvec,row.source,config.gradDivGamma/t.volume);
+    for(int a=0;a<12;++a)for(int i=0;i<3;++i){
+      if(a<8)br[3*a+i]+=rhsAug[3*a+i];
+      else Bextra[3*a+i]+=rhsAug[3*a+i];
+    }
   }
   if(!(enrich_&&enrich_->enabled))constrain_cell(K,br,m,c);
   std::array<double,24>zeroPenaltyRhs{};
