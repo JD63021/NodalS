@@ -196,6 +196,13 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
             raise ValueError('supg.nu_fd_rel must be in (0,0.01]')
         if not number(cp,'supg','tau_scale',0.05)>0:
             raise ValueError('supg.tau_scale must be positive')
+    al_on=flag(cp,'grad_div','enabled',False)
+    al_method=get(cp,'grad_div','method','augmented_lagrangian').strip().lower()
+    if al_method!='augmented_lagrangian':
+        raise ValueError('grad_div.method must be augmented_lagrangian')
+    al_gamma=number(cp,'grad_div','gamma',0.0)
+    if al_gamma<0:raise ValueError('grad_div.gamma must be nonnegative')
+    if al_on and mode=='m4-hybrid':raise ValueError('AL does not support M4')
     sweeps=integer(cp,'solver.u','sweeps',5)
     if not 1<=sweeps<=60:raise ValueError('solver.u.sweeps outside 1..60')
 
@@ -346,6 +353,7 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_MOMENTUM_CONVECTION_FORM':convection_form,
         'NODALS_M3_MODE':modes[mode],
         'NODALS_M3_SWEEPS':str(sweeps),
+        'NODALS_AL_GAMMA':fmt(al_gamma if al_on else 0.0),
         'NODALS_M3_OMEGA':fmt(number(cp,'solver.u','omega',0.7)),
         'NODALS_F1B_FROZEN_WALL':str(int(flag(cp,'wall_function','frozen_wall_cache',True))),
         'NODALS_F2_FACE_SPALDING':str(int(flag(cp,'wall_function','face_spalding',True))),
