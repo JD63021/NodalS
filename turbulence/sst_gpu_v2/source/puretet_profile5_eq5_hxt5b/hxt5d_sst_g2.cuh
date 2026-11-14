@@ -30,6 +30,7 @@ struct BF3BernsteinFace {int v0,v1,v2;};
 #include "modules/coupling/stage22d4i3a_schur.cuh"
 #include "modules/coupling/implicit_dev_volume_tet.inc"
 #include "modules/wall/option_a_shear_replacement.cuh"
+#include "modules/wall/option_a_v3_projected_wall.cuh"
 // NODALS_EMAC_PICARD_V1
 #include "modules/coupling/emac_picard_tet.inc"
 #include "modules/wall/stage22d4d_coupled_matrixfree.inc"
