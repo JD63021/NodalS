@@ -80,3 +80,35 @@ Refresh the GitHub experiment branch, run `bash "$EXP/RUN.sh" dry` to apply
 this Python-only patch, then execute **the already compiled** binary without
 invoking make: `python3 -u "$APP/nodals.py" run --case "$CASE" --steps 5`.
 The next five GPU iterations are not yet confirmed.
+
+## 50D Moody postprocessing (hybrid HEX/TET)
+
+The user-provided November 11 standalone postprocessor used **tetrahedra
+only**. The new `POSTPROCESS_PIPE50_HYBRID.py` extends its geometric P0
+area-weighted pressure-section method to HEX (VTK cell 12) and TET (10)
+without using vertex-averaged pressure. It is independent of the CUDA solver.
+
+Run in the isolated Git worktree:
+```bash
+EXP="$HOME/NODALS_HYBRID_RE1M_99K_GIT/experiments/hybrid_pipe_re1m_99k"
+RUN="$HOME/NodalS_SST_LOCAL_RUNS/PIPE50_RE1M_HYBRID_99K_ONEPOINT"
+bash "$EXP/POSTPROCESS_PIPE50_HYBRID.sh" "$RUN" 1000
+# or automatically use the latest checkpoint, e.g. it500 or it1000:
+bash "$EXP/POSTPROCESS_PIPE50_HYBRID.sh" "$RUN" latest
+```
+
+Each report contains Moody friction error (signed %) for **20–50D, 20–30D,
+30–40D, 40–50D, 40–49D** by both reconstructed endpoint pressure loss and
+linear regression of cross-sectional P0 pressure over mesh-slab midplanes.
+`local_pressure_friction.csv`, `result.json`, `pressure_20to50D.png`,
+and `axial_pressure_20to50D.csv` go under `POSTPROCESS_itNNNN/MOODY`.
+
+The method was independently smoke-tested using a synthetic linear P0
+pressure field on the actual generated 99,216-cell HEX/TET mesh; it recovered
+the imposed Moody value across all five windows. **Actual workstation CFD
+pressure gradients cannot be reported until the user's VTU is processed.**
+
+The November 11 original *velocity* postprocessor is not yet adapted to
+non-node-aligned axial stations in the new 39-slab mesh. The new script
+deliberately processes pressure only. A BF3-aware momentum budget remains
+a separate validation task.
