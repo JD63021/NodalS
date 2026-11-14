@@ -103,7 +103,6 @@ inline void print_momentum_budget(const m2::Mesh&m,const EnrichmentSpace&enrich,
  const double meanNut=b.wallNutArea/b.wallArea;
  const double rhsBudget=b.pforce+b.viscAll-(b.convOut+b.convInPrescribed);
  const double denom=std::max({1.,std::abs(b.pforce),std::abs(b.viscAll),std::abs(b.convOut+b.convInPrescribed)});
- const double U=std::sqrt(inletU2);
  const double fMol=8*wallMol/inletU2,fEff=8*wallEff/inletU2;
  std::printf("NODALS_CPU_M4_RANS_WALL_BUDGET it=%d meanTauMol=%.12e meanTauEff=%.12e tauEffToMol=%.9g fMol=%.9g fEff=%.9g meanNutNu=%.9g maxNutNu=%.9g wallK=%.9g wallOmega=%.9g wallArea=%.12e status=DIAGNOSTIC\n",
   it,wallMol,wallEff,wallEff/std::max(wallMol,1e-300),fMol,fEff,meanNut/cfg.nu,b.wallNutMax/cfg.nu,
