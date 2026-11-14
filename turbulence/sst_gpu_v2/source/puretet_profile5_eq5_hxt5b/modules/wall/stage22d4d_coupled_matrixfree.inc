@@ -4,6 +4,7 @@
 // computed during that outer iteration's Nitsche assembly. No model change.
 // The pressure Schur approximation remains component diagonal (CONTROLLED).
 // This header is included INSIDE namespace hxt5d.
+#include "../coupling/nodals_al.inc"
 
 __global__ void s22d4d_offblock_action(
     const hxt5b::TetFacePlan*F,int nf,
@@ -189,6 +190,15 @@ struct S22D4DOperator {
   int nfaces; double gamma;
   Real* bf3Scratch; bool bf3FluxMode; bool sampledConductance=false;
   const double*f1bFaceCoupling=nullptr;
+  hxt4a::BDevice<Real>*alB=nullptr;
+  const nodals_hxt1::TetGeom*alGeom=nullptr;
+  Real *alPressure=nullptr,*alX=nullptr,*alY=nullptr,*alZ=nullptr;
+  double alGamma=0.; int alPin=-1;
+  void set_al(hxt4a::BDevice<Real>*b,const nodals_hxt1::TetGeom*geom,
+      Real*q,Real*x,Real*y,Real*z,double value,int pin){
+    alB=b;alGeom=geom;alPressure=q;alX=x;alY=y;alZ=z;
+    alGamma=value;alPin=pin;
+  }
   // Physical volume tensor; default OFF leaves the old operator byte-for-byte.
   // NODALS_EMAC_PICARD_V1: frozen-velocity cross-component convection tensor.
   bool emacPicard=false;
@@ -243,6 +253,12 @@ struct S22D4DOperator {
       implicit_dev_tet_apply<<<devNTet,64>>>(devPoints,devTetConn,devTetVel,devTetGeom,
         devU0,devU1,devU2,devK,devOmega,devNTet,
         devRadius,devNu,devKFloor,devOmegaFloor,nv,physical,y);
+    if(alGamma!=0.){
+      hxt4a::B_apply(*alB,physical,physical+nv,physical+2*(std::size_t)nv,alPressure);
+      nodals_al_mass<<<(alB->np+255)/256,256>>>(alB->np,alGeom,alPressure,alGamma,alPin);
+      hxt4a::BT_apply(*alB,alPressure,alX,alY,alZ);
+      nodals_al_add<<<(nv+255)/256,256>>>(nv,alX,alY,alZ,y,y+nv,y+2*(std::size_t)nv);
+    }
     if(bf3FluxMode)
       s22d4i_Tt_apply<<<(nfaces+255)/256,256>>>(nfaces,faces,tvel,y,y+nv,y+2*(std::size_t)nv);
     s22d4d_zero_fixed<<<(3*nv+255)/256,256>>>(nv,xy,fixed,y);
@@ -952,6 +968,10 @@ inline void m3_build(const S22D4DOperator&op,Real*k,Real*tmp,
       op.A.tetSlot.p,op.devU0,op.devU1,op.devU2,op.devK,op.devOmega,
       op.devNTet,op.devRadius,op.devNu,op.devKFloor,op.devOmegaFloor,
       nnz,k);
+  if(op.alGamma!=0.)
+    nodals_al_m3_add<<<op.alB->np,64>>>(op.alB->np,op.alB->row.p,
+      op.alB->col.p,op.alB->bx.p,op.alB->by.p,op.alB->bz.p,
+      op.tvel,op.alGeom,op.A.tetSlot.p,nnz,k,op.alGamma,op.alPin,bad);
   HXT1_CUDA(cudaMemcpy(tmp,k,bytes,cudaMemcpyDeviceToDevice));
   m3_right_transform<<<op.nfaces,128>>>(op.nfaces,op.faces,op.tvel,
     op.A.row.p,op.A.col.p,nnz,k,tmp,bad);
