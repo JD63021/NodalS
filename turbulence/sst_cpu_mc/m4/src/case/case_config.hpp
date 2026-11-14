@@ -22,6 +22,10 @@ struct CaseConfig {
  double scalarOmega=1.0,simpleTol=1e-4,continuityAtol=1e-8,plateauTol=.001;
  int kSweeps=40,omegaSweeps=40,omegaIndex=3,maxOuter=500,printEvery=10,vtuEvery=100;
  bool supgK=false,supgOmega=false,omegaProduction=false,adaptiveSampling=false;
+ // Explicitly opt-in; baseline remains bit-for-bit unchanged when disabled.
+ bool enrichEnabled=false;
+ double enrichUTau=0.5859,enrichCutoff=80.0;
+ int enrichRadialQuad=24;
  int adaptiveFirst=50,adaptiveEvery=500,adaptiveMax=2;
  double adaptiveTargetSp=30,adaptiveTargetOmega=30,adaptiveScaleMin=.05,adaptiveScaleMax=.9;
 
