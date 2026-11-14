@@ -21,7 +21,7 @@ if [[ ! -f "$APP/nodals.py" ]]; then
 fi
 mkdir -p "$WORK/cases" "$WORK/mesh"
 if [[ ! -f "$CASE" ]]; then
-    cp "$EXP/PIPE50_RE1M_HYBRID_99K_ONEPOINT.case" "$CASE"
+    cp "$EXP/cases/PIPE50_RE1M_HYBRID_99K_ONEPOINT.case" "$CASE"
 fi
 if [[ ! -f "$WORK/mesh/HXT1_mesh.bin" ]]; then
     python3 "$EXP/generate_hybrid_pipe.py" --outdir "$WORK/mesh"
