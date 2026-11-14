@@ -18,6 +18,11 @@ struct CaseConfig {
  double intensity=.05,lengthRatio=.07,urK=.7,urOmega=.7;
  double kFloor=1e-8,omegaFloor=1e-3,omegaScale=.5,omegaY3=0,omegaTraceGamma=50;
   double omegaPointGamma=10000.0,omegaPenaltyLength=0.0,omegaOfReBlend=11.0;
+  // Optional equilibrium k wall constraint at same traced interior point3.
+  // no_flux retains the original natural boundary condition bit for bit.
+  std::string kWallMethod="no_flux";
+  double kWallGamma=1000.0,kWallPenaltyLength=0.0;
+  int kWallSampleIndex=3;
  double pAtol=1e-12,continuityRtol=1e-6,pressureDropTol=0.01;
  int pressureDropWindow=20,pressureDropMinIterations=30;
  double scalarOmega=1.0,simpleTol=1e-4,continuityAtol=1e-8,plateauTol=.001;
