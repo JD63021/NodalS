@@ -74,7 +74,7 @@ inline S22D4DResult hybrid_coupled_m3_fgs(
     const double refNorm=red.norm(ax);
     const double rel=discrepancy/std::max(refNorm,1.e-300);
     std::printf("NODALS_HYBRID_M3_OPERATOR_PARITY it=1 "
-      "difference=%.12e reference=%.12e relative=%.12e tol=1e-9 status=%s\\n",
+      "difference=%.12e reference=%.12e relative=%.12e tol=1e-9 status=%s\n",
       discrepancy,refNorm,rel,
       (std::isfinite(rel)&&rel<=1.e-9)?"PASS":"FAIL");
     if(!std::isfinite(rel)||rel>1.e-9)
@@ -107,11 +107,11 @@ inline S22D4DResult hybrid_coupled_m3_fgs(
   if(!q.ok){
     HXT1_CUDA(cudaMemcpy(x,backup,bytes,cudaMemcpyDeviceToDevice));
     std::printf("NODALS_HYBRID_M3_RESTORED it=%d "
-      "reason=FROZEN_RESIDUAL_INCREASE status=WARN\\n",outer);
+      "reason=FROZEN_RESIDUAL_INCREASE status=WARN\n",outer);
   }
   std::printf("NODALS_HYBRID_M3_FGS it=%d sweeps=%d omega=%.6g "
     "initial=%.12e final=%.12e trueRel=%.12e accepted=%d "
-    "operator=3NV_NINE_BLOCK_CSR_NO_TET_WALL_PROJECTION status=%s\\n",
+    "operator=3NV_NINE_BLOCK_CSR_NO_TET_WALL_PROJECTION status=%s\n",
     outer,sweeps,omega,q.initial,q.final,q.rel,(int)q.ok,
     q.ok?"PASS":"WARN");
   return q;
