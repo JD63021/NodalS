@@ -15,6 +15,7 @@ using namespace nodals::cpu_mc::m2;
 struct EnrichmentSpace {
   const Mesh& mesh;
   std::vector<double> distance;
+  std::vector<double> nodalW; // evaluate Spalding inverse at vertices once
   std::vector<int> index;
   std::vector<unsigned char> fixed;
   int ne=0, nr=0;
@@ -28,6 +29,9 @@ struct EnrichmentSpace {
     if(!(cfg.enrichUTau>0 && cfg.enrichCutoff>0 && cfg.nu>0))
       throw std::runtime_error("enrichment: invalid utau/cutoff/nu");
     law.nu=cfg.nu;law.utau=cfg.enrichUTau;
+    nodalW.resize(m.points.size());
+    for(size_t i=0;i<m.points.size();++i)
+      nodalW[i]=law.value_gradient(std::max(0.,y[i]))[0];
     std::vector<unsigned char> wallVertices(m.points.size(),0);
     for(size_t f=0;f<m.faces.size();++f)if(m.faces[f].patch==3){
       fixed[m.points.size()+f]=1;
@@ -75,18 +79,21 @@ struct EnrichmentSpace {
     }
     for(int j=8;j<12;++j){phi[j]=0;grad[j]={};}
     if(!enabled)return;
-    std::array<nodals::cpu_mc::enrichment::V3,4> gradients{};
-    std::array<double,4> ys{};
-    std::array<bool,4> active{};
+    bool present=false;
+    for(int j=0;j<4;++j)if(index[(size_t)t.v[j]]>=0)present=true;
+    if(!present)return;
+    double y=0,linearW=0;Vec3 gy{},gLinearW{};
     for(int j=0;j<4;++j){
-      gradients[j]={gl[j].x,gl[j].y,gl[j].z};
-      ys[j]=distance[(size_t)t.v[j]];
-      active[j]=index[(size_t)t.v[j]]>=0;
+      const double yd=distance[(size_t)t.v[j]],Wj=nodalW[(size_t)t.v[j]];
+      y+=l[j]*yd;linearW+=l[j]*Wj;
+      gy=gy+yd*gl[j];gLinearW=gLinearW+Wj*gl[j];
     }
-    const auto e=nodals::cpu_mc::enrichment::evaluate(l,gradients,ys,active,law);
-    for(int j=0;j<4;++j){
-      phi[8+j]=e.E[j];
-      grad[8+j]={e.dE[j][0],e.dE[j][1],e.dE[j][2]};
+    const auto W=law.value_gradient(std::max(0.,y));
+    const double shift=W[0]-linearW;
+    const Vec3 gradShift=W[1]*gy-gLinearW;
+    for(int j=0;j<4;++j)if(index[(size_t)t.v[j]]>=0){
+      phi[8+j]=l[j]*shift;
+      grad[8+j]=shift*gl[j]+l[j]*gradShift;
     }
   }
   // Gauss-Legendre rule on [0,1]. Non-polynomial wall-law shapes need
