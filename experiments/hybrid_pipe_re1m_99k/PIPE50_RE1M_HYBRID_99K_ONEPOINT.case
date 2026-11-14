@@ -27,7 +27,8 @@ type = spalding
 mode = plug
 
 [wall_distance]
-method = geometric
+# Straight circular pipe: native analytic distance, no tet-only BVH
+method = analytic_pipe
 
 [wall_sampling]
 initial_distance = legacy_scale
