@@ -293,6 +293,63 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    }
   }
  }
+ // GPU stage41 off-wall omega point3: ONE rank-one penalty per wall-face
+ // quadrature ray, assembled in the *interior hit cell*, NOT on wall nodes.
+ // The masked BF3 scalar trial modes remain in the row L1 damping operator.
+ if(omegaEq && cfg_.omegaStage41!="trace_log"){
+  if(cfg_.expectRanks!=1)
+    throw std::runtime_error("offwall omega point3 presently requires ONE MPI rank: hit-cell ownership not yet distributed");
+  if(!fit||fit->qUTau.size()!=12*m_.faces.size())
+    throw std::runtime_error("offwall omega requires Spalding friction velocity at all face quadrature rays");
+  const double ell=cfg_.omegaPenaltyLength;
+  const double gamma=cfg_.omegaPointGamma;
+  double sumA=0,sumTarget=0,sumViscous=0,sumRey=0,smallestTarget=1e300,largestTarget=0;
+  int nsamples=0;
+  for(const RayPoint&r:wallPoints_){
+   const auto&t=m_.tets[(size_t)r.hitCell];
+   const Geo g=geometry(m_,r.hitCell);
+   double ph[8];Vec8 gp{};shape(g,r.bary,ph,gp);
+   const Carrier a=carrier(m_,r.hitCell,r.bary,gp,ph,u,k,omega,distance_,enrich_);
+   const auto ss=physics(a,cfg_);
+   const Vec3 areaVec=outward_area(m_,r.wallCell,r.localFace);
+   const double area=std::sqrt(dot(areaVec,areaVec));
+   if(!(area>0))throw std::runtime_error("offwall omega encountered degenerate wall face");
+   const Vec3 n=(1.0/area)*areaVec;
+   const double Un=dot(a.vel,n);
+   const double Ut=std::sqrt(std::max(0.,dot(a.vel,a.vel)-Un*Un));
+   const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
+   const auto oa=nodals::wall::evaluate_of_auto<double>(
+       r.y,cfg_.nu,Ut,ut,a.k,a.omega,ss,
+       cfg_.kFloor,cfg_.omegaFloor,0.4,9.025013499434122,
+       0.075,cfg_.omegaOfReBlend,10.0,1);
+   const double target=cfg_.omegaStage41=="sample_log"?oa.omegaLog:oa.omegaTarget;
+   const double nuEff=cfg_.nu+ss.sigmaW*ss.nut;
+   // GPU stage41 exact normalization:
+   // coeff=gamma*(nuEff/ell)*(area*QW[q]*ell)/ell.
+   const double coeff=gamma*nuEff*(area*QW[r.q])/ell;
+   if(!(target>0 && nuEff>0 && coeff>0 && std::isfinite(target) &&
+        std::isfinite(nuEff) && std::isfinite(coeff) && std::isfinite(oa.lamFrac)))
+     throw std::runtime_error("invalid sampled omega target / effective viscosity / rank-one penalty");
+   int ent[8];for(int b=0;b<8;++b)ent[b]=(b<4)?t.v[b]:(nv_+t.face[b-4]);
+   for(int ia=0;ia<4;++ia){
+    const int row=localOf[t.v[ia]];if(row<0)continue;
+    rhs[(size_t)row]+=coeff*ph[ia]*target;
+    for(int ib=0;ib<8;++ib)
+      mat[(size_t)row][ent[ib]]+=coeff*ph[ia]*ph[ib];
+   }
+   const double w=area*QW[r.q];
+   sumA+=w;sumTarget+=w*target;sumViscous+=w*oa.lamFrac;
+   sumRey+=w*oa.rey;
+   smallestTarget=std::min(smallestTarget,target);
+   largestTarget=std::max(largestTarget,target);
+   ++nsamples;
+  }
+  if(!(sumA>0))throw std::runtime_error("offwall omega received no wall rays");
+  if(rank_==0 && (omegaAdvanceCount_==1||omegaAdvanceCount_%20==0))
+   std::printf("NODALS_CPU_M4_OMEGA_POINT mode=%s gamma=%.8g penaltyLength=%.12e sampleY=%.12e samples=%d targetMean=%.12e targetMin=%.12e targetMax=%.12e viscousBlendMean=%.12e reyMean=%.12e status=PASS\n",
+       cfg_.omegaStage41.c_str(),gamma,ell,cfg_.omegaY3,nsamples,
+       sumTarget/sumA,smallestTarget,largestTarget,sumViscous/sumA,sumRey/sumA);
+ }
  // Relaxed row-L1 sums include the constrained BF3 trial modes, exactly as in GPU Q1.
  std::vector<std::vector<std::pair<int,double>>> rows(owned.size());
  std::vector<double> inverse(owned.size(),0.0);
