@@ -17,7 +17,9 @@ RUN_ROOT="$HOME/NodalS_SST_LOCAL_RUNS/CPU_M4_K_EQ_AB_20261114"
 # Optional diagnostic UR_U override. Unset preserves original case exactly.
 UR_TAG="base"
 if [[ -n "${M4_DIAG_UR_U:-}" ]]; then UR_TAG="uru${M4_DIAG_UR_U}"; fi
-RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_$(date +%Y%m%d_%H%M%S)"
+GD_TAG="gd0"
+if [[ -n "${M4_GRAD_DIV_GAMMA:-}" ]]; then GD_TAG="gd${M4_GRAD_DIV_GAMMA}"; fi
+RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_"$GD_TAG"_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN"
 CASE="$RUN/experiment.case"
 python3 - "$BASE_CASE" "$CASE" "$MODE" "$STEPS" <<'PY'
@@ -36,6 +38,12 @@ if "M4_DIAG_UR_U" in os.environ:
         raise SystemExit("M4_DIAG_UR_U must be in (0,1]")
     put("simple","ur_u",format(relax,".12g"))
     print("K_EQ_UR_AUDIT ur_u=%.9g override=1"%relax)
+if "M4_GRAD_DIV_GAMMA" in os.environ:
+    gd=float(os.environ["M4_GRAD_DIV_GAMMA"])
+    if not(math.isfinite(gd) and 0<=gd<=100):
+        raise SystemExit("M4_GRAD_DIV_GAMMA must be between 0 and 100 m2/s")
+    put("momentum","grad_div_gamma",format(gd,".12g"))
+    print("K_EQ_GRADDIV_AUDIT gamma=%.12g units=m2/s enabled=%d"%(gd,gd>0))
 put("solver.u","method","fgmres")
 put("solver.u","rtol","1e-5")
 put("solver.u","atol","1e-10")
