@@ -14,11 +14,14 @@ BASE_CASE="$STAGE1/cases/TINY_PIPE_6D_RE72600_CPU_M4_CONTROL.case"
 MESH="$STAGE1/mesh/TINY_PIPE_D0889_RE72600_6D_DELAUNAY_20261114.msh"
 [[ -f "$BASE_CASE" && -f "$MESH" ]] || { echo "Missing Stage1 base case or mesh" >&2; exit 3; }
 RUN_ROOT="$HOME/NodalS_SST_LOCAL_RUNS/CPU_M4_K_EQ_AB_20261114"
-RUN="$RUN_ROOT/"$MODE"_"$STEPS"_$(date +%Y%m%d_%H%M%S)"
+# Optional diagnostic UR_U override. Unset preserves original case exactly.
+UR_TAG="base"
+if [[ -n "${M4_DIAG_UR_U:-}" ]]; then UR_TAG="uru${M4_DIAG_UR_U}"; fi
+RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN"
 CASE="$RUN/experiment.case"
 python3 - "$BASE_CASE" "$CASE" "$MODE" "$STEPS" <<'PY'
-import sys,configparser
+import sys,configparser,os,math
 src,dst,mode,steps=sys.argv[1:]
 n=int(steps)
 p=configparser.ConfigParser(interpolation=None,strict=True)
@@ -27,6 +30,12 @@ def put(section,key,val):
     if not p.has_section(section):p.add_section(section)
     p.set(section,key,str(val))
 put("simple","max_iterations",n)
+if "M4_DIAG_UR_U" in os.environ:
+    relax=float(os.environ["M4_DIAG_UR_U"])
+    if not (math.isfinite(relax) and 0<relax<=1):
+        raise SystemExit("M4_DIAG_UR_U must be in (0,1]")
+    put("simple","ur_u",format(relax,".12g"))
+    print("K_EQ_UR_AUDIT ur_u=%.9g override=1"%relax)
 put("solver.u","method","fgmres")
 put("solver.u","rtol","1e-5")
 put("solver.u","atol","1e-10")
