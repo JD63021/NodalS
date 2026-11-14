@@ -91,14 +91,16 @@ def main():
     # mistakenly inserted an extern before the later in-header definition;
     # NVCC treats that combination as a duplicate.  Repair existing copies too.
     wall = app/"source/puretet_profile5_eq5_hxt5b/modules/wall/of_auto_point3_kernel.inc"
-    old_decl = (
-        "// Stage41 pure-log switch is defined later in the existing wall module.\\n"
-        "extern __device__ __constant__ int stage41_sample_log;\\n"
-    ).replace("\\\\n", "\\n")
-    new_def = (
-        "// Shared HEX/TET Stage41 switch, exactly one CUDA definition.\\n"
-        "__device__ __constant__ int stage41_sample_log=0;\\n"
-    ).replace("\\\\n", "\\n")
+    old_decl = chr(10).join((
+        "// Stage41 pure-log switch is defined later in the existing wall module.",
+        "extern __device__ __constant__ int stage41_sample_log;",
+        ""
+    ))
+    new_def = chr(10).join((
+        "// Shared HEX/TET Stage41 switch, exactly one CUDA definition.",
+        "__device__ __constant__ int stage41_sample_log=0;",
+        ""
+    ))
     cs = cu.read_text()
     if old_decl in cs:
         cu.write_text(cs.replace(old_decl, new_def, 1))
