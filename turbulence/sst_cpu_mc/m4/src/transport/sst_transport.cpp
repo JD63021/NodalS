@@ -1,4 +1,5 @@
 #include "sst_transport.hpp"
+#include "spalding_k_equilibrium.hpp"
 #include "quadrature24.hpp"
 #include "sst2003m_distance_core.hpp" // exact GPU SST-2003m pointwise mathematics
 #include "transport_core.hpp"          // exact GPU row-L1 and scalar source policies
@@ -367,13 +368,13 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    const Carrier a=carrier(m_,r.hitCell,r.bary,gp,ph,u,k,omega,distance_,enrich_);
    const auto ss=physics(a,cfg_);
    const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
-   const double target=std::max(cfg_.kFloor,ut*ut/std::sqrt(0.09));
+   const double target=spalding_log_equilibrium_k(ut,cfg_.kFloor);
    const double nuEff=cfg_.nu+ss.sigmaK*ss.nut;
    const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
    const double area=std::sqrt(dot(av,av));
    // GPU omega point penalty normalization with k effective diffusivity:
    // coeff = gamma * nuEff * wallArea * QW[q] / (y5-y1).
-   const double coeff=gamma*nuEff*area*QW[r.q]/ell;
+   const double coeff=spalding_offwall_k_penalty_coeff(gamma,nuEff,area,QW[r.q],ell);
    if(!(ut>=0&&target>0&&nuEff>0&&area>0&&coeff>0&&
       std::isfinite(ut)&&std::isfinite(target)&&std::isfinite(nuEff)&&std::isfinite(coeff)))
     throw std::runtime_error("invalid k Spalding equilibrium point target / penalty");
@@ -450,7 +451,7 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
   for(const RayPoint&r:wallPoints_){
    const auto&t=m_.tets[(size_t)r.hitCell];
    const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
-   const double target=std::max(cfg_.kFloor,ut*ut/std::sqrt(0.09));
+   const double target=spalding_log_equilibrium_k(ut,cfg_.kFloor);
    double actual=0;for(int a=0;a<4;++a)actual+=r.bary[a]*current[(size_t)t.v[a]];
    const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
    const double wt=std::sqrt(dot(av,av))*QW[r.q];
