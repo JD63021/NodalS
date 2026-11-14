@@ -9,6 +9,7 @@
 #include "spalding_core.hpp"
 #include "../transport/sst_transport.hpp"
 #include "../enrichment/enrichment_momentum.hpp"
+#include "../enrichment/grad_div_rank_one.hpp"
 namespace nodals::cpu_mc::m3 {
 namespace {
 const double Q0[12]={.063089014491502,.063089014491502,.873821971016996,.249286745170910,.249286745170910,.501426509658180,.053145049844816,.053145049844816,.310352451033785,.310352451033785,.636502499121399,.636502499121399};
@@ -45,6 +46,19 @@ void convection(Element24&K,const Geom&geom,const std::vector<double>&lag,const 
   for(int a=0;a<8;++a)for(int b=0;b<8;++b){const double v=wt*ph[a]*(carrier[0]*gr[b].x+carrier[1]*gr[b].y+carrier[2]*gr[b].z);
     for(int d=0;d<3;++d)K[3*a+d][3*b+d]+=v;
   }
+ }
+}
+// On cells without active Spalding enrichment, integrate the same
+// grad-div bilinear form over all 8 P1+BF3 modes.
+void add_grad_div_unenriched(Element24&K,const Geom&g,double gamma){
+ for(int ir=0;ir<5;++ir)for(int is=0;is<5;++is)for(int iz=0;iz<5;++iz){
+  const double r=X5[ir],s=X5[is],t=X5[iz],omr=1-r,oms=1-s;
+  const double wt=W5[ir]*W5[is]*W5[iz]*omr*omr*oms*g.det;
+  const std::array<double,4> lam={omr*oms*(1-t),r,omr*s,omr*oms*t};
+  double ph[8];G gp{};shape(g,lam,ph,gp);
+  std::array<std::array<double,3>,8> gg{};
+  for(int a=0;a<8;++a)gg[a]={gp[a].x,gp[a].y,gp[a].z};
+  nodals::cpu_mc::m4::add_grad_div_rank_one<8>(K,gg,gamma*wt);
  }
 }
 }
@@ -157,6 +171,7 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
    if(k_&&omega_&&wallDistance_)
     nodals::cpu_mc::m4::momentum_turbulent_deviatoric(K,m,c,lag_,*k_,*omega_,*wallDistance_,config,enrich_);
    convection(K,geom,lag_,ent,enrich_,c);
+   if(config.gradDivGamma>0) add_grad_div_unenriched(K,geom,config.gradDivGamma);
   }
   // For enriched cells, the complete PP/PE/EP/EE volume block is integrated
   // together with the same quadrature and the same frozen nu+nut.
