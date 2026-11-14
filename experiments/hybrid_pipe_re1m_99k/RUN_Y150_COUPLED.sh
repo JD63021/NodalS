@@ -9,7 +9,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="${NODALS_HYBRID_APP:-$HOME/NodalS_GPU_HYBRID_RE1M_99K/turbulence/sst_gpu_v2}"
 WORK="${NODALS_HYBRID_M3_WORK:-$HOME/NODALS_HYBRID_Y150_M3_FGS2_WORK}"
-BASE="${NODALS_HYBRID_Y150_WORK:-$HOME/NODALS_HYBRID_RE1M_Y150_TRACE_RUN}"
+BASE="${NODALS_Y150_WORK:-$HOME/NODALS_HYBRID_RE1M_Y150_TRACE_RUN}"
 CASE="$WORK/cases/PIPE50_RE1M_HYBRID_Y150_M3_FGS2.case"
 MESH="$WORK/mesh/HXT1_mesh.bin"
 MODE="${1:-prepare}"
@@ -33,6 +33,7 @@ if [[ ! -f "$CASE" ]];then
 fi
 # The old source must already have the minimal hybrid and trace_log patches.
 # This command adds only the new 3Nv solvers; it is idempotent.
+python3 "$HERE/enable_hex_trace_log.py" --app "$APP"
 python3 "$HERE/enable_hybrid_coupled.py" --app "$APP"
 echo "HYBRID_COUPLED_APP=$APP"
 echo "HYBRID_COUPLED_CASE=$CASE"
