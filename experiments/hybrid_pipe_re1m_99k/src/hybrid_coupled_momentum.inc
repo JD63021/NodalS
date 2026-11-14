@@ -62,19 +62,23 @@ inline S22D4DResult hybrid_coupled_m3_fgs(
   if(!std::isfinite(q.initial))
     throw std::runtime_error("HYBRID_M3 initial block residual nonfinite");
 
-  // Strict single-operator parity against the reference coupled FGMRES action.
-  // No new parameter/diagnostic operator is substituted in the solver.
+  // Exact assembled-CSR-versus-matrix-free operator parity, not just norm
+  // comparison. This proves the M3 sweeps use the SAME frozen K as FGMRES.
   if(outer==1){
-    const auto csrStart=q.initial;
+    const std::size_t bytes3=(std::size_t)3*nv*sizeof(Real);
+    HXT1_CUDA(cudaMemcpy(r,ax,bytes3,cudaMemcpyDeviceToDevice));
     op.apply(x,ax);
-    s22d4d_residual<<<(3*nv+255)/256,256>>>(nv,b,ax,op.xy,op.fixed,r);
+    m3_sub<<<(3*nv+255)/256,256>>>(3*nv,r,ax,r);
     HXT1_CUDA(cudaGetLastError());
-    const double reference=red.norm(r);
-    // Numerical equality of norms alone is insufficient to prove equality
-    // of operators; a separate vector difference is checked below during
-    // integration, where both raw actions are available.
-    std::printf("NODALS_HYBRID_M3_REFERENCE it=1 csrResidual=%.12e "
-      "matrixFreeResidual=%.12e normOnly=1 status=INFO\\n",csrStart,reference);
+    const double discrepancy=red.norm(r);
+    const double refNorm=red.norm(ax);
+    const double rel=discrepancy/std::max(refNorm,1.e-300);
+    std::printf("NODALS_HYBRID_M3_OPERATOR_PARITY it=1 "
+      "difference=%.12e reference=%.12e relative=%.12e tol=1e-9 status=%s\\n",
+      discrepancy,refNorm,rel,
+      (std::isfinite(rel)&&rel<=1.e-9)?"PASS":"FAIL");
+    if(!std::isfinite(rel)||rel>1.e-9)
+      throw std::runtime_error("Hybrid M3 CSR and matrix-free FGMRES operators disagree");
   }
 
   for(int pass=0;pass<sweeps;++pass){
