@@ -89,6 +89,49 @@ struct PressureDrop {
  }
 };
 }
+// Diagnostic only: true molecular deviatoric shear at the PHYSICAL wall,
+// evaluated from all twelve velocity basis functions (not fitted u_tau).
+// No-slip is checked from actual boundary trace, not constrained coefficients.
+void audit_enrichment_wall(const Mesh&m,const EnrichmentSpace&enrich,
+    const std::vector<double>&u,int it,int rank){
+ if(!enrich.enabled||rank!=0)return;
+ std::vector<double>xn,wn;EnrichmentSpace::gauss(6,xn,wn);
+ double totalA=0,totalTau=0,maxSpeed=0,minTau=1e300,maxTau=0;
+ for(const auto&F:m.faces)if(F.patch==3){
+  const int c=F.cell0;
+  int lf=-1;for(int a=0;a<4;++a)if(m.tets[(size_t)c].face[a]==(&F-&m.faces[0]))lf=a;
+  if(lf<0)throw std::runtime_error("enriched wall audit missing owner face");
+  const Vec3 af=outward_area(m,c,lf);const double ar=std::sqrt(dot(af,af)),invA=1./ar;
+  const Vec3 n=invA*af;
+  int v[3],k=0;for(int a=0;a<4;++a)if(a!=lf)v[k++]=a;
+  for(int i=0;i<6;++i)for(int j=0;j<6;++j){
+   const double a=xn[i],b=xn[j],wt=2.*ar*wn[i]*wn[j]*(1.-a);
+   std::array<double,4> l{};l[v[0]]=a;l[v[1]]=(1.-a)*b;l[v[2]]=(1.-a)*(1.-b);
+   double phi[12];Vec3 gp[12];enrich.shape(c,l,phi,gp);
+   double gu[3][3]{};Vec3 vel{};
+   for(int mode=0;mode<12;++mode){const int ent=enrich.entity(c,mode);if(ent<0)continue;
+     const double x[3]={u[3*(size_t)ent],u[3*(size_t)ent+1],u[3*(size_t)ent+2]};
+     vel.x+=phi[mode]*x[0];vel.y+=phi[mode]*x[1];vel.z+=phi[mode]*x[2];
+     const double g[3]={gp[mode].x,gp[mode].y,gp[mode].z};
+     for(int ii=0;ii<3;++ii)for(int d=0;d<3;++d)gu[ii][d]+=x[ii]*g[d];
+   }
+   maxSpeed=std::max(maxSpeed,std::sqrt(dot(vel,vel)));
+   const double nv[3]={n.x,n.y,n.z};
+   double traction[3]{};
+   for(int ii=0;ii<3;++ii)for(int d=0;d<3;++d)
+     traction[ii]+=(gu[ii][d]+gu[d][ii])*nv[d];
+   const double normal=traction[0]*nv[0]+traction[1]*nv[1]+traction[2]*nv[2];
+   for(int ii=0;ii<3;++ii)traction[ii]-=normal*nv[ii];
+   const double tau=enrich.law.nu*std::sqrt(traction[0]*traction[0]+traction[1]*traction[1]+traction[2]*traction[2]);
+   totalA+=wt;totalTau+=wt*tau;minTau=std::min(minTau,tau);maxTau=std::max(maxTau,tau);
+  }
+ }
+ if(!(totalA>0)||!std::isfinite(totalTau))throw std::runtime_error("invalid enriched wall traction");
+ std::printf("NODALS_CPU_M4_ENRICH_WALL it=%d physicalWallVelocityMax=%.12e meanMolecularTau=%.12e minTau=%.12e maxTau=%.12e wallArea=%.12e shapeUTau2=%.12e status=%s\n",
+   it,maxSpeed,totalTau/totalA,minTau,maxTau,totalA,enrich.law.utau*enrich.law.utau,
+   maxSpeed<1e-10?"PASS":"FAIL");
+ if(maxSpeed>1e-10)throw std::runtime_error("strong-no-slip enriched trace violated");
+}
 int main(int argc,char**argv){
  std::setvbuf(stdout,nullptr,_IONBF,0);
  int provided=0;MPI_Init_thread(&argc,&argv,MPI_THREAD_SINGLE,&provided);
@@ -163,6 +206,7 @@ int main(int argc,char**argv){
    m4_diag(sst.state().k,"k_after_transport",it,rank);
    const auto wRes=sst.advance_omega(u,mom.wall_fit());
    m4_diag(sst.state().omega,"omega_after_transport",it,rank);
+   if(enrich.enabled && (it==1 || it%cfg.printEvery==0))audit_enrichment_wall(m,enrich,u,it,rank);
    const double nut=sst.mean_nut(u);
    if(!std::isfinite(nut))throw std::runtime_error("M4_DIAG_NONFINITE mean_nut at it="+std::to_string(it));
    double deltaK=0,baseK=0,deltaW=0,baseW=0;
@@ -183,6 +227,11 @@ int main(int argc,char**argv){
    lastDropAverage=dMean;
    lastDropRangeRel=(double)dropWindow.size()==(double)cfg.pressureDropWindow?
        (*bounds.second-*bounds.first)/std::max(std::abs(dMean),1e-30):std::numeric_limits<double>::infinity();
+   if(enrich.enabled&&rank==0&&(it==1||it%cfg.printEvery==0)){
+     double diff=0,scale=0;for(size_t k=0;k<u.size();++k){const double d=u[k]-oldU[k];diff+=d*d;scale+=u[k]*u[k];}
+     std::printf("NODALS_CPU_M4_ENRICH_UPDATE it=%d velocityUpdateRel=%.12e normVelocity=%.12e totalDofs=%zu status=MEASURED\n",
+       it,std::sqrt(diff/std::max(scale,1e-300)),std::sqrt(scale),u.size());
+   }
    const double uRel=mom0>0?mom1/mom0:0.0;
    const double pRel=pr.r0>0?pr.rFinal/pr.r0:0.0;
    const double continuityRel=post/std::abs(pressureDrop.fluxIn);
