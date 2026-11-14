@@ -17,7 +17,9 @@ RUN_ROOT="$HOME/NodalS_SST_LOCAL_RUNS/CPU_M4_K_EQ_AB_20261114"
 # Optional diagnostic UR_U override. Unset preserves original case exactly.
 UR_TAG="base"
 if [[ -n "${M4_DIAG_UR_U:-}" ]]; then UR_TAG="uru${M4_DIAG_UR_U}"; fi
-RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_$(date +%Y%m%d_%H%M%S)"
+FIX_TAG="dynamic"
+if [[ -n "${M4_DIAG_FIXED_UTAU:-}" ]]; then FIX_TAG="targetutau${M4_DIAG_FIXED_UTAU}"; fi
+RUN="$RUN_ROOT/"$MODE"_"$STEPS"_"$UR_TAG"_"$FIX_TAG"_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN"
 CASE="$RUN/experiment.case"
 python3 - "$BASE_CASE" "$CASE" "$MODE" "$STEPS" <<'PY'
@@ -36,6 +38,12 @@ if "M4_DIAG_UR_U" in os.environ:
         raise SystemExit("M4_DIAG_UR_U must be in (0,1]")
     put("simple","ur_u",format(relax,".12g"))
     print("K_EQ_UR_AUDIT ur_u=%.9g override=1"%relax)
+if "M4_DIAG_FIXED_UTAU" in os.environ:
+    target_utau=float(os.environ["M4_DIAG_FIXED_UTAU"])
+    if not(math.isfinite(target_utau) and target_utau>0):
+        raise SystemExit("M4_DIAG_FIXED_UTAU must be positive")
+    put("sst","debug_fixed_target_utau",format(target_utau,".12g"))
+    print("K_EQ_WALL_TARGET_DIAGNOSTIC mode=FIXED targetUTau=%.9g"%target_utau)
 put("solver.u","method","fgmres")
 put("solver.u","rtol","1e-5")
 put("solver.u","atol","1e-10")
