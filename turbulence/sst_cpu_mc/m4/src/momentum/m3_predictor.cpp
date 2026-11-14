@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include "spalding_core.hpp"
 #include "../transport/sst_transport.hpp"
+#include "../enrichment/enrichment_momentum.hpp"
 namespace nodals::cpu_mc::m3 {
 namespace {
 const double Q0[12]={.063089014491502,.063089014491502,.873821971016996,.249286745170910,.249286745170910,.501426509658180,.053145049844816,.053145049844816,.310352451033785,.310352451033785,.636502499121399,.636502499121399};
@@ -30,12 +31,17 @@ void face_basis(const Geom&geom,int lf,int q,double ph[8],G&gr){
  std::array<double,4> l{};int f=0;for(int i=0;i<4;++i)if(i!=lf){l[i]=(f==0?Q0[q]:(f==1?Q1[q]:Q2[q]));++f;}
  shape(geom,l,ph,gr);
 }
-void convection(Element24&K,const Geom&geom,const std::vector<double>&lag,const std::array<int,8>&entity){
+void convection(Element24&K,const Geom&geom,const std::vector<double>&lag,const std::array<int,8>&entity,
+  const nodals::cpu_mc::m4::EnrichmentSpace*enrich=nullptr,int cell=-1){
  for(int ir=0;ir<5;++ir)for(int is=0;is<5;++is)for(int it=0;it<5;++it){
   const double r=X5[ir],s=X5[is],t=X5[it],omr=1-r,oms=1-s;
   const double wt=W5[ir]*W5[is]*W5[it]*omr*omr*oms*geom.det;
   const std::array<double,4> l={omr*oms*(1-t),r,omr*s,omr*oms*t};double ph[8];G gr{};shape(geom,l,ph,gr);
   double carrier[3]={};for(int z=0;z<8;++z)for(int d=0;d<3;++d)carrier[d]+=ph[z]*lag[3*entity[z]+d];
+   if(enrich&&enrich->enabled){
+     const Vec3 whole=enrich->velocity(cell,l,lag);
+     carrier[0]=whole.x;carrier[1]=whole.y;carrier[2]=whole.z;
+   }
   for(int a=0;a<8;++a)for(int b=0;b<8;++b){const double v=wt*ph[a]*(carrier[0]*gr[b].x+carrier[1]*gr[b].y+carrier[2]*gr[b].z);
     for(int d=0;d<3;++d)K[3*a+d][3*b+d]+=v;
   }
@@ -95,13 +101,17 @@ void constrain_cell(Element24&K,std::array<double,24>&b,const Mesh&m,int c,bool 
 }
 M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
                          const CaseConfig&config,int rank,const std::vector<double>&lag,
- const std::vector<double>*k,const std::vector<double>*omega,const std::vector<double>*wallDistance)
-:mesh_(m),own_(o),wall_(w),case_(config),lag_(lag),rank_(rank),nEntities_((int)m.points.size()+(int)m.faces.size()),
- k_(k),omega_(omega),wallDistance_(wallDistance){
+ const std::vector<double>*k,const std::vector<double>*omega,const std::vector<double>*wallDistance,
+ const nodals::cpu_mc::m4::EnrichmentSpace*enrich)
+:mesh_(m),own_(o),wall_(w),case_(config),lag_(lag),rank_(rank),nEntities_((enrich&&enrich->enabled)?enrich->nent():(int)m.points.size()+(int)m.faces.size()),
+ k_(k),omega_(omega),wallDistance_(wallDistance),enrich_(enrich){
  const int nv=(int)m.points.size();
- wallFit_=sample_spalding_faces(m,o,rank,config,lag);
+ wallFit_=sample_spalding_faces(m,o,rank,config,lag,enrich);
  ownerOfEntity_.resize(nEntities_);
- for(int e=0;e<nEntities_;++e)ownerOfEntity_[e]=(e<nv?o.vertex[e]:o.face[e-nv]);
+ const int nbase=nv+(int)m.faces.size();
+ for(int e=0;e<nbase;++e)ownerOfEntity_[e]=(e<nv?o.vertex[e]:o.face[e-nv]);
+ if(enrich_&&enrich_->enabled)for(int v=0;v<nv;++v)if(enrich_->index[(size_t)v]>=0)
+  ownerOfEntity_[(size_t)nbase+enrich_->index[(size_t)v]]=o.vertex[(size_t)v];
  // M4_WALL_BF3_SWEEP_PROJECTION_V1: GPU m3_block_colour projects every
  // wall-face bubble RHS and local update into the tangential plane.
  // Q at entry/exit alone is not equivalent to this per-sweep restriction.
@@ -128,18 +138,28 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
  ownedCells_=(std::size_t)o.countCell[rank];
  for(int c=0;c<(int)m.tets.size();++c){
   const auto&t=m.tets[c];std::array<int,8>ent{};
+  int augmented[12];for(int a=0;a<8;++a)augmented[a]=a<4?t.v[a]:nv+t.face[a-4];
+  for(int a=8;a<12;++a)augmented[a]=(enrich_&&enrich_->enabled)?enrich_->entity(c,a):-1;
   bool relevant=false;
   for(int a=0;a<8;++a){ent[a]=a<4?t.v[a]:nv+t.face[a-4];
     if(ownerOfEntity_[ent[a]]==rank)relevant=true;}
+  if(enrich_&&enrich_->enabled)for(int a=8;a<12;++a)
+   if(augmented[a]>=0&&ownerOfEntity_[augmented[a]]==rank_)relevant=true;
   if(!relevant)continue;
   ++incidentCells_;
   const Geom geom=geometry(m,c);
   Element24 K=deviatoric_element(m,c,config.nu);
   if(k_&&omega_&&wallDistance_)
-    nodals::cpu_mc::m4::momentum_turbulent_deviatoric(K,m,c,lag_,*k_,*omega_,*wallDistance_,config);
+    nodals::cpu_mc::m4::momentum_turbulent_deviatoric(K,m,c,lag_,*k_,*omega_,*wallDistance_,config,enrich_);
 
   Element24 Kpenalty{}; // only Nitsche normal penalty, for GPU penalty-free rAU
-  convection(K,geom,lag_,ent);
+  convection(K,geom,lag_,ent,enrich_,c);
+  nodals::cpu_mc::m4::K36 Kextra{};
+  nodals::cpu_mc::m4::RHS36 Bextra{};
+  if(enrich_&&enrich_->enabled){
+   if(!(k_&&omega_&&wallDistance_))throw std::runtime_error("enriched momentum requires SST fields");
+   nodals::cpu_mc::m4::augment_momentum(*enrich_,m,c,lag_,*k_,*omega_,*wallDistance_,config,Kextra,Bextra);
+  }
   std::array<double,24>br{};
   // Exact 12-point affine boundary quadrature, with DG vector prescribed inlet.
   for(int lf=0;lf<4;++lf){
