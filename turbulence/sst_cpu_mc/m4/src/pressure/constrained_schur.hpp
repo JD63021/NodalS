@@ -3,6 +3,7 @@
 #include "../parallel/rcb.hpp"
 #include "../operators/p1bf3_p0.hpp"
 #include "../wall/bf3_flux.hpp"
+#include "../enrichment/enrichment_space.hpp"
 #include <array>
 #include <memory>
 #include <vector>
@@ -15,8 +16,9 @@ class PressureAMG;
 // The explicit sparse S is assembled only once per frozen Picard momentum
 // metric; whenever the momentum row-L1 metric changes, create a new Schur.
 class Schur {
- struct Row {std::array<int,8> entity{};std::array<Vec3,8> physical{},reduced{};};
+ struct Row {std::array<int,12> entity{};std::array<Vec3,12> physical{},reduced{};};
  const Mesh& mesh_; const Ownership& own_; const BF3Flux& wall_;
+ const nodals::cpu_mc::m4::EnrichmentSpace* enrich_=nullptr;
  int rank_;
  std::vector<double> inv_,source_,diag_;
  std::vector<Row> rows_;
@@ -25,7 +27,9 @@ class Schur {
  std::vector<double> val_;
  std::unique_ptr<PressureAMG> amg_;
 public:
- Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector<double> inverse,std::array<double,3> inletVelocity);
+ Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector<double> inverse,
+       std::array<double,3> inletVelocity,
+       const nodals::cpu_mc::m4::EnrichmentSpace*enrich=nullptr);
  ~Schur();
  void B(const std::vector<double>&physicalVelocity,std::vector<double>&pressure)const;
  void BT(const std::vector<double>&pressure,std::vector<double>&velocity)const;
