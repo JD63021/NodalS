@@ -62,6 +62,7 @@ def main():
         env.update({
             'SST22_TRACTION_MODEL':'legacy_axial',
             'SST22D4_NITSCHE_ENABLE':'0',
+            'SST22D4D_MOM_MODE':'segregated',
             'SST22D4I_BF3':'0',
             'SST22D4I3A_SCHUR':'0',
             'NODALS_F1B_FROZEN_WALL':'0',
