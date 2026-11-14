@@ -16,6 +16,8 @@ struct EnrichmentSpace {
   const Mesh& mesh;
   std::vector<double> distance;
   std::vector<double> nodalW; // evaluate Spalding inverse at vertices once
+  mutable std::vector<std::array<Vec3,4>> faceFluxCache;
+  mutable std::vector<unsigned char> faceFluxReady;
   std::vector<int> index;
   std::vector<unsigned char> fixed;
   int ne=0, nr=0;
@@ -42,6 +44,10 @@ struct EnrichmentSpace {
       if(wallVertices[i] || y[i]*law.utau/law.nu<=cfg.enrichCutoff)index[i]=nr++;
     }
     fixed.resize((std::size_t)ne+nr,0);
+    // Frozen Spalding shape: pressure B and inlet flux coefficients are
+    // geometric constants, so cache each tetrahedral face integral once.
+    faceFluxCache.resize(m.tets.size()*4);
+    faceFluxReady.assign(m.tets.size()*4,0);
     if(nr==0)throw std::runtime_error("enrichment selected zero vertices");
   }
   int nent()const{return ne+nr;}
@@ -122,6 +128,8 @@ struct EnrichmentSpace {
   void face_flux(int c,int lf,std::array<Vec3,4>&B,int order=12)const {
     B={};
     if(!enabled)return;
+    const size_t key=4*(size_t)c+(size_t)lf;
+    if(order==12 && faceFluxReady[key]){B=faceFluxCache[key];return;}
     const auto&t=mesh.tets[(size_t)c];
     const Vec3 ar=outward_area(mesh,c,lf); // vector with magnitude Area
     std::vector<double>x,w;gauss(order,x,w);
@@ -135,6 +143,7 @@ struct EnrichmentSpace {
       for(int m=0;m<4;++m)if(entity(c,8+m)>=0)
         B[m]=B[m]+(wt*ph[8+m])*ar;
     }
+    if(order==12){faceFluxCache[key]=B;faceFluxReady[key]=1;}
   }
   void divergence(int c,std::array<Vec3,4>&B)const{
     B={};if(!enabled)return;
