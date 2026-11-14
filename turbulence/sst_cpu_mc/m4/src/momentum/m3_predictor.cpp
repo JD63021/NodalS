@@ -185,7 +185,7 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
       wallFit_.qBeta[(size_t)12*t.face[lf]+(size_t)q]:0.0;
     // GPU full SST Nitsche and DG inlet use local nu_eff at face quadrature.
     const double nuEff=(k_&&omega_&&wallDistance_)?
-      config.nu+nodals::cpu_mc::m4::sst_nut_at_point(m,c,
+      config.nu+config.momentumNutScale*nodals::cpu_mc::m4::sst_nut_at_point(m,c,
         [&](){std::array<double,4> l{};int n=0;for(int a=0;a<4;++a)if(a!=lf){
           l[a]=n==0?Q0[q]:(n==1?Q1[q]:Q2[q]);++n;}
           return l;}(),lag_,*k_,*omega_,*wallDistance_,config,enrich_):config.nu;
