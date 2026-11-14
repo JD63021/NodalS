@@ -1,6 +1,6 @@
 # 99,216 cells (3,744 HEX wall + 95,472 TET core), D=0.889m, L=50D
-# Mesh is provided separately in downloadable local experiment tar.gz:
-#   cases/...case and mesh/HXT1_mesh.bin in sibling folders.
+# Mesh is generated on your workstation by this branch's RUN.sh prepare
+# as WORK/mesh/HXT1_mesh.bin. The runner copies this case to WORK/cases.
 # A local source patch is needed; main's puretet runner cannot run this case.
 [mesh]
 format = hxt1
