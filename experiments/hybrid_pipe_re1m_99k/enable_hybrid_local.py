@@ -87,9 +87,30 @@ def main():
         native.extend(['--wall-sample-fraction','0.5'])
     if cp.has_section('native'):
         for k,v in cp.items('native'):""")
-    replace_one(cu,
-        "__global__ void sst_omega_wall_hex(",
-        "// Stage41 pure-log switch is defined later in the existing wall module.\nextern __device__ __constant__ int stage41_sample_log;\n__global__ void sst_omega_wall_hex(")
+    # CUDA has one *definition* of the global constant.  The old experiment
+    # mistakenly inserted an extern before the later in-header definition;
+    # NVCC treats that combination as a duplicate.  Repair existing copies too.
+    wall = app/"source/puretet_profile5_eq5_hxt5b/modules/wall/of_auto_point3_kernel.inc"
+    old_decl = (
+        "// Stage41 pure-log switch is defined later in the existing wall module.\\n"
+        "extern __device__ __constant__ int stage41_sample_log;\\n"
+    ).replace("\\\\n", "\\n")
+    new_def = (
+        "// Shared HEX/TET Stage41 switch, exactly one CUDA definition.\\n"
+        "__device__ __constant__ int stage41_sample_log=0;\\n"
+    ).replace("\\\\n", "\\n")
+    cs = cu.read_text()
+    if old_decl in cs:
+        cu.write_text(cs.replace(old_decl, new_def, 1))
+        print("REPAIRED_EARLIER_CUDA_DECLARATION", cu)
+    elif new_def not in cs:
+        replace_one(cu,"__global__ void sst_omega_wall_hex(",
+                    new_def+"__global__ void sst_omega_wall_hex(")
+    else:
+        print("CUDA_SYMBOL_ALREADY_CORRECT",cu)
+    replace_one(wall,
+        "__device__ __constant__ int stage41_sample_log=0;",
+        "// stage41_sample_log defined once in hxt5c_sst_g1.cuh for HEX and TET.")
     replace_one(cu,
         "target=oa.omegaTarget;}",
         "target=stage41_sample_log?oa.omegaLog:oa.omegaTarget;}")
