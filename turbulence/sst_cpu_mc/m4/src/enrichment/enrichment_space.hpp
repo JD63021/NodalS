@@ -89,6 +89,52 @@ struct EnrichmentSpace {
       grad[8+j]={e.dE[j][0],e.dE[j][1],e.dE[j][2]};
     }
   }
+  // Gauss-Legendre rule on [0,1]. Non-polynomial wall-law shapes need
+  // increased face/volume quadrature, never a polynomial-only low-order rule.
+  static void gauss(int n,std::vector<double>&x,std::vector<double>&w){
+    x.resize(n);w.resize(n);
+    const double pi=3.1415926535897932384626433832795;
+    for(int i=0;i<(n+1)/2;++i){
+      double z=std::cos(pi*(i+0.75)/(n+0.5)),dp=0;
+      for(int it=0;it<60;++it){
+        double p0=1,p1=z;
+        for(int k=2;k<=n;++k){double t=((2*k-1)*z*p1-(k-1)*p0)/k;p0=p1;p1=t;}
+        dp=n*(z*p1-p0)/(z*z-1);
+        double dz=p1/dp;z-=dz;
+        if(std::abs(dz)<1e-15)break;
+      }
+      const double weight=1./((1.-z*z)*dp*dp);
+      x[i]=(1-z)*.5;x[n-1-i]=(1+z)*.5;
+      w[i]=weight;w[n-1-i]=weight;
+    }
+  }
+  // Exact weak pressure coupling for each enriched mode is the elementwise
+  // flux integral ∫_∂T E_i n dS (not an assumed zero "bubble" coupling).
+  // Each triangle uses a high-order Duffy rule. Coordinates on a shared face
+  // are consistent because the face's sorted vertex IDs are used by both tets.
+  void face_flux(int c,int lf,std::array<Vec3,4>&B,int order=12)const {
+    B={};
+    if(!enabled)return;
+    const auto&t=mesh.tets[(size_t)c];
+    const Vec3 ar=outward_area(mesh,c,lf); // vector with magnitude Area
+    std::vector<double>x,w;gauss(order,x,w);
+    int js[3],k=0;
+    for(int j=0;j<4;++j)if(j!=lf)js[k++]=j;
+    for(int i=0;i<order;++i)for(int j=0;j<order;++j){
+      const double a=x[i],b=x[j];std::array<double,4> l{};
+      l[js[0]]=a;l[js[1]]=(1-a)*b;l[js[2]]=(1-a)*(1-b);
+      double ph[12];Vec3 gp[12];shape(c,l,ph,gp);
+      const double wt=2.*(1-a)*w[i]*w[j];
+      for(int m=0;m<4;++m)if(entity(c,8+m)>=0)
+        B[m]=B[m]+(wt*ph[8+m])*ar;
+    }
+  }
+  void divergence(int c,std::array<Vec3,4>&B)const{
+    B={};if(!enabled)return;
+    for(int f=0;f<4;++f){std::array<Vec3,4> b{};face_flux(c,f,b);
+      for(int m=0;m<4;++m)B[m]=B[m]+b[m];
+    }
+  }
   Vec3 velocity(int cell,const std::array<double,4>&l,const std::vector<double>&u)const {
     double ph[12];Vec3 gp[12];shape(cell,l,ph,gp);
     if((int)u.size()!=3*nent())throw std::runtime_error("enrichment velocity length mismatch");
