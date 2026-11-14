@@ -37,8 +37,16 @@ fi
 # This is the only mesh generation; case and VTUs live in an independent
 # folder, preserving the divergent y+300 run for numerical comparison.
 if [[ ! -s "$MESH" ]];then
-  python3 "$HERE/generate_hybrid_pipe.py" \
-    --outdir "$WORK/mesh" --sample-yplus 150 --target-cells 99216
+  OLD_HXT0="${NODALS_OLD_HXT0:-$HOME/NODALS_HYBRID_RE1M_99K_RUN/mesh/HXT0.npz}"
+  if [[ -f "$OLD_HXT0" && -f "$(dirname "$OLD_HXT0")/pipe_geometry.json" ]];then
+    echo "Reusing exact y+300 99,216-cell topology: $OLD_HXT0"
+    python3 "$HERE/rescale_hybrid_wall_layer.py" \
+      --input "$OLD_HXT0" --outdir "$WORK/mesh" --target-yplus 150
+  else
+    echo "Previous HXT0 not found; generating fresh ~99k HEX/TET mesh"
+    python3 "$HERE/generate_hybrid_pipe.py" \
+      --outdir "$WORK/mesh" --sample-yplus 150 --target-cells 99216
+  fi
   python3 "$APP/tools/prepare_hxt1.py" \
     --input "$WORK/mesh/HXT0.npz" --outdir "$WORK/mesh"
 fi
