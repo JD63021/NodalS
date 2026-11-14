@@ -42,7 +42,9 @@ samples = 1
 spalding_sample_scale = 0.5
 distances = 0.001, 0.003, 0.00699, 0.010, 0.013
 zero_limit = true
-nitsche_gamma = 1e-6
+# Hybrid HEX/TET interface Nitsche gamma (NOT the omega-wall gamma).
+# Historical hybrid default: 50; 1e-6 was effectively unstabilized.
+nitsche_gamma = 50
 face_spalding = false
 frozen_wall_cache = false
 shared_wall_state = true
