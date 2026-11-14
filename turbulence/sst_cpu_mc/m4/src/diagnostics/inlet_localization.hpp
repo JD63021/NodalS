@@ -123,18 +123,22 @@ inline void print_inlet_localization(const m2::Mesh&m,const EnrichmentSpace&spac
    ++count[band];
   }
  }
- double worstWallUTau=-1,worstWallAxial=0,worstWallDistance=0;
+ double worstWallUTau=-1,worstWallAxial=0;
+ double wallUSum[NZ]{},wallUMax[NZ]{},wallUCount[NZ]{};
  int worstWallFace=-1,worstWallQ=-1;
  for(size_t i=0;i<m.faces.size();++i)if(m.faces[i].patch==3){
   const auto&f=m.faces[i];
   m2::Vec3 center{};
   for(int j=0;j<3;++j)center=center+(1./3.)*m.points[(size_t)f.v[j]];
   const double x=dot(center,axis)-minAx;
+  int zone=NZ-1;
+  for(int j=0;j<NZ;++j)if(x<=cuts[j]*D){zone=j;break;}
   for(int qid=0;qid<12;++qid){
    const double ut=fit.qUTau[12*i+(size_t)qid];
+   wallUSum[zone]+=ut;wallUCount[zone]+=1.;
+   wallUMax[zone]=std::max(wallUMax[zone],ut);
    if(ut>worstWallUTau){
     worstWallUTau=ut;worstWallAxial=x;
-    worstWallDistance=std::min(x,length-x);
     worstWallFace=(int)i;worstWallQ=qid;
    }
   }
@@ -150,6 +154,10 @@ inline void print_inlet_localization(const m2::Mesh&m,const EnrichmentSpace&spac
    std::sqrt(squareAxial[j]/area[j])/speed,
    actualAxial[j]/area[j]/speed,minAxial[j]/speed,maxAxial[j]/speed,
    prescribedFlux[j],computedFlux[j],count[j]);
+ }
+ for(int j=0;j<NZ;++j)if(wallUCount[j]>0){
+  std::printf("NODALS_CPU_M4_WALL_FIT_BIN it=%d zone=%d xUpperD=%.9g meanLaggedUTau=%.9g maxLaggedUTau=%.9g fitSamples=%.0f status=DIAGNOSTIC\n",
+   it,j,cuts[j],wallUSum[j]/wallUCount[j],wallUMax[j],wallUCount[j]);
  }
  for(int j=0;j<NZ;++j)if(bins[j].nsamples){
   const auto&b=bins[j];
