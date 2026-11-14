@@ -75,6 +75,15 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
    c.omegaPenaltyLength=real("omega_wall.penalty_length");
  if(!(c.omegaPenaltyLength>0))c.omegaPenaltyLength=4.0*c.spaldingY3/3.0;
  c.omegaY3=4.4084029504620439e-4*(c.diameter/0.004)*c.omegaScale;
+ c.kWallMethod=a.count("k_wall.method")?a.at("k_wall.method"):"no_flux";
+ c.kWallGamma=a.count("k_wall.penalty_gamma")?real("k_wall.penalty_gamma"):1000.0;
+ c.kWallSampleIndex=a.count("k_wall.sample_index")?intval("k_wall.sample_index"):3;
+ c.kWallPenaltyLength=a.count("k_wall.penalty_length")?real("k_wall.penalty_length"):c.omegaPenaltyLength;
+ if(c.kWallMethod!="no_flux"&&c.kWallMethod!="equilibrium_spalding")
+   throw std::runtime_error("k_wall.method must be no_flux or equilibrium_spalding");
+ if(c.kWallMethod=="equilibrium_spalding"&&
+    (c.kWallSampleIndex!=3||c.omegaIndex!=3||c.omegaStage41=="trace_log"))
+   throw std::runtime_error("equilibrium_spalding requires shared offwall omega sample_point index=3");
  c.maxOuter=intval("simple.max_iterations");c.simpleTol=real("simple.simple_tol");
  c.continuityAtol=real("simple.continuity_atol");c.continuityRtol=a.count("simple.continuity_rtol")?real("simple.continuity_rtol"):1e-6;
  c.plateauTol=real("simple.plateau_tol");
@@ -108,7 +117,9 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
  if(!(c.intensity>0&&c.lengthRatio>0&&c.urK>0&&c.urK<=1&&c.urOmega>0&&c.urOmega<=1&&
       c.kSweeps>0&&c.omegaSweeps>0&&c.maxOuter>0&&c.omegaScale>0&&c.omegaTraceGamma>=10&&
       c.omegaPointGamma>=1&&c.omegaPointGamma<=1e8&&
-      c.omegaPenaltyLength>0&&c.omegaOfReBlend>0))
+      c.omegaPenaltyLength>0&&c.omegaOfReBlend>0&&
+      std::isfinite(c.kWallGamma)&&c.kWallGamma>=1&&c.kWallGamma<=1e8&&
+      std::isfinite(c.kWallPenaltyLength)&&c.kWallPenaltyLength>0))
    throw std::runtime_error("invalid SST config values");
  if(!(c.pRtol>=0&&c.pAtol>=0&&(c.pRtol>0||c.pAtol>0)&&c.continuityAtol>=0&&c.continuityRtol>=0&&
       c.pressureDropWindow>=2&&c.pressureDropMinIterations>=c.pressureDropWindow&&c.pressureDropTol>0&&c.pressureDropTol<1))
