@@ -10,30 +10,47 @@
           HXT1_CUDA(cudaMemcpy(d_s22d4i2Old.p+nv,d_u1.p,nbyte,cudaMemcpyDeviceToDevice));
           HXT1_CUDA(cudaMemcpy(d_s22d4i2Old.p+2*(std::size_t)nv,d_u2.p,nbyte,cudaMemcpyDeviceToDevice));
         }
-        if(optionAShearActive){
-          HXT1_CUDA(cudaMemset(d_optionANu.p,0,(std::size_t)M.h.ntet*sizeof(T)));
+        if(optionAShearActive || optionAV3Active){
+          if(optionAShearActive)
+            HXT1_CUDA(cudaMemset(d_optionANu.p,0,(std::size_t)M.h.ntet*sizeof(T)));
           HXT1_CUDA(cudaMemset(d_optionAStats.p,0,3*sizeof(double)));
           HXT1_CUDA(cudaMemset(d_bad.p,0,sizeof(unsigned long long)));
+          // Exactly one F2 face-level five-point fit per wall face.
           hxt5d::f2_face_averaged_spalding<<<(BH.wallT.size()+127)/128,128>>>(
               sstG1.tetWallPlans,(int)BH.wallT.size(),sstG1.tetWallQuads,
               sstG1.profileTetMatchPoints,d_tv.p,
               d_u0.p,d_u1.p,d_u2.p,nu,d_f2FaceFit.p,d_bad.p);
           HXT1_CUDA(cudaGetLastError());
-          hxt5d::option_a_build_wall_nu<<<(BH.wallT.size()+127)/128,128>>>(
+          if(optionAV3Active){
+            hxt5d::option_a_v3_build<<<BH.wallT.size(),64>>>(
+              sstG1.tetWallPlans,(int)BH.wallT.size(),sstG1.tetWallQuads,
+              d_pts.p,d_tc.p,d_tv.p,d_tg.p,
+              d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
+              d_f2FaceFit.p,R,nu,sstG1.kFloor,sstG1.omegaFloor,
+              d_optionAV3Beta.p,d_optionAV3Alpha.p,d_optionAV3C.p,
+              d_optionAStats.p,d_bad.p);
+          }else{
+            hxt5d::option_a_build_wall_nu<<<(BH.wallT.size()+127)/128,128>>>(
               sstG1.tetWallPlans,(int)BH.wallT.size(),
               d_tv.p,d_tg.p,d_u0.p,d_u1.p,d_u2.p,
               d_f2FaceFit.p,d_optionANu.p,nu,d_optionAStats.p,d_bad.p);
+          }
           HXT1_CUDA(cudaGetLastError());
           HXT1_CUDA(cudaDeviceSynchronize());
           unsigned long long wallBad=0;
           HXT1_CUDA(cudaMemcpy(&wallBad,d_bad.p,sizeof(wallBad),cudaMemcpyDeviceToHost));
-          if(wallBad)throw std::runtime_error("OPTION_A invalid Spalding/normal-gradient wall face count="+std::to_string(wallBad));
+          if(wallBad)
+            throw std::runtime_error("OPTION_A invalid frozen wall fit/operator faces="+std::to_string(wallBad));
           if(git==1 || git%sstG2PrintEvery==0){
             double st[3]={};
             HXT1_CUDA(cudaMemcpy(st,d_optionAStats.p,sizeof(st),cudaMemcpyDeviceToHost));
             if(!(st[0]>0.))throw std::runtime_error("OPTION_A zero sampled wall area");
-            std::printf("NODALS_OPTION_A_WALL it=%d wallFaces=%zu wallArea=%.10e meanUtau2=%.10e meanNuWallOverNu=%.10e clipMolecular=ON model=REPLACE_CELL_NU status=PASS\n",
-              git,BH.wallT.size(),st[0],st[1]/st[0],st[2]/st[0]);
+            if(optionAV3Active)
+              std::printf("NODALS_OPTION_A_V3_WALL it=%d faces=%zu area=%.10e meanUtau2=%.10e meanBeta=%.10e model=PROJECTED_MODE_REPLACEMENT status=PASS\n",
+                git,BH.wallT.size(),st[0],st[1]/st[0],st[2]/st[0]);
+            else
+              std::printf("NODALS_OPTION_A_WALL it=%d wallFaces=%zu wallArea=%.10e meanUtau2=%.10e meanNuWallOverNu=%.10e model=SHEAR_REPLACEMENT_V2 status=PASS\n",
+                git,BH.wallT.size(),st[0],st[1]/st[0],st[2]/st[0]);
           }
         }
         hxt5d::assemble_momentum_sst(M,d_pts,d_hc,d_tc,d_hv,d_tv,d_tg,d_ip,A,d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,d_turb,d_diagRTurb,R,nu,gamma,sstG1,TS.stats,d_bad,&d_sstDevRhs0,&d_sstDevRhs1,&d_sstDevRhs2,&d_sstInterfaceCache
@@ -182,7 +199,7 @@
           // F2: exactly ONE nonlinear Spalding fit per physical wall face.
           // All q-dependent nu_eff, normal/BF3 terms and omega equation remain
           // unchanged. The face coefficient is frozen for this SIMPLE step.
-          if(f2FaceSpalding && !optionAShearActive){
+          if(f2FaceSpalding && !optionAShearActive && !optionAV3Active){
             hxt5d::f2_face_averaged_spalding<<<(BH.wallT.size()+127)/128,128>>>(
               sstG1.tetWallPlans,(int)BH.wallT.size(),sstG1.tetWallQuads,
               sstG1.profileTetMatchPoints,d_tv.p,
