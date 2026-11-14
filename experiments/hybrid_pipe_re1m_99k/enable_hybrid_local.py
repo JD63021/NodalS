@@ -54,7 +54,7 @@ def main():
             raise ValueError('hybrid SUPG not enabled: select supg.momentum=false')
         if samples!=1 or omega_sample!=3 or auto_enabled:
             raise ValueError('hybrid one-point run needs samples=1, omega index=3, initial_distance=legacy_scale')
-        if couette_target not in ('sample_log','of_auto'):
+        if couette_target not in ('sample_log','of_auto','trace_log'):
             raise ValueError('hybrid HEX wall omega supports stage41_mode=sample_log or of_auto')
         if flag(cp,'adaptive_sampling','enabled',False):
             raise ValueError('hybrid HEX single-layer runs use fixed midpoint sampling, no adaptive tet rays')
