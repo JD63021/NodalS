@@ -148,15 +148,22 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
   if(!relevant)continue;
   ++incidentCells_;
   const Geom geom=geometry(m,c);
-  Element24 K=deviatoric_element(m,c,config.nu);
-  if(k_&&omega_&&wallDistance_)
+  bool enrichedCell=false;
+  if(enrich_&&enrich_->enabled)for(int j=0;j<4;++j)
+     enrichedCell|=enrich_->index[(size_t)t.v[j]]>=0;
+  Element24 K{};
+  if(!enrichedCell){
+   K=deviatoric_element(m,c,config.nu);
+   if(k_&&omega_&&wallDistance_)
     nodals::cpu_mc::m4::momentum_turbulent_deviatoric(K,m,c,lag_,*k_,*omega_,*wallDistance_,config,enrich_);
-
+   convection(K,geom,lag_,ent,enrich_,c);
+  }
+  // For enriched cells, the complete PP/PE/EP/EE volume block is integrated
+  // together with the same quadrature and the same frozen nu+nut.
   Element24 Kpenalty{}; // only Nitsche normal penalty, for GPU penalty-free rAU
-  convection(K,geom,lag_,ent,enrich_,c);
   nodals::cpu_mc::m4::K36 Kextra{};
   nodals::cpu_mc::m4::RHS36 Bextra{};
-  if(enrich_&&enrich_->enabled){
+  if(enrichedCell){
    if(!(k_&&omega_&&wallDistance_))throw std::runtime_error("enriched momentum requires SST fields");
    nodals::cpu_mc::m4::augment_momentum(*enrich_,m,c,lag_,*k_,*omega_,*wallDistance_,config,Kextra,Bextra);
   }
