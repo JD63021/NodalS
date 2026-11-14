@@ -170,8 +170,9 @@ SSTTransport::SSTTransport(const Mesh&m,const Ownership&own,const CaseConfig&cfg
 // The scalar matrices are assembled from the original enriched P1+BF3 FEM
 // test/trial basis; only 4 vertex rows participate in the Q1 linear solve.
 // BF3 entries retain their contribution to the row-L1 fixed-point damping.
-ScalarReport SSTTransport::advance_k(const std::vector<double>&velocity){
- return advance_impl(false,velocity,nullptr);
+ScalarReport SSTTransport::advance_k(const std::vector<double>&velocity,const nodals::cpu_mc::m3::WallFaceFit&fit){
+ ++kAdvanceCount_;
+ return advance_impl(false,velocity,&fit);
 }
 ScalarReport SSTTransport::advance_omega(const std::vector<double>&velocity,const nodals::cpu_mc::m3::WallFaceFit&fit){
  ++omegaAdvanceCount_;
@@ -350,6 +351,40 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
        cfg_.omegaStage41.c_str(),gamma,ell,cfg_.omegaY3,nsamples,
        sumTarget/sumA,smallestTarget,largestTarget,sumViscous/sumA,sumRey/sumA);
  }
+ // Optional offwall equilibrium k at exactly the SAME third ray sample as omega.
+ // One shared Spalding uTau per face quadrature point; no change to natural
+ // no-flux k at the wall when disabled. Only masked P1 test rows are solved.
+ if(!omegaEq && cfg_.kWallMethod=="equilibrium_spalding"){
+  if(cfg_.expectRanks!=1)
+   throw std::runtime_error("offwall k equilibrium currently requires exactly one MPI rank");
+  if(!fit||fit->qUTau.size()!=12*m_.faces.size())
+   throw std::runtime_error("offwall k requires shared Spalding qUTau");
+  const double ell=cfg_.kWallPenaltyLength,gamma=cfg_.kWallGamma;
+  for(const RayPoint&r:wallPoints_){
+   const auto&t=m_.tets[(size_t)r.hitCell];
+   const Geo g=geometry(m_,r.hitCell);
+   double ph[8];Vec8 gp{};shape(g,r.bary,ph,gp);
+   const Carrier a=carrier(m_,r.hitCell,r.bary,gp,ph,u,k,omega,distance_,enrich_);
+   const auto ss=physics(a,cfg_);
+   const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
+   const double target=std::max(cfg_.kFloor,ut*ut/std::sqrt(0.09));
+   const double nuEff=cfg_.nu+ss.sigmaK*ss.nut;
+   const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
+   const double area=std::sqrt(dot(av,av));
+   // GPU omega point penalty normalization with k effective diffusivity:
+   // coeff = gamma * nuEff * wallArea * QW[q] / (y5-y1).
+   const double coeff=gamma*nuEff*area*QW[r.q]/ell;
+   if(!(ut>=0&&target>0&&nuEff>0&&area>0&&coeff>0&&
+      std::isfinite(ut)&&std::isfinite(target)&&std::isfinite(nuEff)&&std::isfinite(coeff)))
+    throw std::runtime_error("invalid k Spalding equilibrium point target / penalty");
+   int ent[8];for(int ib=0;ib<8;++ib)ent[ib]=ib<4?t.v[ib]:nv_+t.face[ib-4];
+   for(int ia=0;ia<4;++ia){
+    const int row=localOf[t.v[ia]];if(row<0)continue;
+    rhs[(size_t)row]+=coeff*ph[ia]*target;
+    for(int ib=0;ib<8;++ib)mat[(size_t)row][ent[ib]]+=coeff*ph[ia]*ph[ib];
+   }
+  }
+ }
  // Relaxed row-L1 sums include the constrained BF3 trial modes, exactly as in GPU Q1.
  std::vector<std::vector<std::pair<int,double>>> rows(owned.size());
  std::vector<double> inverse(owned.size(),0.0);
@@ -404,6 +439,33 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
  MPI_Allreduce(newOwned.data(),current.data(),nv_,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
  report.clips=localClips;int globalClips=0;
  MPI_Allreduce(&localClips,&globalClips,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);report.clips=globalClips;
+ // Passive post-sweep sample audit: compare achieved masked P1 k with target.
+ // Emit for all three A/B/C modes so no-flux reference is directly comparable.
+ if(!omegaEq && (kAdvanceCount_==1||kAdvanceCount_%20==0)){
+  if(cfg_.expectRanks!=1||!fit||fit->qUTau.size()!=12*m_.faces.size())
+   throw std::runtime_error("k point audit needs one MPI rank and shared wall fit");
+  double areaSum=0,meanTarget=0,meanActual=0,meanAbsError=0,meanYPlus=0,meanUTau=0;
+  double targetMin=std::numeric_limits<double>::infinity(),targetMax=0;
+  int nsamples=0;
+  for(const RayPoint&r:wallPoints_){
+   const auto&t=m_.tets[(size_t)r.hitCell];
+   const double ut=fit->qUTau[12*(size_t)r.face+(size_t)r.q];
+   const double target=std::max(cfg_.kFloor,ut*ut/std::sqrt(0.09));
+   double actual=0;for(int a=0;a<4;++a)actual+=r.bary[a]*current[(size_t)t.v[a]];
+   const Vec3 av=outward_area(m_,r.wallCell,r.localFace);
+   const double wt=std::sqrt(dot(av,av))*QW[r.q];
+   meanTarget+=wt*target;meanActual+=wt*actual;meanAbsError+=wt*std::abs(actual-target);
+   meanYPlus+=wt*r.y*ut/cfg_.nu;meanUTau+=wt*ut;areaSum+=wt;
+   targetMin=std::min(targetMin,target);targetMax=std::max(targetMax,target);++nsamples;
+  }
+  if(!(areaSum>0))throw std::runtime_error("k point audit has zero wall area");
+  if(rank_==0)
+   std::printf("NODALS_CPU_M4_K_POINT mode=%s gamma=%.8g sampleIndex=%d sampleY=%.12e penaltyLength=%.12e samples=%d targetMean=%.12e actualMean=%.12e targetMin=%.12e targetMax=%.12e relativeMeanAbsError=%.12e yPlusMean=%.12e uTauMean=%.12e status=DIAGNOSTIC\n",
+    cfg_.kWallMethod.c_str(),cfg_.kWallMethod=="no_flux"?0.:cfg_.kWallGamma,
+    cfg_.kWallSampleIndex,cfg_.omegaY3,cfg_.kWallPenaltyLength,nsamples,
+    meanTarget/areaSum,meanActual/areaSum,targetMin,targetMax,
+    meanAbsError/std::max(meanTarget,1e-300),meanYPlus/areaSum,meanUTau/areaSum);
+ }
  return report;
 }
 
