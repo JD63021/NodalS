@@ -69,6 +69,20 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
    if(row.entity[a]>=0 && enrich_->is_fixed(row.entity[a]))
     row.physical[a]=row.reduced[a]=Vec3{};
  }
+ if(enrich_&&enrich_->enabled&&rank_==0){
+   static bool logged=false;
+   if(!logged){
+     double bmax=0,b2=0;int count=0;
+     for(const auto&rw:rows_)for(int j=8;j<12;++j)if(rw.entity[j]>=0){
+       const double val=dot(rw.physical[j],rw.physical[j]);
+       bmax=std::max(bmax,std::sqrt(val));b2+=val;++count;
+     }
+     std::printf("NODALS_CPU_M4_ENRICH_P0_COUPLING count=%d bMax=%.12e bNorm=%.12e extraVectorDofs=%d status=%s\n",
+       count,bmax,std::sqrt(b2),3*enrich_->nr,bmax>1e-14?"PASS":"FAIL");
+     if(!(bmax>1e-14))throw std::runtime_error("enrichment pressure B coupling unexpectedly zero");
+     logged=true;
+   }
+ }
  // The sparse pressure matrix is assembled from exactly B_reduced and the
  // frozen momentum inverse, with no pressure-diagonal approximation.
  using Pair=std::pair<int,double>;
