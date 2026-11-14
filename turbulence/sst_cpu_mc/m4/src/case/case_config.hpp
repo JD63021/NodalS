@@ -17,6 +17,7 @@ struct CaseConfig {
  std::string kSolver="fgs-fixed",omegaSolver="fgs-fixed",outputDirectory=".";
  double intensity=.05,lengthRatio=.07,urK=.7,urOmega=.7;
  double kFloor=1e-8,omegaFloor=1e-3,omegaScale=.5,omegaY3=0,omegaTraceGamma=50;
+  double omegaPointGamma=10000.0,omegaPenaltyLength=0.0,omegaOfReBlend=11.0;
  double pAtol=1e-12,continuityRtol=1e-6,pressureDropTol=0.01;
  int pressureDropWindow=20,pressureDropMinIterations=30;
  double scalarOmega=1.0,simpleTol=1e-4,continuityAtol=1e-8,plateauTol=.001;
