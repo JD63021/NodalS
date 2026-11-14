@@ -306,8 +306,8 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
 
     # Isolated native Option-A experiment. No silent fallback to the old Robin wall.
     momentum_wall_bc=get(cp,'wall_function','momentum_bc','robin').strip().lower()
-    if momentum_wall_bc not in ('robin','of12_noslip','strong_noslip_sst'):
-        raise ValueError('wall_function.momentum_bc must be robin, of12_noslip, or strong_noslip_sst')
+    if momentum_wall_bc not in ('robin','of12_noslip','of12_noslip_v3','strong_noslip_sst'):
+        raise ValueError('wall_function.momentum_bc must be robin, of12_noslip, of12_noslip_v3, or strong_noslip_sst')
     # Exact environment compatibility flags used by the existing, unmodified CUDA solver.
     env={
         'SST_STATE_SPACE':state,
@@ -355,8 +355,9 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         'NODALS_F2_FACE_SPALDING':str(int(flag(cp,'wall_function','face_spalding',True))),
         'NODALS_F1_FACE_LOCAL':'0',
         'NODALS_MOM_WALL_OPERATOR':'original',
-        'NODALS_OPTION_A_OF12_NOSLIP':str(int(momentum_wall_bc in ('of12_noslip','strong_noslip_sst'))),
+        'NODALS_OPTION_A_OF12_NOSLIP':str(int(momentum_wall_bc in ('of12_noslip','of12_noslip_v3','strong_noslip_sst'))),
         'NODALS_OPTION_A_SHEAR_ACTIVE':str(int(momentum_wall_bc=='of12_noslip')),
+        'NODALS_OPTION_A_V3_ACTIVE':str(int(momentum_wall_bc=='of12_noslip_v3')),
         'NODALS_P_REFRESH_EVERY':'1',
         'NODALS_F1B_GPU_GATE':'0',
         'STAGE27_WALL_AUDIT_MODE':'off',
