@@ -178,7 +178,7 @@
                      // NODALS_EMAC_M3_TRUE_CSR_RESIDUAL_DIAG_V1: first two diagnostic iterations only.
                      (nodalsDiagnosticsDue(git) && git<=2)?&stage22d4dRed:nullptr,
                      d_m3Check.p,d_m3CheckDiff.p);
-                if(git==1 && nodalsDiagnosticsDue(git)){
+                if(git==1 && (nodalsDiagnosticsDue(git) || optionAV3Active)){
                   // Optional assembly parity gate against the ORIGINAL exact
                   // matrix-free application. Once at startup, not per sweep.
                   d4op.apply(d_s22d4dX.p,d_m3Check.p);
