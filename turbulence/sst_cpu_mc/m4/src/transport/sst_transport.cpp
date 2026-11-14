@@ -109,7 +109,7 @@ void momentum_turbulent_deviatoric(Element24&K,const Mesh&m,int c,const std::vec
  const auto geom=geometry(m,c);
  for(int q=0;q<24;++q){const auto l=q24(q);double ph[8];Vec8 gp{};shape(geom,l,ph,gp);
   const auto state=carrier(m,c,l,gp,ph,u,k,omega,distance,enrich);
-  const auto ss=physics(state,cfg);const double nuT=ss.nut;
+  const auto ss=physics(state,cfg);const double nuT=ss.nut*cfg.momentumNutScale;
   if(!std::isfinite(nuT)||nuT<0)throw std::runtime_error("nonfinite turbulent viscosity in momentum");
   const double weight=geom.det*quad::w[q]*nuT;
   for(int a=0;a<8;++a)for(int b=0;b<8;++b){
