@@ -28,7 +28,7 @@ In kinematic, density-normalized NSE units:
                  (∂_i phi_a)(∂_j phi_b) dV
  resulting in gamma*(div u_h, div v_h), gamma [m2/s].
 
-Default gamma=0.0. The parser requires gamma finite, 0<=gamma<=100.
+Default gamma=0.0. The parser requires gamma finite and nonnegative, with no arbitrary upper limit (including 1e6).
 There is NO change to convection, original deviatoric stress,
 turbulent viscosity, k/omega, pressure B/B^T, strong no-slip, DG inlet,
 Spalding fit, SIMPLE relaxation, or physical inlet/outlet flux.
@@ -126,3 +126,7 @@ Code committed, statically checked. The assistant cannot access the
 user's workstation or its MPI toolchain; full MPI compile and tests
 must be executed there. The standalone unit test was added to the
 branch but has likewise not yet been executed on that workstation.
+
+## 2026-11-14 extension: exact DG-inlet RHS augmentation
+
+See HIGH_GAMMA_AUGMENTED_RHS.md for selectable [momentum] grad_div_form=volume or constraint_p0, including the mandatory -gamma B^T Mp^-1 source_DG RHS term for the constraint_p0 mode.
