@@ -17,11 +17,13 @@ inline double global_dot(const std::vector<double>&x,const std::vector<double>&y
 }
 }
 Schur::~Schur()=default;
-Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector<double> inverse,std::array<double,3> inletVelocity)
-:mesh_(m),own_(o),wall_(w),rank_(rank),inv_(std::move(inverse)){
+Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector<double> inverse,
+    std::array<double,3> inletVelocity,const nodals::cpu_mc::m4::EnrichmentSpace*enrich)
+:mesh_(m),own_(o),wall_(w),enrich_(enrich),rank_(rank),inv_(std::move(inverse)){
  const int nv=(int)m.points.size(),nc=(int)m.tets.size();
  const int ne=nv+(int)m.faces.size();
- if((int)inv_.size()!=3*ne)throw std::runtime_error("Schur: inconsistent momentum rAU vector length");
+ const int neFull=(enrich_&&enrich_->enabled)?enrich_->nent():ne;
+ if((int)inv_.size()!=3*neFull)throw std::runtime_error("Schur: inconsistent augmented rAU length");
  rows_.resize(nc);source_.assign(nc,0.0);diag_.assign(nc,0.0);
  // Exactly the GPU boundary construction: subtract integral_F phi_a n on
  // the inlet from Bvolume, and add the inlet flux to the source vector.
@@ -31,6 +33,11 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
   const auto&t=m.tets[c];const auto raw=divergence_coefficients(m,c);
   Row& row=rows_[c];
   for(int a=0;a<8;++a){row.entity[a]=a<4?t.v[a]:nv+t.face[a-4];row.physical[a]=raw.b[a];}
+  for(int a=8;a<12;++a)row.entity[a]=(enrich_&&enrich_->enabled)?enrich_->entity(c,a):-1;
+  if(enrich_&&enrich_->enabled){
+   std::array<Vec3,4> b{};enrich_->divergence(c,b);
+   for(int a=0;a<4;++a)row.physical[8+a]=b[a];
+  }
   for(int lf=0;lf<4;++lf){
    const int f=t.face[lf];if(m.faces[f].patch!=1)continue;
    const Vec3 sf=outward_area(m,c,lf);
@@ -40,6 +47,10 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
    row.physical[4+lf]=row.physical[4+lf]-(9.0/20.0)*sf;
    // The original GPU uses the prescribed DG inlet flux, not a conforming
    // velocity Dirichlet condition at inlet-wall intersection vertices.
+   if(enrich_&&enrich_->enabled){
+    std::array<Vec3,4> be{};enrich_->face_flux(c,lf,be);
+    for(int a=0;a<4;++a)row.physical[8+a]=row.physical[8+a]-be[a];
+   }
    source_[c]+=dot(sf,{inletVelocity[0],inletVelocity[1],inletVelocity[2]});
   }
   row.reduced=row.physical;
@@ -54,12 +65,16 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
    for(int j=0;j<4;++j)if(j!=lf)
      row.reduced[j]=row.reduced[j]-(20.0/27.0)*bn*n;
   }
+  if(enrich_&&enrich_->enabled)for(int a=0;a<12;++a)
+   if(row.entity[a]>=0 && enrich_->is_fixed(row.entity[a]))
+    row.physical[a]=row.reduced[a]=Vec3{};
  }
  // The sparse pressure matrix is assembled from exactly B_reduced and the
  // frozen momentum inverse, with no pressure-diagonal approximation.
  using Pair=std::pair<int,double>;
- std::vector<std::vector<Pair>> inc((std::size_t)3*ne);
- for(int c=0;c<nc;++c)for(int a=0;a<8;++a)for(int d=0;d<3;++d){
+ std::vector<std::vector<Pair>> inc((std::size_t)3*neFull);
+ for(int c=0;c<nc;++c)for(int a=0;a<12;++a)for(int d=0;d<3;++d){
+   if(rows_[c].entity[a]<0)continue;
    const double b=comp(rows_[c].reduced[a],d);
    if(std::abs(b)>1e-30)inc[(std::size_t)3*rows_[c].entity[a]+d].emplace_back(c,b);
  }
@@ -68,7 +83,8 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
  for(int c=0;c<nc;++c)if(o.cell[c]==rank){
   ownedRows_.push_back(c);
   std::unordered_map<int,double> tmp;
-  for(int a=0;a<8;++a)for(int d=0;d<3;++d){
+  for(int a=0;a<12;++a)for(int d=0;d<3;++d){
+    if(rows_[c].entity[a]<0)continue;
     const int j=3*rows_[c].entity[a]+d;
     const double v=comp(rows_[c].reduced[a],d),inv=inv_[j];
     if(std::abs(v)<1e-30 || !(inv>0.0))continue;
@@ -95,7 +111,7 @@ void Schur::B(const std::vector<double>&u,std::vector<double>&p)const{
  const int nc=(int)rows_.size();p.assign(nc,0.0);
  for(int c=0;c<nc;++c)if(own_.cell[c]==rank_){
   double s=0.0;const Row&r=rows_[c];
-  for(int a=0;a<8;++a){int e=3*r.entity[a];
+  for(int a=0;a<12;++a){if(r.entity[a]<0)continue;int e=3*r.entity[a];
    for(int d=0;d<3;++d)s+=comp(r.physical[a],d)*u[e+d];}
   p[c]=s;
  }
@@ -104,7 +120,7 @@ void Schur::B(const std::vector<double>&u,std::vector<double>&p)const{
 void Schur::BT(const std::vector<double>&p,std::vector<double>&v)const{
  v.assign(inv_.size(),0.0);
  for(int c=0;c<(int)rows_.size();++c)if(own_.cell[c]==rank_){
-  const Row&r=rows_[c];for(int a=0;a<8;++a){const int e=3*r.entity[a];
+  const Row&r=rows_[c];for(int a=0;a<12;++a){if(r.entity[a]<0)continue;const int e=3*r.entity[a];
    for(int d=0;d<3;++d)v[e+d]+=comp(r.physical[a],d)*p[c];}
  }
  MPI_Allreduce(MPI_IN_PLACE,v.data(),(int)v.size(),MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
