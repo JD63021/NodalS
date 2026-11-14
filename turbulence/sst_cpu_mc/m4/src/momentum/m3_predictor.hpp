@@ -4,6 +4,7 @@
 #include "../operators/p1bf3_p0.hpp"
 #include "../wall/bf3_flux.hpp"
 #include "../wall/wall_sampler.hpp"
+#include "../enrichment/enrichment_space.hpp"
 #include "../case/case_config.hpp"
 #include <vector>
 #include <array>
@@ -19,13 +20,15 @@ class M3Predictor {
  std::vector<double> rhs_,rowL1_,inv_;
  std::vector<Vec3> wallBubbleNormal_; // GPU per-row tangential BF3 GS projection
  const std::vector<double>* k_=nullptr,*omega_=nullptr,*wallDistance_=nullptr;
+ const nodals::cpu_mc::m4::EnrichmentSpace*enrich_=nullptr;
  WallFaceFit wallFit_;
  std::size_t ownedCells_=0,incidentCells_=0;
  void sync_updates(std::vector<double>&x,const std::vector<double>&old)const;
 public:
  M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,const CaseConfig&c,int rank,const std::vector<double>&lag,
    const std::vector<double>* k=nullptr,const std::vector<double>* omega=nullptr,
-   const std::vector<double>* wallDistance=nullptr);
+   const std::vector<double>* wallDistance=nullptr,
+   const nodals::cpu_mc::m4::EnrichmentSpace*enrich=nullptr);
  // input and output in constrained BF3 PARAMETER coordinates (reduced operator)
  void apply(const std::vector<double>&x,std::vector<double>&out)const;
  // returns PHYSICAL velocity, u=T*x, for the pressure continuity calculation
