@@ -170,7 +170,7 @@ int main(int argc,char**argv){
   std::string dir=expand_home(outputOverride.empty()?cfg.outputDirectory:outputOverride);
   if(rank==0)std::filesystem::create_directories(dir);
   MPI_Barrier(MPI_COMM_WORLD);
-  if(rank==0)std::printf("NODALS_CPU_SST_M4_SETUP status=PASS ranks=%d cells=%zu vertices=%zu faces=%zu maxOuter=%d transport=Q1_MASKED_P1BF3 matrix=ENRICHED momentum=M3_BLOCK_MPI pressure=PCG_AMG_SGS wall=SPALDING_PLUS_TRACE_LOG case=%s\n",size,m.tets.size(),m.points.size(),m.faces.size(),cfg.maxOuter,casePath.c_str());
+  if(rank==0)std::printf("NODALS_CPU_SST_M4_SETUP status=PASS ranks=%d cells=%zu vertices=%zu faces=%zu maxOuter=%d transport=Q1_MASKED_P1BF3 matrix=ENRICHED momentum=M3_BLOCK_MPI pressure=PCG_AMG_SGS wall=SPALDING_PLUS_%s kWall=%s case=%s\n",size,m.tets.size(),m.points.size(),m.faces.size(),cfg.maxOuter,cfg.omegaStage41.c_str(),cfg.kWallMethod.c_str(),casePath.c_str());
   const double start=MPI_Wtime();
   bool allLinearOkay=true;int completed=0,refreshes=0;
   double lastFull=0,prevMeanNut=-1;
