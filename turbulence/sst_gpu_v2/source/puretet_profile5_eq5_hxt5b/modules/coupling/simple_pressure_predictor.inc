@@ -11,6 +11,12 @@
           HXT1_CUDA(cudaMemcpy(&badI3,d_bad.p,sizeof(badI3),cudaMemcpyDeviceToHost));
           if(badI3)throw std::runtime_error(
             "I3A invalid gamma-free row-L1 denominator rows="+std::to_string(badI3));
+          if(alGamma!=0.){
+            hxt5d::nodals_al_i3_diag_update<<<(nv+TPB-1)/TPB,TPB>>>(
+              nv,d_alDiagX.p,d_alDiagY.p,d_alDiagZ.p,
+              d_i3rx.p,d_i3ry.p,d_i3rz.p);
+            HXT1_CUDA(cudaGetLastError());
+          }
           if(git==1||git%sstG2PrintEvery==0)
             std::printf("STAGE22D4I3A_D0 it=%d gammaStab=%.8g "
               "gammaPenaltyCSR=SUBTRACTED rowL1=UNRELAXED_NONPENALIZED "
@@ -75,6 +81,12 @@
               "rhs=PICARD_DEFERRED status=PASS\n",
               git,(unsigned long long)M.h.ntet,convectionDivFactor);
         }
+        if(alGamma!=0.){
+          hxt5d::nodals_al_add<<<(nv+TPB-1)/TPB,TPB>>>(
+            nv,d_alRhsX.p,d_alRhsY.p,d_alRhsZ.p,
+            d_rhs0.p,d_rhs1.p,d_rhs2.p);
+          HXT1_CUDA(cudaGetLastError());
+        }
         predAuditMark(3);
         double s22d4dR0=0.,s22d4dR1=0.;
         if(stage22d4Live){
@@ -85,6 +97,8 @@
             d_clampXY.p,d_fixed.p,sstG1.tetWallPlans,sstG1.tetWallQuads,
             d_tv.p,d_tg.p,d_s22d4dCoeff.p,(int)BH.wallT.size(),s22d4Gamma,d_s22d4iScratch.p,stage22d4iEnable,sampledConductance,
             f1bFrozenWall?d_f1bWallCross.p:nullptr};
+          if(alGamma!=0.)
+            d4op.set_al(&B,d_tg.p,d_alQ.p,d_alX.p,d_alY.p,d_alZ.p,alGamma,pin);
           // NODALS_EMAC_PICARD_V1: pressure-corrected Picard carrier for 9-block EMAC.
           d4op.set_emac_picard(momentumEmac,d_u0.p,d_u1.p,d_u2.p,M.h.ntet);
           d4op.set_implicit_dev(implicitDevStress,
@@ -226,6 +240,8 @@
             d_clampXY.p,d_fixed.p,sstG1.tetWallPlans,sstG1.tetWallQuads,
             d_tv.p,d_tg.p,d_s22d4dCoeff.p,(int)BH.wallT.size(),s22d4Gamma,d_s22d4iScratch.p,stage22d4iEnable,sampledConductance,
             f1bFrozenWall?d_f1bWallCross.p:nullptr};
+          if(alGamma!=0.)
+            d4op.set_al(&B,d_tg.p,d_alQ.p,d_alX.p,d_alY.p,d_alZ.p,alGamma,pin);
           // NODALS_EMAC_PICARD_V1: pressure-corrected Picard carrier for 9-block EMAC.
           d4op.set_emac_picard(momentumEmac,d_u0.p,d_u1.p,d_u2.p,M.h.ntet);
           d4op.set_implicit_dev(implicitDevStress,
