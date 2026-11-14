@@ -71,6 +71,9 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
  c.omegaTraceGamma=a.count("omega_wall.trace_gamma")?real("omega_wall.trace_gamma"):50.0;
  c.omegaPointGamma=a.count("omega_wall.penalty_gamma")?real("omega_wall.penalty_gamma"):10000.0;
  c.omegaOfReBlend=a.count("sst.of_re_blend")?real("sst.of_re_blend"):11.0;
+ c.momentumNutScale=a.count("sst.momentum_nut_scale")?real("sst.momentum_nut_scale"):1.0;
+ if(!(std::isfinite(c.momentumNutScale) && c.momentumNutScale>=0 && c.momentumNutScale<=1))
+   throw std::runtime_error("DIAGNOSTIC sst.momentum_nut_scale must be between 0 and 1");
  if(a.count("omega_wall.penalty_length"))
    c.omegaPenaltyLength=real("omega_wall.penalty_length");
  if(!(c.omegaPenaltyLength>0))c.omegaPenaltyLength=4.0*c.spaldingY3/3.0;
