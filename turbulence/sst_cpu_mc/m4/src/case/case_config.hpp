@@ -22,6 +22,9 @@ struct CaseConfig {
   // no_flux retains the original natural boundary condition bit for bit.
   std::string kWallMethod="no_flux";
   double kWallGamma=1000.0,kWallPenaltyLength=0.0;
+  // Diagnostic only: fixed Spalding u_tau for k/omega offwall targets.
+  // Negative preserves the original dynamically fitted wall targets.
+  double debugFixedTargetUTau=-1.0;
   int kWallSampleIndex=3;
  double pAtol=1e-12,continuityRtol=1e-6,pressureDropTol=0.01;
  int pressureDropWindow=20,pressureDropMinIterations=30;
