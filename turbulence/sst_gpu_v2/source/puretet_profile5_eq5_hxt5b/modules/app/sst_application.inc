@@ -119,8 +119,10 @@ int main(int argc,char**argv){
     }
     const char* tgRaw=std::getenv("STAGE41_TRACE_GAMMA");
     const double traceGamma=(tgRaw&&*tgRaw)?std::stod(tgRaw):50.0;
-    if(s41mode=="trace_log" && !(std::isfinite(traceGamma)&&traceGamma>=10.0&&traceGamma<=1.e5))
-      throw std::runtime_error("trace_log trace_gamma must be in [10,100000]");
+    // No arbitrary upper bound on the dimensionless symmetric Nitsche penalty.
+    // The wall kernel retains the finite-positive check on gamma * mu / hTet.
+    if(s41mode=="trace_log" && !(std::isfinite(traceGamma)&&traceGamma>0.0))
+      throw std::runtime_error("trace_log trace_gamma must be finite and positive");
     const int s41Trace=(s41mode=="trace_log")?1:0;
     HXT1_CUDA(cudaMemcpyToSymbol(hxt5c::stage41_trace_log,&s41Trace,sizeof(s41Trace)));
     HXT1_CUDA(cudaMemcpyToSymbol(hxt5c::stage41_trace_gamma,&traceGamma,sizeof(traceGamma)));
