@@ -25,6 +25,7 @@ class SSTTransport {
  std::vector<RayPoint> wallPoints_;
  SSTFields state_;
  double bulk_=0;
+ int omegaAdvanceCount_=0;
  ScalarReport advance_impl(bool omegaEq,const std::vector<double>&u,const nodals::cpu_mc::m3::WallFaceFit*fit);
 public:
  SSTTransport(const Mesh&m,const Ownership&o,const CaseConfig&cfg,int rank,
