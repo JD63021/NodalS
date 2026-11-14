@@ -43,3 +43,22 @@ If SciPy is missing, install `numpy` and `scipy` in your current Python environm
 ## Troubleshooting
 
 `bash "$EXP/RUN.sh" prepare` validates mesh and patches isolated source without building CUDA. `bash "$EXP/RUN.sh" dry` checks the exact native invocation. `bash "$EXP/RUN.sh" 5` incrementally compiles and executes the first 5 steps. Read `$HOME/NodalS_SST_LOCAL_RUNS/PIPE50_RE1M_HYBRID_99K_ONEPOINT/terminal.log` after the run starts.
+
+## November 14 hybrid native-startup repair
+
+After the first successful NVCC build, a mixed mesh hit the unconditional
+`STAGE25_ROTATION currently supports pure-tet` startup exception. The opt-in
+`fix_hybrid_startup.py` (automatically called from `RUN.sh`) now:
+- Keeps all existing pure-tet startup operations unchanged.
+- For mixed HEX/TET only, requires zero rotation and native HXT1 patch tags,
+  skips the tetra-only Stage19 registry and performs a boundary-plan audit.
+- Removes the `SST22D4_NITSCHE_ENABLE` variable entirely in hybrid mode;
+  the native parser treats its mere presence as a request to enable D4D.
+- Requires the straight-pipe wall-distance choice `analytic_pipe`; this is
+  also set in the GitHub case. **Already copied working cases must be changed
+  manually from `method = geometric` to `method = analytic_pipe`.**
+
+Re-fetch the experiment worktree, edit the existing local case, run `bash
+"$EXP/RUN.sh" dry` and only then `bash "$EXP/RUN.sh" 5`.
+This patch modifies an existing app `.inc` and needs one incremental NVCC
+rebuild. It has not yet been verified by a successful GPU iteration.
