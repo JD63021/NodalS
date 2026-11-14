@@ -235,6 +235,17 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
  inv_.assign((std::size_t)3*nEntities_,0.0);
  for(std::size_t ri=0;ri<owned_.size();++ri){
   const int entity=owned_[ri];
+  // Strong no-slip: eliminate wall vertex and wall face-bubble rows/columns
+  // before relaxation, rather than imposing a second Spalding Robin drag.
+  if(enrich_&&enrich_->enabled){
+   if(enrich_->is_fixed(entity)){
+    rows[ri].clear();B9 identity{};
+    for(int j=0;j<3;++j){identity[3*j+j]=1.;rhs_[3*(size_t)entity+j]=0.;}
+    rows[ri][entity]=identity;
+   }else{
+    for(auto&kv:rows[ri])if(enrich_->is_fixed(kv.first))kv.second=B9{};
+   }
+  }
   std::vector<int>keys;keys.reserve(rows[ri].size());
   for(const auto&pair:rows[ri])keys.push_back(pair.first);
   std::sort(keys.begin(),keys.end());
@@ -262,7 +273,7 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
    if(!(momentumDiag>0.0 && pressureMetric>0.0) ||
        !std::isfinite(momentumDiag) || !std::isfinite(pressureMetric))
      throw std::runtime_error("M3: nonpositive relaxed momentum or penalty-free pressure metric");
-   inv_[3*entity+i]=1.0/pressureMetric;
+   inv_[3*entity+i]=(enrich_&&enrich_->is_fixed(entity))?0.0:1.0/pressureMetric;
   }
   for(int col:keys){cols_.push_back(col);a_.push_back(rows[ri].at(col));}
   diagInverse_[ri]=inverse3(diag);
@@ -292,6 +303,8 @@ void M3Predictor::sync_updates(std::vector<double>&x,const std::vector<double>&o
 void M3Predictor::solve(std::vector<double>&u,int sweeps,double omega,double*start,double*end,
  const std::vector<double>*pressureForce,int*iterations)const{
  std::vector<double>x=lag_,Ax,res;wall_.Q(x);
+ if(enrich_&&enrich_->enabled)for(int e=0;e<enrich_->ne;++e)if(enrich_->is_fixed(e))
+   for(int d=0;d<3;++d)x[3*(size_t)e+d]=0.;
  std::vector<double> rhsEffective=rhs_;
  if(pressureForce){
    if(pressureForce->size()!=rhs_.size())throw std::runtime_error("M3 pressure force dimension mismatch");
