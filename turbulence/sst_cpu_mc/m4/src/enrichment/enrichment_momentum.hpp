@@ -17,6 +17,8 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
     const m3::CaseConfig&cfg,K36&EK,RHS36&ER){
   if(!enrich.enabled)return;
   const auto&t=m.tets[(size_t)cell];
+  bool active=false;for(int a=0;a<4;++a)active|=enrich.index[(size_t)t.v[a]]>=0;
+  if(!active)return;
   const Vec3 p0=m.points[(size_t)t.v[0]],p1=m.points[(size_t)t.v[1]],
              p2=m.points[(size_t)t.v[2]],p3=m.points[(size_t)t.v[3]];
   const double det=dot(p1-p0,cross(p2-p0,p3-p0));
@@ -38,7 +40,7 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
     const Vec3 U=enrich.velocity(cell,l,lag);
     const double wt=det*wr[ir]*wr[is]*w[iz]*oa*oa*ob;
     for(int ia=0;ia<12;++ia)if(enrich.entity(cell,ia)>=0)
-     for(int ib=0;ib<12;++ib)if(enrich.entity(cell,ib)>=0 && (ia>=8||ib>=8)){
+     for(int ib=0;ib<12;++ib)if(enrich.entity(cell,ib)>=0){
       const Vec3 ga=gp[ia],gb=gp[ib];
       const double aa[3]={ga.x,ga.y,ga.z},bb[3]={gb.x,gb.y,gb.z};
       const double gradDot=dot(ga,gb),advection=wt*phi[ia]*dot(U,gb);
