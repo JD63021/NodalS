@@ -25,7 +25,7 @@ inline void print_grad_div_audit(const m2::Mesh&m,const EnrichmentSpace&space,
  EnrichmentSpace::gauss(order,x,w);
  EnrichmentSpace::gauss(6,x6,w6);
  constexpr double X5[5]={.0469100770306680185,.23076534494715845,.5,.7692346550528415,.95308992296933193};
- constexpr double W5[5]={.11846344252809449,.23931433524968326,.28444444444444450,.23931433524868326,.11846344252809449};
+ constexpr double W5[5]={.11846344252809449,.23931433524968326,.28444444444444450,.23931433524968326,.11846344252809449};
  double integratedDiv2=0,vol=0,absMax=0;
  double partialDiv2[2]{},partialVol[2]{};
  double enrichedDiv2=0,enrichedVol=0;
