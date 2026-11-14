@@ -51,6 +51,7 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
    auto raw=a.at("wall_function.distances");for(char&ch:raw)if(ch==',')ch=' ';
    double y[5]{};std::istringstream yy(raw);for(int j=0;j<5;++j)if(!(yy>>y[j]))throw std::runtime_error("bad wall_function.distances");
    c.spaldingY3=y[2];
+   c.omegaPenaltyLength=y[4]-y[0]; // GPU profile5 y5-y1 thickness
  }
  if(must("wall_sampling.mode")!="ray_trace")throw std::runtime_error("M3 supports only strict ray_trace, cannot change numerical sampling");
  if(must("mesh.format")!="msh2")throw std::runtime_error("M3 CPU expects unchanged tetrahedral MSH2 mesh");
@@ -68,6 +69,11 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
  c.omegaScale=real("omega_wall.sample_scale");c.omegaIndex=intval("omega_wall.sample_index");
  c.omegaProduction=(must("omega_wall.production")=="true");
  c.omegaTraceGamma=a.count("omega_wall.trace_gamma")?real("omega_wall.trace_gamma"):50.0;
+ c.omegaPointGamma=a.count("omega_wall.penalty_gamma")?real("omega_wall.penalty_gamma"):10000.0;
+ c.omegaOfReBlend=a.count("sst.of_re_blend")?real("sst.of_re_blend"):11.0;
+ if(a.count("omega_wall.penalty_length"))
+   c.omegaPenaltyLength=real("omega_wall.penalty_length");
+ if(!(c.omegaPenaltyLength>0))c.omegaPenaltyLength=4.0*c.spaldingY3/3.0;
  c.omegaY3=4.4084029504620439e-4*(c.diameter/0.004)*c.omegaScale;
  c.maxOuter=intval("simple.max_iterations");c.simpleTol=real("simple.simple_tol");
  c.continuityAtol=real("simple.continuity_atol");c.continuityRtol=a.count("simple.continuity_rtol")?real("simple.continuity_rtol"):1e-6;
@@ -94,11 +100,15 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
  if(c.convection!="advective"||c.stress!="deviatoric"||(c.method!="m3-fgs"&&c.method!="fgmres")||c.momentumSupg||c.compactP1)
    throw std::runtime_error("M3 does not support this case mode; refusing numerical substitution. Expected advective/deviatoric/fgmres or m3-fgs, momentum SUPG off, masked P1.");
  if(c.sstSpace!="q1"||c.kSolver!="fgs-fixed"||c.omegaSolver!="fgs-fixed"||
-    c.omegaMethod!="of_auto"||c.omegaStage41!="trace_log"||c.omegaIndex!=3||
+    c.omegaMethod!="of_auto"||
+    (c.omegaStage41!="trace_log"&&c.omegaStage41!="of_auto"&&c.omegaStage41!="sample_log")||
+    c.omegaIndex!=3||
     c.omegaProduction||c.supgK||c.supgOmega)
    throw std::runtime_error("M4 supports the captured spiral GPU SST q1/fgs-fixed/trace_log configuration; refusing to replace an unsupported option");
  if(!(c.intensity>0&&c.lengthRatio>0&&c.urK>0&&c.urK<=1&&c.urOmega>0&&c.urOmega<=1&&
-      c.kSweeps>0&&c.omegaSweeps>0&&c.maxOuter>0&&c.omegaScale>0&&c.omegaTraceGamma>=10))
+      c.kSweeps>0&&c.omegaSweeps>0&&c.maxOuter>0&&c.omegaScale>0&&c.omegaTraceGamma>=10&&
+      c.omegaPointGamma>=1&&c.omegaPointGamma<=1e8&&
+      c.omegaPenaltyLength>0&&c.omegaOfReBlend>0))
    throw std::runtime_error("invalid SST config values");
  if(!(c.pRtol>=0&&c.pAtol>=0&&(c.pRtol>0||c.pAtol>0)&&c.continuityAtol>=0&&c.continuityRtol>=0&&
       c.pressureDropWindow>=2&&c.pressureDropMinIterations>=c.pressureDropWindow&&c.pressureDropTol>0&&c.pressureDropTol<1))
