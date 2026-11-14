@@ -126,7 +126,9 @@ SSTTransport::SSTTransport(const Mesh&m,const Ownership&own,const CaseConfig&cfg
  ne_((int)m.points.size()+(int)m.faces.size()),enrich_(enrich),distance_(wallDistance){
  if(distance_.size()!=m.points.size())throw std::runtime_error("SST: wall distance size mismatch");
  if(cfg.sstSpace!="q1"||cfg.compactP1)throw std::runtime_error("M4 requires original masked Q1 with BF3 enrichment in matrix");
- if(cfg.omegaMethod!="of_auto"||cfg.omegaStage41!="trace_log"||cfg.omegaIndex!=3)
+ if(cfg.omegaMethod!="of_auto"||
+    (cfg.omegaStage41!="trace_log"&&cfg.omegaStage41!="of_auto"&&cfg.omegaStage41!="sample_log")||
+    cfg.omegaIndex!=3)
   throw std::runtime_error("M4 requires captured of_auto/trace_log sample point 3; refusing wall model replacement");
  if(cfg.supgK||cfg.supgOmega)throw std::runtime_error("M4 scalar SUPG implementation is not yet available");
  bulk_=std::sqrt(cfg.inlet[0]*cfg.inlet[0]+cfg.inlet[1]*cfg.inlet[1]+cfg.inlet[2]*cfg.inlet[2]);
@@ -158,7 +160,11 @@ SSTTransport::SSTTransport(const Mesh&m,const Ownership&own,const CaseConfig&cfg
  }
  long long local=(long long)wallPoints_.size(),total=0;
  MPI_Allreduce(&local,&total,1,MPI_LONG_LONG_INT,MPI_SUM,MPI_COMM_WORLD);
- if(rank==0)std::printf("NODALS_CPU_SST_M4_WALL_CACHE mode=TRACE_LOG_NITSCHE wallQuadraturePoints=%lld omegaScale=%.8g sampleY=%.12e gamma=%.8g source=GPU_TET_RAY_TRACE\n",total,cfg.omegaScale,y,cfg.omegaTraceGamma);
+ if(rank==0)std::printf("NODALS_CPU_SST_M4_WALL_CACHE mode=%s wallQuadraturePoints=%lld omegaScale=%.8g sampleY=%.12e gamma=%.8g penaltyLength=%.8g source=GPU_TET_RAY_TRACE\n",
+    cfg.omegaStage41=="trace_log"?"TRACE_LOG_NITSCHE":"OFFWALL_RANK_ONE",
+    total,cfg.omegaScale,y,
+    cfg.omegaStage41=="trace_log"?cfg.omegaTraceGamma:cfg.omegaPointGamma,
+    cfg.omegaPenaltyLength);
 }
 
 // The scalar matrices are assembled from the original enriched P1+BF3 FEM
@@ -168,6 +174,7 @@ ScalarReport SSTTransport::advance_k(const std::vector<double>&velocity){
  return advance_impl(false,velocity,nullptr);
 }
 ScalarReport SSTTransport::advance_omega(const std::vector<double>&velocity,const nodals::cpu_mc::m3::WallFaceFit&fit){
+ ++omegaAdvanceCount_;
  return advance_impl(true,velocity,&fit);
 }
 ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u,const nodals::cpu_mc::m3::WallFaceFit*fit){
@@ -259,7 +266,7 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    rhs[ia]+=B[a];for(int b=0;b<8;++b)mat[ia][ent[b]]+=M[a][b];
   }
  }
- if(omegaEq){
+ if(omegaEq && cfg_.omegaStage41=="trace_log"){
   if(!fit||fit->uTau.size()!=m_.faces.size())throw std::runtime_error("SST omega trace requires SAME Spalding wall state");
   for(const RayPoint&r:wallPoints_){
    const auto&t=m_.tets[r.wallCell];const Geo gw=geometry(m_,r.wallCell);
