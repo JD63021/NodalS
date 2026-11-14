@@ -2,6 +2,7 @@
 #include "../mesh/tet_mesh.hpp"
 #include "../parallel/rcb.hpp"
 #include "../case/case_config.hpp"
+#include "../enrichment/enrichment_space.hpp"
 #include <vector>
 
 namespace nodals::cpu_mc::m3 {
@@ -16,5 +17,6 @@ struct WallFaceFit {
   std::size_t rays=0, crossed=0, shortened=0;
 };
 WallFaceFit sample_spalding_faces(const m2::Mesh &mesh, const m2::Ownership &own,
-  int rank, const CaseConfig &cfg, const std::vector<double>&velocity);
+  int rank, const CaseConfig &cfg, const std::vector<double>&velocity,
+  const nodals::cpu_mc::m4::EnrichmentSpace*enrich=nullptr);
 }
