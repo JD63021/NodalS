@@ -192,6 +192,14 @@ struct S22D4DOperator {
   // Option A v2: same tangential-shear replacement in CSR AND matrix-free.
   bool optionAShear=false;
   const Real*optionAWallNu=nullptr;
+  // Frozen V3 cache, shared between coupled matrix-free and exact M3 CSR.
+  bool optionAV3=false;
+  const double *v3Beta=nullptr,*v3Alpha=nullptr,*v3C=nullptr;
+  void set_option_a_v3(bool enabled,const double*beta,
+      const double*alpha,const double*C){
+    optionAV3=enabled;
+    if(enabled){v3Beta=beta;v3Alpha=alpha;v3C=C;}
+  }
   void set_option_a_shear(bool enabled,const Real*wallNu) {
     optionAShear=enabled;optionAWallNu=enabled?wallNu:nullptr;
   }
@@ -254,6 +262,9 @@ struct S22D4DOperator {
         devPoints,devTetConn,devTetVel,devTetGeom,
         devU0,devU1,devU2,devK,devOmega,optionAWallNu,
         devRadius,devNu,devKFloor,devOmegaFloor,nv,physical,y);
+    if(optionAV3)
+      option_a_v3_apply<<<nfaces,64>>>(faces,nfaces,quads,tvel,
+        v3Beta,v3Alpha,v3C,nv,physical,y);
     if(bf3FluxMode)
       s22d4i_Tt_apply<<<(nfaces+255)/256,256>>>(nfaces,faces,tvel,y,y+nv,y+2*(std::size_t)nv);
     s22d4d_zero_fixed<<<(3*nv+255)/256,256>>>(nv,xy,fixed,y);
@@ -970,6 +981,9 @@ inline void m3_build(const S22D4DOperator&op,Real*k,Real*tmp,
       op.devK,op.devOmega,op.optionAWallNu,
       op.devRadius,op.devNu,op.devKFloor,op.devOmegaFloor,
       nnz,k);
+  if(op.optionAV3)
+    option_a_v3_add_m3<<<op.nfaces,64>>>(op.faces,op.nfaces,
+      op.quads,op.A.tetSlot.p,nnz,op.v3Beta,op.v3Alpha,op.v3C,k);
   HXT1_CUDA(cudaMemcpy(tmp,k,bytes,cudaMemcpyDeviceToDevice));
   m3_right_transform<<<op.nfaces,128>>>(op.nfaces,op.faces,op.tvel,
     op.A.row.p,op.A.col.p,nnz,k,tmp,bad);
