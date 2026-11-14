@@ -173,8 +173,9 @@ int main(int argc,char**argv){
   if(rank==0)std::filesystem::create_directories(dir);
   MPI_Barrier(MPI_COMM_WORLD);
   if(rank==0)std::printf("NODALS_CPU_SST_M4_SETUP status=PASS ranks=%d cells=%zu vertices=%zu faces=%zu maxOuter=%d transport=Q1_MASKED_P1BF3 matrix=ENRICHED momentum=M3_BLOCK_MPI pressure=PCG_AMG_SGS wall=SPALDING_PLUS_%s kWall=%s case=%s\n",size,m.tets.size(),m.points.size(),m.faces.size(),cfg.maxOuter,cfg.omegaStage41.c_str(),cfg.kWallMethod.c_str(),casePath.c_str());
-  if(rank==0)std::printf("NODALS_CPU_M4_GRADDIV_CONFIG gamma=%.12g units=m2/s enabled=%d convection=advective space=FULL_P1_BF3_SPALDING pressureSchur=UNCHANGED status=EXPERIMENTAL\n",
-    cfg.gradDivGamma,(int)(cfg.gradDivGamma>0));
+  if(rank==0)std::printf("NODALS_CPU_M4_GRADDIV_CONFIG gamma=%.12g units=m2/s enabled=%d form=%s rhsCorrection=%s convection=advective space=FULL_P1_BF3_SPALDING pressureSchur=UNCHANGED status=EXPERIMENTAL\n",
+    cfg.gradDivGamma,(int)(cfg.gradDivGamma>0),cfg.gradDivForm.c_str(),
+    cfg.gradDivForm=="constraint_p0"?"DG_INLET_MATCHED":"ZERO_POINTWISE_DIV_TARGET");
   const double start=MPI_Wtime();
   bool allLinearOkay=true;int completed=0,refreshes=0;
   double lastFull=0,prevMeanNut=-1;
