@@ -31,6 +31,7 @@ if [[ ! -s "$WORK/mesh/HXT1_mesh.bin" ]]; then
     echo "Missing or empty HXT1 mesh; aborting." >&2; exit 1
 fi
 python3 "$EXP/enable_hybrid_local.py" --app "$APP"
+python3 "$EXP/fix_hybrid_startup.py" --app "$APP"
 echo "EXPERIMENT=$EXP"
 echo "ISOLATED_APP=$APP"
 echo "EDITABLE_CASE=$CASE"
