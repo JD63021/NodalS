@@ -127,6 +127,8 @@
             d_clampXY.p,d_fixed.p,sstG1.tetWallPlans,sstG1.tetWallQuads,
             d_tv.p,d_tg.p,d_s22d4dCoeff.p,(int)BH.wallT.size(),s22d4Gamma,
             d_s22d4iScratch.p,true,sampledConductance};
+          if(alGamma!=0.)
+            i2op.set_al(&B,d_tg.p,d_alQ.p,d_alX.p,d_alY.p,d_alZ.p,alGamma,pin);
           i2op.set_implicit_dev(implicitDevStress,
             d_pts.p,d_tc.p,d_tv.p,d_tg.p,
             d_u0.p,d_u1.p,d_u2.p,TS.k.p,TS.omega.p,
