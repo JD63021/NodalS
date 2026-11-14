@@ -8,6 +8,7 @@
 #include "../pressure/constrained_schur.hpp"
 #include "../initialization/potential_flow.hpp"
 #include "../geometry/wall_distance.hpp"
+#include "../enrichment/enrichment_space.hpp"
 #include "../transport/sst_transport.hpp"
 #include "../case/case_config.hpp"
 #include "../output/flow_vtu.hpp"
@@ -109,8 +110,16 @@ int main(int argc,char**argv){
   const auto own=partition_rcb(m,size);
   const BF3Flux wall(m);
   auto distance=geometric_wall_distance(m,rank);
+  nodals::cpu_mc::m4::EnrichmentSpace enrich(m,distance,cfg);
   std::vector<double> u=potential_velocity(m,cfg.inlet,rank);
-  SSTTransport sst(m,own,cfg,rank,distance);
+  if(enrich.enabled){
+   u.resize((size_t)3*enrich.nent(),0.);
+   for(int e=0;e<enrich.ne;++e)if(enrich.is_fixed(e))
+    for(int i=0;i<3;++i)u[3*(size_t)e+i]=0.;
+   if(rank==0)std::printf("NODALS_CPU_M4_ENRICH_CONFIG enabled=1 extraVectorDofs=%d totalVelocityDofs=%zu utauShape=%.9g yplusCutoff=%.5g strongNoSlip=1 robin=OFF shapeUpdate=FROZEN status=EXPERIMENTAL\n",
+    3*enrich.nr,u.size(),cfg.enrichUTau,cfg.enrichCutoff);
+  }
+  SSTTransport sst(m,own,cfg,rank,distance,&enrich);
   std::vector<double> p(m.tets.size(),0.0);
   const PressureDrop pressureDrop(m,cfg.inlet);
   std::deque<double> dropWindow;double lastDrop=0,lastDropAverage=0,lastDropRangeRel=std::numeric_limits<double>::infinity();bool plateauConverged=false;
@@ -127,8 +136,8 @@ int main(int argc,char**argv){
    m4_diag(u,"u_before_momentum",it,rank);
    m4_diag(p,"p_before_momentum",it,rank);
    const auto oldU=u,oldK=sst.state().k,oldOmega=sst.state().omega;
-   M3Predictor mom(m,own,wall,cfg,rank,oldU,&oldK,&oldOmega,&distance);
-   Schur pressure(m,own,wall,rank,mom.inverse(),cfg.inlet);
+   M3Predictor mom(m,own,wall,cfg,rank,oldU,&oldK,&oldOmega,&distance,&enrich);
+   Schur pressure(m,own,wall,rank,mom.inverse(),cfg.inlet,&enrich);
    std::vector<double> gradP,uStar,cont,dp,bt,deltaU;
    pressure.BT(p,gradP);
    double mom0=0,mom1=0;int momIts=0;
@@ -141,6 +150,8 @@ int main(int argc,char**argv){
    pressure.BT(dp,bt);pressure.C(bt,deltaU);
    u=std::move(uStar);
    for(size_t i=0;i<u.size();++i)u[i]-=deltaU[i];
+   if(enrich.enabled)for(int e=0;e<enrich.ne;++e)if(enrich.is_fixed(e))
+     for(int d=0;d<3;++d)u[3*(size_t)e+d]=0.;
    for(size_t c=0;c<p.size();++c)p[c]-=cfg.alphaP*dp[c];
    m4_diag(u,"u_after_pressure",it,rank);
    m4_diag(p,"p_after_pressure",it,rank);
