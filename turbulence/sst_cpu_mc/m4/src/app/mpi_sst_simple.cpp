@@ -14,6 +14,7 @@
 #include "../output/flow_vtu.hpp"
 #include "../diagnostics/momentum_budget.hpp"
 #include "../diagnostics/inlet_localization.hpp"
+#include "../diagnostics/grad_div_audit.hpp"
 #include <mpi.h>
 #include <cstdio>
 #include <cmath>
@@ -172,6 +173,8 @@ int main(int argc,char**argv){
   if(rank==0)std::filesystem::create_directories(dir);
   MPI_Barrier(MPI_COMM_WORLD);
   if(rank==0)std::printf("NODALS_CPU_SST_M4_SETUP status=PASS ranks=%d cells=%zu vertices=%zu faces=%zu maxOuter=%d transport=Q1_MASKED_P1BF3 matrix=ENRICHED momentum=M3_BLOCK_MPI pressure=PCG_AMG_SGS wall=SPALDING_PLUS_%s kWall=%s case=%s\n",size,m.tets.size(),m.points.size(),m.faces.size(),cfg.maxOuter,cfg.omegaStage41.c_str(),cfg.kWallMethod.c_str(),casePath.c_str());
+  if(rank==0)std::printf("NODALS_CPU_M4_GRADDIV_CONFIG gamma=%.12g units=m2/s enabled=%d convection=advective space=FULL_P1_BF3_SPALDING pressureSchur=UNCHANGED status=EXPERIMENTAL\n",
+    cfg.gradDivGamma,(int)(cfg.gradDivGamma>0));
   const double start=MPI_Wtime();
   bool allLinearOkay=true;int completed=0,refreshes=0;
   double lastFull=0,prevMeanNut=-1;
@@ -213,6 +216,7 @@ int main(int argc,char**argv){
    if(enrich.enabled && (it==1 || it%20==0 || it==cfg.maxOuter)){
      print_momentum_budget(m,enrich,sst,u,p,cfg,it,rank);
      print_inlet_localization(m,enrich,sst,mom.wall_fit(),u,cfg,it,rank);
+     print_grad_div_audit(m,enrich,u,cfg,it,rank);
    }
    if(!std::isfinite(nut))throw std::runtime_error("M4_DIAG_NONFINITE mean_nut at it="+std::to_string(it));
    double deltaK=0,baseK=0,deltaW=0,baseW=0;
