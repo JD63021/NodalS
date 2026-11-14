@@ -35,6 +35,15 @@ def main():
     if not face.is_file() or not kernel.is_file():
         raise FileNotFoundError(f"Missing local November-14 SST source under {root}")
 
+    # Existing isolated app from the y+300 experiment restricted hybrid
+    # Stage41 to sample_log/of_auto.  Extend only that hybrid restriction:
+    # the original pure-tet validator already accepts trace_log.
+    bridge=args.app.expanduser().resolve()/"nodals.py"
+    if not bridge.is_file():raise FileNotFoundError(bridge)
+    replace_once(bridge,
+        "if couette_target not in ('sample_log','of_auto'):",
+        "if couette_target not in ('sample_log','of_auto','trace_log'):")
+
     # The existing HEX omega boundary kernel already supplies symmetric
     # consistency + adjoint terms and a log target; only its host dispatcher
     # was hard-wired to OF_AUTO's interior rank-one penalty.
