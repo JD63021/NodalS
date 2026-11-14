@@ -697,6 +697,18 @@ int main(int argc,char**argv){
     if(implicitDevStress && m3Mode=="m4")
       throw std::runtime_error("implicit deviatoric stress supports M3 FGS/SGS or coupled FGMRES, not experimental M4");
     const bool m3Active=m3Mode!="off";
+    const double alGamma=std::getenv("NODALS_AL_GAMMA")?
+      std::stod(std::getenv("NODALS_AL_GAMMA")):0.;
+    if(!std::isfinite(alGamma)||alGamma<0.)
+      throw std::runtime_error("NODALS_AL_GAMMA must be finite and nonnegative");
+    if(alGamma!=0. && (!stage22d4Live || !stage22d4iEnable ||
+        !stage22d4i3Enable || stage22d4dMode!="coupled" ||
+        (m3Mode!="fgs" && m3Mode!="sgs" && m3Mode!="off") || M.h.nhex!=0 ||
+        M.h.ninterface!=0 || simpleCoupling!="corrected"))
+      throw std::runtime_error("AL requires pure tet, BF3, I3A, corrected SIMPLE and M3 FGS/SGS or coupled FGMRES");
+    std::printf("NODALS_AL_CONFIG gamma=%.12e operator=B_T_MP_INV_B rhs=MINUS_B_T_MP_INV_CSRC "
+      "pressure=I3A_AUGMENTED_DIAGONAL_SURROGATE exactSchur=NO status=%s\n",
+      alGamma,alGamma>0.?"EXPERIMENTAL":"OFF");
     if(momentumFullSupg && m3Mode!="fgs" && m3Mode!="sgs")
       throw std::runtime_error("Full momentum SUPG requires M3 FGS or M3 SGS");
     const int m3Sweeps=s05b1Integer("NODALS_M3_SWEEPS",m3Mode=="sgs"?5:10,1,60);
@@ -1339,6 +1351,28 @@ int main(int argc,char**argv){
     Dev<hxt5b::WallHexQuadCache>
       d_wallCache(wallCacheHost);
     Dev<T>d_contSource(hxt4c::castv<T>(BH.csrc));
+    Dev<T>d_alQ(std::vector<T>(alGamma>0.?(std::size_t)np:1,0));
+    Dev<T>d_alX(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alY(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alZ(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alRhsX(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alRhsY(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alRhsZ(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alDiagX(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alDiagY(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    Dev<T>d_alDiagZ(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
+    if(alGamma!=0.){
+      hxt5d::nodals_al_source_mass<<<(np+255)/256,256>>>(
+        np,d_tg.p,d_contSource.p,d_alQ.p,alGamma,pin);
+      hxt4a::BT_apply(B,d_alQ.p,d_alRhsX.p,d_alRhsY.p,d_alRhsZ.p);
+      HXT1_CUDA(cudaMemset(d_alDiagX.p,0,(std::size_t)nv*sizeof(T)));
+      HXT1_CUDA(cudaMemset(d_alDiagY.p,0,(std::size_t)nv*sizeof(T)));
+      HXT1_CUDA(cudaMemset(d_alDiagZ.p,0,(std::size_t)nv*sizeof(T)));
+      hxt5d::nodals_al_diag<<<np,32>>>(np,B.row.p,B.col.p,
+        B.bx.p,B.by.p,B.bz.p,d_tg.p,alGamma,pin,
+        d_alDiagX.p,d_alDiagY.p,d_alDiagZ.p);
+      HXT1_CUDA(cudaGetLastError());
+    }
     Dev<T>d_dg(std::vector<T>(A.nnz,0)),d_diagDG(std::vector<T>((std::size_t)nv,0)),d_inletRhsX(std::vector<T>((std::size_t)nv,0)),d_inletRhsY(std::vector<T>((std::size_t)nv,0)),d_inletRhsZ(std::vector<T>((std::size_t)nv,0));
     // Stage6.B.3: with zero deviatoric RHS, the staged X/Y RHS is
     // precisely the already allocated inlet RHS. s22b_add_extra uses
