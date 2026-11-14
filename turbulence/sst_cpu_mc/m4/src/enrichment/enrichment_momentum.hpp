@@ -4,6 +4,7 @@
 // using the total enriched SST gradient and advecting velocity.
 // This file never adds an effective wall viscosity or Robin wall drag.
 #include "enrichment_space.hpp"
+#include "grad_div_rank_one.hpp"
 #include "../transport/sst_transport.hpp"
 #include <array>
 #include <cmath>
@@ -47,6 +48,15 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
       for(int i=0;i<3;++i)for(int j=0;j<3;++j)
        EK[3*ia+i][3*ib+j]+=wt*nueff*((i==j?gradDot:0)+
          aa[j]*bb[i]-(2./3.)*aa[i]*bb[j])+(i==j?advection:0.0);
+    }
+    // Assemble the COMPLETE P1+BF3+Spalding grad-div block on the SAME
+    // elevated (6x6xradial) volume quadrature as enriched momentum.
+    // All 12 test/trial shapes contribute, including PP, PE, EP, EE.
+    // It is added to EK (not K), therefore never double-counted.
+    if(cfg.gradDivGamma>0){
+      std::array<std::array<double,3>,12> gg{};
+      for(int a=0;a<12;++a)gg[a]={gp[a].x,gp[a].y,gp[a].z};
+      add_grad_div_rank_one<12>(EK,gg,cfg.gradDivGamma*wt);
     }
   }
   // Original inlet is DG prescribed velocity and is not a no-slip wall.
