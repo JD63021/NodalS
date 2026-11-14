@@ -33,6 +33,10 @@ def main():
         "            'SST22D4_NITSCHE_ENABLE':'0',\n",
         "            # SST22D4_NITSCHE_ENABLE is absent for legacy HEX/TET.\n")
 
+    replace_once(py,
+        "        })\\n    env['SST_G2_VTU_DIR']",
+        "        })\\n        env.pop('SST22D4_NITSCHE_ENABLE', None)\\n    env['SST_G2_VTU_DIR']")
+
     replace_once(cpp,
         """    nodals::stage25::rotate_loaded_tets(M,stage25Degrees);
     nodals::mesh::route_operator_patches(M,std::getenv("SST_PATCH_MAP_FILE")?std::getenv("SST_PATCH_MAP_FILE"):"");
