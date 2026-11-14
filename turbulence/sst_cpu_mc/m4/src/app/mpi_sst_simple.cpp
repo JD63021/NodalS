@@ -12,6 +12,7 @@
 #include "../transport/sst_transport.hpp"
 #include "../case/case_config.hpp"
 #include "../output/flow_vtu.hpp"
+#include "../diagnostics/momentum_budget.hpp"
 #include <mpi.h>
 #include <cstdio>
 #include <cmath>
@@ -208,6 +209,8 @@ int main(int argc,char**argv){
    m4_diag(sst.state().omega,"omega_after_transport",it,rank);
    if(enrich.enabled && (it==1 || it%cfg.printEvery==0))audit_enrichment_wall(m,enrich,u,it,rank);
    const double nut=sst.mean_nut(u);
+   if(enrich.enabled && (it==1 || it%20==0 || it==cfg.maxOuter))
+     print_momentum_budget(m,enrich,sst,u,p,cfg,it,rank);
    if(!std::isfinite(nut))throw std::runtime_error("M4_DIAG_NONFINITE mean_nut at it="+std::to_string(it));
    double deltaK=0,baseK=0,deltaW=0,baseW=0;
    for(size_t i=0;i<oldK.size();++i){deltaK+=std::pow(sst.state().k[i]-oldK[i],2);baseK+=oldK[i]*oldK[i];deltaW+=std::pow(sst.state().omega[i]-oldOmega[i],2);baseW+=oldOmega[i]*oldOmega[i];}
