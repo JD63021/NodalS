@@ -174,13 +174,14 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
    for(int q=0;q<12;++q){
     double ph[8];G g{};face_basis(geom,lf,q,ph,g);
     const double wt=ar*QW[q];
-    const double beta=face.patch==3?wallFit_.qBeta[(size_t)12*t.face[lf]+(size_t)q]:0.0;
+    const double beta=(face.patch==3 && !(enrich_&&enrich_->enabled))?
+      wallFit_.qBeta[(size_t)12*t.face[lf]+(size_t)q]:0.0;
     // GPU full SST Nitsche and DG inlet use local nu_eff at face quadrature.
     const double nuEff=(k_&&omega_&&wallDistance_)?
       config.nu+nodals::cpu_mc::m4::sst_nut_at_point(m,c,
         [&](){std::array<double,4> l{};int n=0;for(int a=0;a<4;++a)if(a!=lf){
           l[a]=n==0?Q0[q]:(n==1?Q1[q]:Q2[q]);++n;}
-          return l;}(),lag_,*k_,*omega_,*wallDistance_,config):config.nu;
+          return l;}(),lag_,*k_,*omega_,*wallDistance_,config,enrich_):config.nu;
     for(int a=0;a<8;++a){
       const double dna=dot(g[a],nn);
       if(face.patch==1){
@@ -194,30 +195,37 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
          if(i==j)K[3*a+i][3*b+j]+=wt*(inflow*ph[a]*ph[b]+nuEff*(-ph[a]*dnb+dna*ph[b]));
         }else{
          const double ij=n[i]*n[j];
-         const double v=beta*((i==j?1.0:0.0)-ij)+config.nitscheGamma*nuEff/h*ij;
+         const double gamma=(enrich_&&enrich_->enabled)?0.0:config.nitscheGamma;
+         const double v=beta*((i==j?1.0:0.0)-ij)+gamma*nuEff/h*ij;
          K[3*a+i][3*b+j]+=wt*ph[a]*ph[b]*v;
-         Kpenalty[3*a+i][3*b+j]+=wt*ph[a]*ph[b]*(config.nitscheGamma*nuEff/h*ij);
+         Kpenalty[3*a+i][3*b+j]+=wt*ph[a]*ph[b]*
+           ((enrich_&&enrich_->enabled)?0.0:config.nitscheGamma*nuEff/h*ij);
         }
        }
       }
     }
    }
   }
-  constrain_cell(K,br,m,c);
+  if(!(enrich_&&enrich_->enabled))constrain_cell(K,br,m,c);
   std::array<double,24>zeroPenaltyRhs{};
-  constrain_cell(Kpenalty,zeroPenaltyRhs,m,c,false);
-  for(int a=0;a<8;++a){
-   const int rowEntity=ent[a],local=localIndex[rowEntity];
+  if(!(enrich_&&enrich_->enabled))constrain_cell(Kpenalty,zeroPenaltyRhs,m,c,false);
+  const int nloc=(enrich_&&enrich_->enabled)?12:8;
+  for(int a=0;a<nloc;++a){
+   const int rowEntity=augmented[a];
+   if(rowEntity<0)continue;
+   const int local=localIndex[rowEntity];
    if(local<0)continue;
-   auto&row=rows[local];
+   auto&row=rows[(size_t)local];
    for(int i=0;i<3;++i){
-     rhs_[3*rowEntity+i]+=br[3*a+i];
-     nitschePenaltyDiag[(std::size_t)3*rowEntity+i]+=Kpenalty[3*a+i][3*a+i];
+     rhs_[3*(size_t)rowEntity+i]+=a<8?br[3*a+i]:Bextra[3*a+i];
+     if(a<8)nitschePenaltyDiag[3*(size_t)rowEntity+i]+=Kpenalty[3*a+i][3*a+i];
    }
-   for(int b=0;b<8;++b){
-    auto&block=row[ent[b]];
+   for(int b=0;b<nloc;++b){
+    if(augmented[b]<0)continue;
+    auto&block=row[augmented[b]];
     for(int i=0;i<3;++i)for(int j=0;j<3;++j)
-      block[3*i+j]+=K[3*a+i][3*b+j];
+       block[3*i+j]+=(a<8&&b<8?K[3*a+i][3*b+j]:0.0)
+         +((enrich_&&enrich_->enabled)?Kextra[3*a+i][3*b+j]:0.0);
    }
   }
  }
