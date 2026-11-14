@@ -1,4 +1,5 @@
 #include "constrained_schur.hpp"
+#include "discrete_constraint_row.hpp"
 #include "pressure_amg.hpp"
 #include <mpi.h>
 #include <cmath>
@@ -30,44 +31,13 @@ Schur::Schur(const Mesh&m,const Ownership&o,const BF3Flux&w,int rank,std::vector
  // For an affine triangle: integral phi_vertex = Area/3 and
  // integral (27*l1*l2*l3) = (9/20)*Area.
  for(int c=0;c<nc;++c){
-  const auto&t=m.tets[c];const auto raw=divergence_coefficients(m,c);
-  Row& row=rows_[c];
-  for(int a=0;a<8;++a){row.entity[a]=a<4?t.v[a]:nv+t.face[a-4];row.physical[a]=raw.b[a];}
-  for(int a=8;a<12;++a)row.entity[a]=(enrich_&&enrich_->enabled)?enrich_->entity(c,a):-1;
-  if(enrich_&&enrich_->enabled){
-   std::array<Vec3,4> b{};enrich_->divergence(c,b);
-   for(int a=0;a<4;++a)row.physical[8+a]=b[a];
-  }
-  for(int lf=0;lf<4;++lf){
-   const int f=t.face[lf];if(m.faces[f].patch!=1)continue;
-   const Vec3 sf=outward_area(m,c,lf);
-   const double a=std::sqrt(dot(sf,sf));
-   if(!(a>0))throw std::runtime_error("Schur: degenerate inlet area");
-   for(int i=0;i<4;++i)if(i!=lf)row.physical[i]=row.physical[i]-(1.0/3.0)*sf;
-   row.physical[4+lf]=row.physical[4+lf]-(9.0/20.0)*sf;
-   // The original GPU uses the prescribed DG inlet flux, not a conforming
-   // velocity Dirichlet condition at inlet-wall intersection vertices.
-   if(enrich_&&enrich_->enabled){
-    std::array<Vec3,4> be{};enrich_->face_flux(c,lf,be);
-    for(int a=0;a<4;++a)row.physical[8+a]=row.physical[8+a]-be[a];
-   }
-   source_[c]+=dot(sf,{inletVelocity[0],inletVelocity[1],inletVelocity[2]});
-  }
-  row.reduced=row.physical;
-  for(int lf=0;lf<4;++lf){
-   const int f=t.face[lf];if(m.faces[f].patch!=3)continue;
-   const Vec3 sf=outward_area(m,c,lf);
-   const double a=std::sqrt(dot(sf,sf));
-   if(!(a>0))throw std::runtime_error("Schur: degenerate wall area");
-   const Vec3 n=(1.0/a)*sf;
-   const double bn=dot(row.reduced[4+lf],n);
-   row.reduced[4+lf]=row.reduced[4+lf]-bn*n;
-   for(int j=0;j<4;++j)if(j!=lf)
-     row.reduced[j]=row.reduced[j]-(20.0/27.0)*bn*n;
-  }
-  if(enrich_&&enrich_->enabled)for(int a=0;a<12;++a)
-   if(row.entity[a]>=0 && enrich_->is_fixed(row.entity[a]))
-    row.physical[a]=row.reduced[a]=Vec3{};
+  const auto assembled=nodals::cpu_mc::m4::build_discrete_constraint_row(
+    m,c,inletVelocity,enrich_);
+  Row& row=rows_[(std::size_t)c];
+  row.entity=assembled.entity;
+  row.physical=assembled.physical;
+  row.reduced=assembled.reduced;
+  source_[(std::size_t)c]=assembled.source;
  }
  if(enrich_&&enrich_->enabled&&rank_==0){
    static bool logged=false;
