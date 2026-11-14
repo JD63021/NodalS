@@ -269,6 +269,7 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
   // the same relaxation shift appears in the predictor operator and rAU.
   const double fac=1.0/config.alphaU-1.0;
   for(int i=0;i<3;++i){
+   const double diagonalBeforeRelax=diag[3*i+i];
    const double shift=fac*scalarRowL1[i];
    rhs_[3*entity+i]+=shift*lag_[3*entity+i];
    diag[3*i+i]+=shift;
@@ -278,8 +279,21 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
    // Match GPU h5b3_finalize_row_l1: Nitsche normal penalty contributes to
    // momentum, but NOT to pressure rAU when schurNitscheGamma=0.
    if(!(momentumDiag>0.0 && pressureMetric>0.0) ||
-       !std::isfinite(momentumDiag) || !std::isfinite(pressureMetric))
+       !std::isfinite(momentumDiag) || !std::isfinite(pressureMetric)){
+     const int nv=(int)mesh_.points.size();
+     const int nbase=nv+(int)mesh_.faces.size();
+     const char*kind=entity<nv?"P1_VERTEX":(entity<nbase?"BF3_FACE":"SPALDING_ENRICH");
+     std::fprintf(stderr,
+       "NODALS_CPU_M4_BAD_MOMENTUM_DIAG rank=%d entity=%d component=%d entityKind=%s "
+       "relaxAlpha=%.17g originalDiag=%.17e scalarRowL1=%.17e relaxationShift=%.17e "
+       "finalMomentumDiag=%.17e nitschePenaltyDiag=%.17e pressureMetric=%.17e "
+       "rowEntries=%zu lagU=%.17e status=FAIL\n",
+       rank_,entity,i,kind,config.alphaU,diagonalBeforeRelax,scalarRowL1[i],shift,
+       momentumDiag,nitschePenaltyDiag[(std::size_t)3*entity+i],
+       pressureMetric,rows[ri].size(),lag_[3*(size_t)entity+i]);
+     std::fflush(stderr);
      throw std::runtime_error("M3: nonpositive relaxed momentum or penalty-free pressure metric");
+   }
    inv_[3*entity+i]=(enrich_&&enrich_->is_fixed(entity))?0.0:1.0/pressureMetric;
   }
   for(int col:keys){cols_.push_back(col);a_.push_back(rows[ri].at(col));}
