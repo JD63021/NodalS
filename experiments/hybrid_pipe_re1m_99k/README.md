@@ -62,3 +62,21 @@ Re-fetch the experiment worktree, edit the existing local case, run `bash
 "$EXP/RUN.sh" dry` and only then `bash "$EXP/RUN.sh" 5`.
 This patch modifies an existing app `.inc` and needs one incremental NVCC
 rebuild. It has not yet been verified by a successful GPU iteration.
+
+## November 14: startup now reaches the SST setup (HXT1 fingerprint)
+
+The second workstation run successfully compiled the full CUDA executable,
+identified 3744 HEX + 95472 TET cells and 3744 interfaces, initialized the
+HEX/TET SST wall and AMG hierarchy, and then stopped at
+`STAGE31_INPUT_FINGERPRINT missing/not SHA256`. This is not a mesh failure.
+
+`enable_hybrid_local.py` now patches the **Python runner only** so that
+`[mesh] hybrid=true` on a preconverted HXT1 binary produces the normal
+Stage31 input fingerprint using SHA256 of HXT1 bytes and the same Re/nu/D
+parameters as the source-mesh contract. This also supports a future checked
+hybrid restart; existing pure-tet and MSH handling remain unchanged.
+
+Refresh the GitHub experiment branch, run `bash "$EXP/RUN.sh" dry` to apply
+this Python-only patch, then execute **the already compiled** binary without
+invoking make: `python3 -u "$APP/nodals.py" run --case "$CASE" --steps 5`.
+The next five GPU iterations are not yet confirmed.
