@@ -28,7 +28,9 @@ void basis(const std::array<double,4>&l,double ph[8]){
  for(int i=0;i<4;++i)ph[i]=l[i];
  for(int i=0;i<4;++i){double b=27.;for(int j=0;j<4;++j)if(j!=i)b*=l[j];ph[4+i]=b;}
 }
-Vec3 interpolate(const Mesh&m,const std::vector<double>&u,int c,const std::array<double,4>&lam){
+Vec3 interpolate(const Mesh&m,const std::vector<double>&u,int c,const std::array<double,4>&lam,
+   const nodals::cpu_mc::m4::EnrichmentSpace*enrich){
+ if(enrich&&enrich->enabled)return enrich->velocity(c,lam,u);
  const int nv=(int)m.points.size();double ph[8];basis(lam,ph);
  const auto&t=m.tets[c];Vec3 out{};
  for(int a=0;a<8;++a){const int e=a<4?t.v[a]:nv+t.face[a-4];
@@ -39,12 +41,14 @@ Vec3 interpolate(const Mesh&m,const std::vector<double>&u,int c,const std::array
 }
 }
 WallFaceFit sample_spalding_faces(const m2::Mesh&m,const m2::Ownership&own,
-  int rank,const CaseConfig&cfg,const std::vector<double>&lag){
+  int rank,const CaseConfig&cfg,const std::vector<double>&lag,
+  const nodals::cpu_mc::m4::EnrichmentSpace*enrich){
  if(cfg.wallSamples!=1)throw std::runtime_error("M3 wall sampler currently requires wall_function.samples=1, matching captured spiral case");
  using ::nodals::wall::ray::TetRayTrace;
  using ::nodals::wall::vector3::V3;
  const int nv=(int)m.points.size(),ne=nv+(int)m.faces.size();
- if(lag.size()!=(std::size_t)3*ne)throw std::runtime_error("wall ray sampler: velocity field size mismatch");
+ if(lag.size()!=(std::size_t)3*((enrich&&enrich->enabled)?enrich->nent():ne))
+   throw std::runtime_error("wall sampler: enlarged velocity size mismatch");
  std::vector<P>pts;pts.reserve(m.points.size());for(Vec3 x:m.points)pts.push_back(p(x));
  std::vector<T>tets;tets.reserve(m.tets.size());for(const auto&t:m.tets)tets.push_back(t.v);
  const TetRayTrace trace(std::move(pts),std::move(tets));
@@ -85,7 +89,7 @@ WallFaceFit sample_spalding_faces(const m2::Mesh&m,const m2::Ownership&own,
    Vec3 pic{};
    for(int k=0;k<4;++k){const double s=.45*exit*(1.+GX4[k]);
      auto bary=bary0;for(int j=0;j<4;++j)bary[j]+=s*dr[j];
-     pic=pic+(.5*GW4[k])*interpolate(m,lag,c,bary);
+     pic=pic+(.5*GW4[k])*interpolate(m,lag,c,bary,enrich);
    }
    double y=cfg.spaldingY3;
    ::nodals::wall::ray::Hit hit;
@@ -99,7 +103,7 @@ WallFaceFit sample_spalding_faces(const m2::Mesh&m,const m2::Ownership&own,
      if(!(chosen>=.25*y && chosen<y))throw std::runtime_error("M4 LOCAL_RAY_UNSAFE face="+std::to_string(f));
      y=chosen;hit=trace.trace(c,originP,inwardP,{y},cfg.maxCrossings,cfg.baryTolerance).front();++out.shortened;
    }
-   const Vec3 uv=interpolate(m,lag,hit.cell,hit.bary);
+   const Vec3 uv=interpolate(m,lag,hit.cell,hit.bary,enrich);
    V3 samples[5]{};samples[2]=V3{uv.x,uv.y,uv.z};
    const double heights[5]={y/3.,2.*y/3.,y,4.*y/3.,5.*y/3.};
    const V3 n{normal.x,normal.y,normal.z},pbar{pic.x,pic.y,pic.z};
