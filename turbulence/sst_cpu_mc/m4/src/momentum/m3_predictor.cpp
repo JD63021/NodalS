@@ -245,6 +245,15 @@ M3Predictor::M3Predictor(const Mesh&m,const Ownership&o,const BF3Flux&w,
     for(int a=0;a<12;++a){
       if(row.entity[a]!=augmented[a])
         throw std::runtime_error("constraint_p0 B entity ordering mismatch");
+      // In this strongly constrained enriched space, Schur's reduced
+      // B and physical B must agree on every free velocity coefficient.
+      if(row.entity[a]>=0&&!enrich_->is_fixed(row.entity[a])){
+        const auto delta=row.physical[a]-row.reduced[a];
+        const double dnorm=std::sqrt(dot(delta,delta));
+        const double rnorm=std::sqrt(dot(row.physical[a],row.physical[a]));
+        if(dnorm>1e-12*std::max(1.0,rnorm))
+          throw std::runtime_error("constraint_p0 physical/reduced B mismatch on free velocity entity");
+      }
       const auto v=row.physical[a];
       bvec[a]={v.x,v.y,v.z};
     }
