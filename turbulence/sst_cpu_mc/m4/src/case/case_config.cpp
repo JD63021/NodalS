@@ -20,6 +20,16 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
  auto real=[&](std::string key)->double{return std::stod(must(key));};
  auto intval=[&](std::string key)->int{return std::stoi(must(key));};
  CaseConfig c;c.casePath=path;c.mesh=meshPath;c.expectRanks=n;
+ c.enrichEnabled=a.count("enrichment.enabled")&&a.at("enrichment.enabled")=="true";
+ c.enrichUTau=a.count("enrichment.utau_initial")?std::stod(a.at("enrichment.utau_initial")):0.5859;
+ c.enrichCutoff=a.count("enrichment.yplus_cutoff")?std::stod(a.at("enrichment.yplus_cutoff")):80.;
+ c.enrichRadialQuad=a.count("enrichment.quadrature_order")?std::stoi(a.at("enrichment.quadrature_order")):24;
+ if(c.enrichEnabled&&(!(c.enrichUTau>0)||!(c.enrichCutoff>0)||
+    c.enrichRadialQuad<4||c.enrichRadialQuad>48))
+   throw std::runtime_error("invalid enrichment initial wall friction velocity / cutoff / quadrature");
+ if(c.enrichEnabled && a.count("wall_function.momentum_bc") &&
+    a.at("wall_function.momentum_bc")!="strong_noslip_enriched")
+   throw std::runtime_error("enrichment requires wall_function.momentum_bc=strong_noslip_enriched");
  c.nu=real("physics.kinematic_viscosity");c.diameter=real("mesh.diameter");c.alphaU=real("simple.ur_u");c.alphaP=real("simple.ur_p");
  c.convection=must("convection.form");c.stress=must("stress.form");c.method=must("solver.u.method");
  c.momSweeps=a.count("solver.u.sweeps")?intval("solver.u.sweeps"):2;
