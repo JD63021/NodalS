@@ -41,6 +41,7 @@ inline void print_inlet_localization(const m2::Mesh&m,const EnrichmentSpace&spac
   double maxSpeed=0,axialMin=std::numeric_limits<double>::infinity();
   double maxAxialError=0;
   double axialAtMax=0,wallDistanceAtMax=0;
+  double p1AtMax=0,bf3AtMax=0,enrichAtMax=0,divAtMax=0;
   int cellAtMax=-1,nsamples=0,negativeAxial=0;
  };
  Peak bins[NZ]{};
@@ -81,6 +82,25 @@ inline void print_inlet_localization(const m2::Mesh&m,const EnrichmentSpace&spac
    if(us>b.maxSpeed){
     b.maxSpeed=us;b.axialAtMax=axial;b.wallDistanceAtMax=y;
     b.cellAtMax=(int)c;
+    // Decompose actual physical u at this hot point into the three
+    // finite-element function-space contributions, not coefficient norms.
+    double ph[12];m2::Vec3 grad[12];space.shape((int)c,l,ph,grad);
+    m2::Vec3 p1{},bf3{},spalding{};
+    double div=0;
+    for(int a=0;a<12;++a){
+     const int id=space.entity((int)c,a);
+     if(id<0)continue;
+     const m2::Vec3 dof{u[3*(size_t)id],u[3*(size_t)id+1],u[3*(size_t)id+2]};
+     const auto contribution=ph[a]*dof;
+     if(a<4)p1=p1+contribution;
+     else if(a<8)bf3=bf3+contribution;
+     else spalding=spalding+contribution;
+     div+=dot(grad[a],dof);
+    }
+    b.p1AtMax=std::sqrt(dot(p1,p1));
+    b.bf3AtMax=std::sqrt(dot(bf3,bf3));
+    b.enrichAtMax=std::sqrt(dot(spalding,spalding));
+    b.divAtMax=div;
    }
    if(k>peakK){peakK=k;peakKAx=axial;peakKCell=(int)c;}
    if(omega>peakOmega){peakOmega=omega;peakOmegaAx=axial;peakOmegaCell=(int)c;}
@@ -155,12 +175,46 @@ inline void print_inlet_localization(const m2::Mesh&m,const EnrichmentSpace&spac
    actualAxial[j]/area[j]/speed,minAxial[j]/speed,maxAxial[j]/speed,
    prescribedFlux[j],computedFlux[j],count[j]);
  }
+ // The natural outlet can admit backflow; check its signed flux directly.
+ double outletArea=0,backArea=0,netOutlet=0,reverseOutlet=0,maxInflow=0;
+ int backCount=0,totalCount=0;
+ for(const auto&f:m.faces)if(f.patch==2){
+  const int c=f.cell0,id=(int)(&f-m.faces.data());
+  if(c<0)continue;
+  const auto&t=m.tets[(size_t)c];
+  int lf=-1;for(int j=0;j<4;++j)if(t.face[j]==id)lf=j;
+  if(lf<0)throw std::runtime_error("outlet backflow: missing local face");
+  const auto av=outward_area(m,c,lf);
+  const double areaFace=std::sqrt(dot(av,av));
+  if(!(areaFace>0))throw std::runtime_error("outlet backflow: zero face area");
+  const auto n=(1./areaFace)*av;
+  int ids[3],jv=0;for(int j=0;j<4;++j)if(j!=lf)ids[jv++]=j;
+  for(int i=0;i<6;++i)for(int j=0;j<6;++j){
+   const double x=q[i],z=q[j];
+   std::array<double,4> l{};
+   l[ids[0]]=x;l[ids[1]]=(1-x)*z;l[ids[2]]=(1-x)*(1-z);
+   const double wt=2*areaFace*w[i]*w[j]*(1-x);
+   const auto vel=space.velocity(c,l,u);
+   const double vn=dot(vel,n);
+   netOutlet+=wt*vn;outletArea+=wt;++totalCount;
+   if(vn<0){reverseOutlet-=wt*vn;backArea+=wt;
+    maxInflow=std::max(maxInflow,-vn);++backCount;}
+  }
+ }
+ if(outletArea>0)
+  std::printf("NODALS_CPU_M4_OUTLET_BACKFLOW it=%d netFlux=%.12e reverseFluxMagnitude=%.12e backflowAreaFraction=%.9g maxInwardNormalOverU=%.9g reverseQuadratureFraction=%.9g outletSamples=%d status=DIAGNOSTIC\n",
+   it,netOutlet,reverseOutlet,backArea/outletArea,maxInflow/speed,
+   totalCount>0?(double)backCount/totalCount:0,totalCount);
  for(int j=0;j<NZ;++j)if(wallUCount[j]>0){
   std::printf("NODALS_CPU_M4_WALL_FIT_BIN it=%d zone=%d xUpperD=%.9g meanLaggedUTau=%.9g maxLaggedUTau=%.9g fitSamples=%.0f status=DIAGNOSTIC\n",
    it,j,cuts[j],wallUSum[j]/wallUCount[j],wallUMax[j],wallUCount[j]);
  }
  for(int j=0;j<NZ;++j)if(bins[j].nsamples){
   const auto&b=bins[j];
+  std::printf("NODALS_CPU_M4_VELOCITY_MODES it=%d zone=%d maxSpeedOverU=%.9g p1AtMaxOverU=%.9g bf3AtMaxOverU=%.9g spaldingAtMaxOverU=%.9g divAtMaxDOverU=%.9g maxSpeedCell=%d maxSpeedAxialD=%.9g maxSpeedWallDistanceD=%.9g status=DIAGNOSTIC\n",
+   it,j,b.maxSpeed/speed,b.p1AtMax/speed,b.bf3AtMax/speed,
+   b.enrichAtMax/speed,b.divAtMax*D/speed,
+   b.cellAtMax,b.axialAtMax/D,b.wallDistanceAtMax/D);
   std::printf("NODALS_CPU_M4_AXIAL_SPIKE_BIN it=%d zone=%d xUpperD=%.9g maxSpeedOverU=%.9g maxAxialDeviationOverU=%.9g minAxialOverU=%.9g negativeSampleFraction=%.9g maxSpeedCell=%d maxSpeedAxialD=%.9g maxSpeedWallDistanceD=%.9g count=%d status=DIAGNOSTIC\n",
     it,j,cuts[j],b.maxSpeed/speed,b.maxAxialError/speed,
     b.axialMin/speed,(double)b.negativeAxial/b.nsamples,
