@@ -9,6 +9,11 @@ def replace_one(path, old, new):
     data=path.read_text()
     if new in data:
         print("ALREADY_PATCHED",path);return
+    # Startup patch adds an env.pop() between the hybrid block and this
+    # original anchor; do not duplicate the entire hybrid configuration
+    # when RUN.sh is called repeatedly after a successful first patch.
+    if "env['SST_G2_VTU_DIR']" in old and "env.pop('SST22D4_NITSCHE_ENABLE', None)" in data:
+        print("ALREADY_PATCHED_HYBRID_ENV",path);return
     n=data.count(old)
     if n!=1:
         raise RuntimeError(f"{path}: expected one source anchor, found {n}: {old[:90]}")
