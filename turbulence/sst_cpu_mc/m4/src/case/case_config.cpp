@@ -32,8 +32,13 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
    throw std::runtime_error("enrichment requires wall_function.momentum_bc=strong_noslip_enriched");
  c.nu=real("physics.kinematic_viscosity");c.diameter=real("mesh.diameter");c.alphaU=real("simple.ur_u");c.alphaP=real("simple.ur_p");
  c.gradDivGamma=a.count("momentum.grad_div_gamma")?real("momentum.grad_div_gamma"):0.0;
+ c.gradDivForm=a.count("momentum.grad_div_form")?must("momentum.grad_div_form"):"volume";
  if(!(std::isfinite(c.gradDivGamma)&&c.gradDivGamma>=0.0))
    throw std::runtime_error("momentum.grad_div_gamma must be finite and nonnegative (m2/s)");
+ if(c.gradDivForm!="volume"&&c.gradDivForm!="constraint_p0")
+   throw std::runtime_error("momentum.grad_div_form must be volume or constraint_p0");
+ if(c.gradDivForm=="constraint_p0"&&!c.enrichEnabled)
+   throw std::runtime_error("experimental constraint_p0 form currently requires strong-no-slip enrichment");
  c.convection=must("convection.form");c.stress=must("stress.form");c.method=must("solver.u.method");
  c.momSweeps=a.count("solver.u.sweeps")?intval("solver.u.sweeps"):2;
  c.momOmega=a.count("solver.u.omega")?real("solver.u.omega"):0.7;
