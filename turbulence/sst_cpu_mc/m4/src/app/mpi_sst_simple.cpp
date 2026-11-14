@@ -203,7 +203,7 @@ int main(int argc,char**argv){
    const double post=norm(cont),postPin=cont[0],postSum=sum(cont);
    double active=0;for(size_t i=1;i<cont.size();++i)active+=cont[i]*cont[i];active=std::sqrt(active);
    const double fluxMax=wall.max_mean_flux(u);
-   const auto kRes=sst.advance_k(u);
+   const auto kRes=sst.advance_k(u,mom.wall_fit());
    m4_diag(sst.state().k,"k_after_transport",it,rank);
    const auto wRes=sst.advance_omega(u,mom.wall_fit());
    m4_diag(sst.state().omega,"omega_after_transport",it,rank);
