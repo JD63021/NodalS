@@ -35,7 +35,7 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
     bool present=false;for(int i=8;i<12;++i)present|=enrich.entity(cell,i)>=0;
     if(!present)continue;
     const double nuT=sst_nut_at_point(m,cell,l,lag,k,omega,distance,cfg,&enrich);
-    const double nueff=cfg.nu+nuT;
+    const double nueff=cfg.nu+cfg.momentumNutScale*nuT;
     if(!(nueff>0)||!std::isfinite(nueff))throw std::runtime_error("enrichment invalid SST viscosity");
     const Vec3 U=enrich.velocity(cell,l,lag);
     const double wt=det*wr[ir]*wr[is]*w[iz]*oa*oa*ob;
@@ -70,7 +70,7 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
       double ph[12];Vec3 g[12];enrich.shape(cell,l,ph,g);
       const double nuT=sst_nut_at_point(m,cell,l,lag,k,omega,distance,cfg,&enrich);
       const double wt=2*ar*wf[iq]*wf[jq]*(1-a);
-      const double nueff=cfg.nu+nuT;
+      const double nueff=cfg.nu+cfg.momentumNutScale*nuT;
       for(int i=0;i<12;++i)if(enrich.entity(cell,i)>=0){
        const double dni=dot(g[i],n);
        if(i>=8)for(int d=0;d<3;++d)ER[3*i+d]+=wt*(inflow*ph[i]+nueff*dni)*bulk[d];
