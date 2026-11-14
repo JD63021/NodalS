@@ -275,8 +275,10 @@ def make_invocation(cp, args, mesh, source_mesh, mesh_sha, output):
         if state!='q1':
             raise ValueError('trace_log currently supports masked-P1/Q1 SST')
         tg=number(cp,'omega_wall','trace_gamma',50.0)
-        if not (10<=tg<=100000):
-            raise ValueError('omega_wall.trace_gamma must be between 10 and 100000')
+        # No arbitrary upper penalty limit: the native symmetric trace Nitsche
+        # assembly checks the resulting coefficient for finite positivity.
+        if not (math.isfinite(tg) and tg>0.0):
+            raise ValueError('omega_wall.trace_gamma must be finite and positive')
     if couette_target=='couette_point3':
         if samples!=5 or omega_sample!=3:
             raise ValueError('couette_point3 needs wall_function.samples=5 and omega_wall.sample_index=3')
