@@ -75,10 +75,15 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
    c.omegaPenaltyLength=real("omega_wall.penalty_length");
  if(!(c.omegaPenaltyLength>0))c.omegaPenaltyLength=4.0*c.spaldingY3/3.0;
  c.omegaY3=4.4084029504620439e-4*(c.diameter/0.004)*c.omegaScale;
+ c.debugFixedTargetUTau=a.count("sst.debug_fixed_target_utau")?real("sst.debug_fixed_target_utau"):-1.0;
+ if(a.count("sst.debug_fixed_target_utau") && (!std::isfinite(c.debugFixedTargetUTau)||c.debugFixedTargetUTau<=0))
+   throw std::runtime_error("DIAGNOSTIC sst.debug_fixed_target_utau must be strictly positive");
  c.kWallMethod=a.count("k_wall.method")?a.at("k_wall.method"):"no_flux";
  c.kWallGamma=a.count("k_wall.penalty_gamma")?real("k_wall.penalty_gamma"):1000.0;
  c.kWallSampleIndex=a.count("k_wall.sample_index")?intval("k_wall.sample_index"):3;
  c.kWallPenaltyLength=a.count("k_wall.penalty_length")?real("k_wall.penalty_length"):c.omegaPenaltyLength;
+ if(c.debugFixedTargetUTau>0 && c.omegaStage41!="sample_log")
+   throw std::runtime_error("DIAGNOSTIC fixed wall uTau targets only valid with sample_log omega");
  if(c.kWallMethod!="no_flux"&&c.kWallMethod!="equilibrium_spalding")
    throw std::runtime_error("k_wall.method must be no_flux or equilibrium_spalding");
  if(c.kWallMethod=="equilibrium_spalding"&&
