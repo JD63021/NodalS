@@ -38,7 +38,7 @@ struct Carrier {double gradU[9]{},gk[3]{},gw[3]{},k=0,omega=0,d=0;Vec3 vel{};};
 Carrier carrier(const Mesh&m,int c,const std::array<double,4>&l,
               const Vec8&gp,const double phi[8],const std::vector<double>&u,
               const std::vector<double>&k,const std::vector<double>&w,
-              const std::vector<double>&distance){
+              const std::vector<double>&distance,const EnrichmentSpace*enrich){
  Carrier a;const auto&t=m.tets[c];const int nv=(int)m.points.size();
  for(int i=0;i<4;++i)a.d+=l[i]*distance[t.v[i]];
  for(int b=0;b<8;++b){const int ent=b<4?t.v[b]:nv+t.face[b-4];
@@ -52,6 +52,15 @@ Carrier carrier(const Mesh&m,int c,const std::array<double,4>&l,
   a.vel.x+=phi[b]*ub[0];a.vel.y+=phi[b]*ub[1];a.vel.z+=phi[b]*ub[2];
   a.gk[0]+=kb*gp[b].x;a.gk[1]+=kb*gp[b].y;a.gk[2]+=kb*gp[b].z;
   a.gw[0]+=wb*gp[b].x;a.gw[1]+=wb*gp[b].y;a.gw[2]+=wb*gp[b].z;
+ }
+ if(enrich&&enrich->enabled){
+  double ephi[12];Vec3 eg[12];enrich->shape(c,l,ephi,eg);
+  for(int b=8;b<12;++b){const int id=enrich->entity(c,b);if(id<0)continue;
+    const double coeff[3]={u[3*(size_t)id],u[3*(size_t)id+1],u[3*(size_t)id+2]};
+    const double gg[3]={eg[b].x,eg[b].y,eg[b].z};
+    for(int i=0;i<3;++i)for(int d=0;d<3;++d)a.gradU[3*i+d]+=coeff[i]*gg[d];
+    a.vel.x+=ephi[b]*coeff[0];a.vel.y+=ephi[b]*coeff[1];a.vel.z+=ephi[b]*coeff[2];
+  }
  }
  return a;
 }
@@ -90,16 +99,16 @@ const ConvectionTensor& conv_tensor(){
 
 double sst_nut_at_point(const Mesh&m,int c,const std::array<double,4>&l,
  const std::vector<double>&u,const std::vector<double>&k,const std::vector<double>&omega,
- const std::vector<double>&distance,const CaseConfig&cfg){
+ const std::vector<double>&distance,const CaseConfig&cfg,const EnrichmentSpace*enrich){
  const auto geom=geometry(m,c);double ph[8];Vec8 gp{};shape(geom,l,ph,gp);
- return physics(carrier(m,c,l,gp,ph,u,k,omega,distance),cfg).nut;
+ return physics(carrier(m,c,l,gp,ph,u,k,omega,distance,enrich),cfg).nut;
 }
 void momentum_turbulent_deviatoric(Element24&K,const Mesh&m,int c,const std::vector<double>&u,
  const std::vector<double>&k,const std::vector<double>&omega,
- const std::vector<double>&distance,const CaseConfig&cfg){
+ const std::vector<double>&distance,const CaseConfig&cfg,const EnrichmentSpace*enrich){
  const auto geom=geometry(m,c);
  for(int q=0;q<24;++q){const auto l=q24(q);double ph[8];Vec8 gp{};shape(geom,l,ph,gp);
-  const auto state=carrier(m,c,l,gp,ph,u,k,omega,distance);
+  const auto state=carrier(m,c,l,gp,ph,u,k,omega,distance,enrich);
   const auto ss=physics(state,cfg);const double nuT=ss.nut;
   if(!std::isfinite(nuT)||nuT<0)throw std::runtime_error("nonfinite turbulent viscosity in momentum");
   const double weight=geom.det*quad::w[q]*nuT;
@@ -112,9 +121,9 @@ void momentum_turbulent_deviatoric(Element24&K,const Mesh&m,int c,const std::vec
  }
 }
 SSTTransport::SSTTransport(const Mesh&m,const Ownership&own,const CaseConfig&cfg,int rank,
- const std::vector<double>&wallDistance)
+ const std::vector<double>&wallDistance,const EnrichmentSpace*enrich)
 :m_(m),owners_(own),cfg_(cfg),rank_(rank),nv_((int)m.points.size()),
- ne_((int)m.points.size()+(int)m.faces.size()),distance_(wallDistance){
+ ne_((int)m.points.size()+(int)m.faces.size()),enrich_(enrich),distance_(wallDistance){
  if(distance_.size()!=m.points.size())throw std::runtime_error("SST: wall distance size mismatch");
  if(cfg.sstSpace!="q1"||cfg.compactP1)throw std::runtime_error("M4 requires original masked Q1 with BF3 enrichment in matrix");
  if(cfg.omegaMethod!="of_auto"||cfg.omegaStage41!="trace_log"||cfg.omegaIndex!=3)
@@ -162,7 +171,8 @@ ScalarReport SSTTransport::advance_omega(const std::vector<double>&velocity,cons
  return advance_impl(true,velocity,&fit);
 }
 ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u,const nodals::cpu_mc::m3::WallFaceFit*fit){
- if((int)u.size()!=3*ne_)throw std::runtime_error("SST scalar velocity size mismatch");
+ if((int)u.size()!=3*((enrich_&&enrich_->enabled)?enrich_->nent():ne_))
+   throw std::runtime_error("SST scalar enriched velocity size mismatch");
  const int N=nv_;
  using Row=std::unordered_map<int,double>;
  std::vector<int> owned,localOf(N,-1);owned.reserve((size_t)N/16+20);
@@ -180,7 +190,7 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
   double M[4][8]{},B[4]{};
   // Molecular and SST turbulent diffusion/reaction/source at the 24 GPU points.
   for(int q=0;q<24;++q){auto l=q24(q);double ph[8];Vec8 gp{};shape(g,l,ph,gp);
-   const Carrier a=carrier(m_,c,l,gp,ph,u,k,omega,distance_);
+   const Carrier a=carrier(m_,c,l,gp,ph,u,k,omega,distance_,enrich_);
    const auto ss=physics(a,cfg_);
    const double extra=(omegaEq?ss.sigmaW:ss.sigmaK)*ss.nut;
    const double diffusion=cfg_.nu+extra;
@@ -206,6 +216,27 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    }
    M[a][b]+=g.det*v;
   }
+  // Existing pretabulated convection tensor covers only the P1+BF3 carrier.
+  // Add the enriched velocity carrier against all masked P1 scalar rows.
+  if(enrich_&&enrich_->enabled){
+   constexpr double X[5]={.0469100770306680185,.23076534494715845,.5,.7692346550528415,.95308992296933193};
+   constexpr double W[5]={.11846344252809449,.23931433524968326,.28444444444444450,.23931433524968326,.11846344252809449};
+   for(int ir=0;ir<5;++ir)for(int is=0;is<5;++is)for(int iz=0;iz<5;++iz){
+    const double a=X[ir],b=X[is],z=X[iz],oma=1-a,omb=1-b;
+    std::array<double,4> l{oma*omb*(1-z),a,oma*b,oma*omb*z};
+    double ep[12];Vec3 eg[12];enrich_->shape(c,l,ep,eg);
+    Vec3 ve{};
+    for(int j=8;j<12;++j){const int e=enrich_->entity(c,j);if(e<0)continue;
+      const Vec3 ue{u[3*(size_t)e],u[3*(size_t)e+1],u[3*(size_t)e+2]};
+      ve=ve+ep[j]*ue;
+    }
+    if(dot(ve,ve)==0.)continue;
+    double ph[8];Vec8 gp{};shape(g,l,ph,gp);
+    const double wt=g.det*W[ir]*W[is]*W[iz]*oma*oma*omb;
+    for(int a2=0;a2<4;++a2)for(int b2=0;b2<8;++b2)
+      M[a2][b2]+=wt*ph[a2]*dot(ve,gp[b2]);
+   }
+  }
   // Exact 12-point GPU DG inlet for scalar transport.
   for(int lf=0;lf<4;++lf){const auto&f=m_.faces[t.face[lf]];
    if(f.patch!=1)continue;
@@ -215,7 +246,7 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    int verts[3],j=0;for(int a=0;a<4;++a)if(a!=lf)verts[j++]=a;
    for(int q=0;q<12;++q){std::array<double,4> l{};l[verts[0]]=L0[q];l[verts[1]]=L1[q];l[verts[2]]=L2[q];
     double ph[8];Vec8 gp{};shape(g,l,ph,gp);
-    const auto sc=physics(carrier(m_,c,l,gp,ph,u,k,omega,distance_),cfg_);
+    const auto sc=physics(carrier(m_,c,l,gp,ph,u,k,omega,distance_,enrich_),cfg_);
     const double nuEff=cfg_.nu+(omegaEq?sc.sigmaW:sc.sigmaK)*sc.nut;
     const double wt=ar*QW[q];
     for(int a=0;a<4;++a){const double dn=dot(gp[a],n);
@@ -236,7 +267,7 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
    const double area=std::sqrt(dot(af,af));const Vec3 n=(1.0/area)*af;
    const double h=3.*t.volume/area;
    const Geo gs=geometry(m_,r.hitCell);double phs[8];Vec8 gps{};shape(gs,r.bary,phs,gps);
-   const Carrier a=carrier(m_,r.hitCell,r.bary,gps,phs,u,k,omega,distance_);
+   const Carrier a=carrier(m_,r.hitCell,r.bary,gps,phs,u,k,omega,distance_,enrich_);
    const auto ss=physics(a,cfg_);
    const double ut=fit->qUTau[(size_t)12*r.face+(size_t)r.q];const double target=ut/(std::sqrt(0.09)*0.4*r.y);
    // Pure logarithmic target, STAGE41_OMEGA_MODE=trace_log. GPU source uses
@@ -315,18 +346,18 @@ ScalarReport SSTTransport::advance_impl(bool omegaEq,const std::vector<double>&u
 double SSTTransport::cell_nut(int c,const std::vector<double>&u)const{
  const Geo g=geometry(m_,c);double ph[8];Vec8 gr{};
  std::array<double,4> center{.25,.25,.25,.25};shape(g,center,ph,gr);
- return physics(carrier(m_,c,center,gr,ph,u,state_.k,state_.omega,distance_),cfg_).nut;
+ return physics(carrier(m_,c,center,gr,ph,u,state_.k,state_.omega,distance_,enrich_),cfg_).nut;
 }
 void SSTTransport::refresh_wall_rays(){
  // Reuse the unchanged GPU geometric BVH distance; only re-trace the scalar wall points.
- SSTTransport refreshed(m_,owners_,cfg_,rank_,distance_);
+ SSTTransport refreshed(m_,owners_,cfg_,rank_,distance_,enrich_);
  wallPoints_.swap(refreshed.wallPoints_);
 }
 double SSTTransport::mean_nut(const std::vector<double>&u)const{
  double l=0,v=0;
  for(int c=0;c<(int)m_.tets.size();++c)if(owners_.cell[c]==rank_){
   const Geo g=geometry(m_,c);double ph[8];Vec8 gr{};std::array<double,4> center{.25,.25,.25,.25};shape(g,center,ph,gr);
-  const auto ss=physics(carrier(m_,c,center,gr,ph,u,state_.k,state_.omega,distance_),cfg_);
+  const auto ss=physics(carrier(m_,c,center,gr,ph,u,state_.k,state_.omega,distance_,enrich_),cfg_);
   l+=ss.nut*m_.tets[c].volume;v+=m_.tets[c].volume;
  }
  double a[2]={l,v},b[2]{};MPI_Allreduce(a,b,2,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
