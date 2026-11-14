@@ -697,6 +697,9 @@ int main(int argc,char**argv){
     if(implicitDevStress && m3Mode=="m4")
       throw std::runtime_error("implicit deviatoric stress supports M3 FGS/SGS or coupled FGMRES, not experimental M4");
     const bool m3Active=m3Mode!="off";
+    const bool stage22d4i3Enable=std::getenv("SST22D4I3A_SCHUR") &&
+       std::string(std::getenv("SST22D4I3A_SCHUR"))=="1";
+
     const double alGamma=std::getenv("NODALS_AL_GAMMA")?
       std::stod(std::getenv("NODALS_AL_GAMMA")):0.;
     if(!std::isfinite(alGamma)||alGamma<0.)
@@ -1569,8 +1572,6 @@ int main(int argc,char**argv){
     Dev<T>d_f1bGateCached(std::vector<T>(f1bGpuGate&&f1bFrozenWall?(std::size_t)3*nv:1u,0));
     Dev<T>d_f1bGateDiff(std::vector<T>(f1bGpuGate&&f1bFrozenWall?(std::size_t)3*nv:1u,0));
     // I2: device-resident snapshots and temporary buffers for reduced post-SIMPLE residual.
-    const bool stage22d4i3Enable=std::getenv("SST22D4I3A_SCHUR") &&
-       std::string(std::getenv("SST22D4I3A_SCHUR"))=="1";
     if(stage22d4i3Enable && !stage22d4iEnable)
       throw std::runtime_error("I3A requires BF3 constrained coupled momentum");
     Dev<T>d_i3penX(std::vector<T>(stage22d4i3Enable?(std::size_t)A.nnz:1,0));
