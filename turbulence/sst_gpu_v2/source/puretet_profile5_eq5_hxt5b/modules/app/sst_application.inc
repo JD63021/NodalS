@@ -584,7 +584,13 @@ int main(int argc,char**argv){
     if(optionARaw && std::string(optionARaw)!="0" && !optionA)
       throw std::runtime_error("NODALS_OPTION_A_OF12_NOSLIP must be 0 or 1");
     const char* optionAShearRaw=std::getenv("NODALS_OPTION_A_SHEAR_ACTIVE");
-    const bool optionAShearActive=optionA &&
+    const char* optionAV3Raw=std::getenv("NODALS_OPTION_A_V3_ACTIVE");
+    if(optionAV3Raw && std::string(optionAV3Raw)!="0" &&
+       std::string(optionAV3Raw)!="1")
+      throw std::runtime_error("NODALS_OPTION_A_V3_ACTIVE must be 0 or 1");
+    const bool optionAV3Active=optionA && optionAV3Raw &&
+      std::string(optionAV3Raw)=="1";
+    const bool optionAShearActive=optionA && !optionAV3Active &&
       (!optionAShearRaw || std::string(optionAShearRaw)=="1");
     if(optionAShearRaw && std::string(optionAShearRaw)!="0" &&
        std::string(optionAShearRaw)!="1")
@@ -835,7 +841,8 @@ int main(int argc,char**argv){
       }
       std::printf("NODALS_OPTION_A enabled=1 wallFaces=%zu wallTets=%zu model=%s stress=IMPLICIT_DEVIATORIC noRobin=1 validation=EXPERIMENTAL\n",
         BH.wallT.size(),BH.wallT.size(),
-        optionAShearActive?"NO_SLIP_SHEAR_REPLACEMENT_V2":"NO_SLIP_ORDINARY_SST_CONTROL");
+        optionAV3Active?"NO_SLIP_PROJECTED_WALL_V3":
+          (optionAShearActive?"NO_SLIP_SHEAR_REPLACEMENT_V2":"NO_SLIP_ORDINARY_SST_CONTROL"));
     }
     auto fixed=hxt5b::plug_initial(M,inlet23);
     double plugVertexErr=0.0,plugEnrichMax=0.0;
@@ -1569,8 +1576,13 @@ int main(int argc,char**argv){
     // F2: three face scalars [beta,uTau,yPlus] per wall triangle.
     Dev<double>d_f2FaceFit(std::vector<double>(
       f2FaceSpalding ? (std::size_t)3*BH.wallT.size() : 1u,0.));
-    Dev<T>d_optionANu(std::vector<T>(optionA?(std::size_t)M.h.ntet:1u,Real(0)));
+    Dev<T>d_optionANu(std::vector<T>(optionAShearActive?(std::size_t)M.h.ntet:1u,Real(0)));
     Dev<double>d_optionAStats(std::vector<double>(3u,0.));
+    // V3: per-wall-face conductance, shear Gram scalar, projected shear column.
+    // Computed once per SIMPLE step; cached for every Krylov/M3 application.
+    Dev<double>d_optionAV3Beta(std::vector<double>(optionAV3Active?BH.wallT.size():1u,0.));
+    Dev<double>d_optionAV3Alpha(std::vector<double>(optionAV3Active?BH.wallT.size():1u,0.));
+    Dev<double>d_optionAV3C(std::vector<double>(optionAV3Active?72u*BH.wallT.size():1u,0.));
     if(optionA){
       // V2 no longer substitutes a scalar viscosity throughout wall-owner
       // tetrahedra. The viscosity array is passed explicitly to the
