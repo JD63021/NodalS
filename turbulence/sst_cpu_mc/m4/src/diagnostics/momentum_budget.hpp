@@ -61,7 +61,8 @@ inline void print_momentum_budget(const m2::Mesh&m,const EnrichmentSpace&enrich,
     velocity.x+=ph[mode]*coeff[0];velocity.y+=ph[mode]*coeff[1];velocity.z+=ph[mode]*coeff[2];
     for(int i=0;i<3;++i)for(int j=0;j<3;++j)grad[i][j]+=coeff[i]*g[j];
    }
-   const double nuT=sst_nut_at_point(m,c,l,u,k,omega,sst.wall_distance(),cfg,&enrich);
+   const double nuTRaw=sst_nut_at_point(m,c,l,u,k,omega,sst.wall_distance(),cfg,&enrich);
+   const double nuT=cfg.momentumNutScale*nuTRaw;
    if(!(nuT>=0&&std::isfinite(nuT)))throw std::runtime_error("budget: nonfinite eddy viscosity at boundary");
    const double div=grad[0][0]+grad[1][1]+grad[2][2];
    double Dn[3]{};
@@ -82,7 +83,7 @@ inline void print_momentum_budget(const m2::Mesh&m,const EnrichmentSpace&enrich,
     b.viscMolecularWall+=wt*cfg.nu*Dn[2];
     double kval=0,omval=0;for(int i=0;i<4;++i){kval+=l[i]*k[(size_t)t.v[i]];omval+=l[i]*omega[(size_t)t.v[i]];}
     b.wallKArea+=wt*kval;b.wallOmegaArea+=wt*omval;
-    b.wallNutArea+=wt*nuT;b.wallNutMax=std::max(b.wallNutMax,nuT);
+    b.wallNutArea+=wt*nuTRaw;b.wallNutMax=std::max(b.wallNutMax,nuTRaw);
     b.massWall+=wt*dot(velocity,n);
    }else {
     b.viscEnd+=wt*(cfg.nu+nuT)*Dn[2];
@@ -104,8 +105,8 @@ inline void print_momentum_budget(const m2::Mesh&m,const EnrichmentSpace&enrich,
  const double rhsBudget=b.pforce+b.viscAll-(b.convOut+b.convInPrescribed);
  const double denom=std::max({1.,std::abs(b.pforce),std::abs(b.viscAll),std::abs(b.convOut+b.convInPrescribed)});
  const double fMol=8*wallMol/inletU2,fEff=8*wallEff/inletU2;
- std::printf("NODALS_CPU_M4_RANS_WALL_BUDGET it=%d meanTauMol=%.12e meanTauEff=%.12e tauEffToMol=%.9g fMol=%.9g fEff=%.9g meanNutNu=%.9g maxNutNu=%.9g wallK=%.9g wallOmega=%.9g wallArea=%.12e status=DIAGNOSTIC\n",
-  it,wallMol,wallEff,wallEff/std::max(wallMol,1e-300),fMol,fEff,meanNut/cfg.nu,b.wallNutMax/cfg.nu,
+ std::printf("NODALS_CPU_M4_RANS_WALL_BUDGET it=%d momentumNutScale=%.9g meanTauMol=%.12e meanTauEff=%.12e tauEffToMol=%.9g fMol=%.9g fEff=%.9g meanNutNu=%.9g maxNutNu=%.9g wallK=%.9g wallOmega=%.9g wallArea=%.12e status=DIAGNOSTIC\n",
+  it,cfg.momentumNutScale,wallMol,wallEff,wallEff/std::max(wallMol,1e-300),fMol,fEff,meanNut/cfg.nu,b.wallNutMax/cfg.nu,
   b.wallKArea/b.wallArea,b.wallOmegaArea/b.wallArea,b.wallArea);
  std::printf("NODALS_CPU_M4_AXIAL_MOMENTUM_BUDGET it=%d pressureForce=%.12e wallStressZ=%.12e wallStressMolZ=%.12e endStressZ=%.12e totalViscZ=%.12e advOut=%.12e advInPrescribed=%.12e advInComputed=%.12e surfaceMismatch=%.12e mismatchRel=%.9g status=APPROX_BOUNDARY_P0\n",
   it,b.pforce,b.viscWall,b.viscMolecularWall,b.viscEnd,b.viscAll,b.convOut,b.convInPrescribed,b.convInComputed,rhsBudget,std::abs(rhsBudget)/denom);
