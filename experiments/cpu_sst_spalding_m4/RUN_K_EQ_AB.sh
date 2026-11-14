@@ -40,8 +40,8 @@ if "M4_DIAG_UR_U" in os.environ:
     print("K_EQ_UR_AUDIT ur_u=%.9g override=1"%relax)
 if "M4_GRAD_DIV_GAMMA" in os.environ:
     gd=float(os.environ["M4_GRAD_DIV_GAMMA"])
-    if not(math.isfinite(gd) and 0<=gd<=100):
-        raise SystemExit("M4_GRAD_DIV_GAMMA must be between 0 and 100 m2/s")
+    if not(math.isfinite(gd) and gd>=0):
+        raise SystemExit("M4_GRAD_DIV_GAMMA must be finite and nonnegative (m2/s)")
     put("momentum","grad_div_gamma",format(gd,".12g"))
     print("K_EQ_GRADDIV_AUDIT gamma=%.12g units=m2/s enabled=%d"%(gd,gd>0))
 put("solver.u","method","fgmres")
