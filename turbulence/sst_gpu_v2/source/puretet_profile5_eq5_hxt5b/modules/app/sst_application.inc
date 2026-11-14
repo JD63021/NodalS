@@ -1364,18 +1364,6 @@ int main(int argc,char**argv){
     Dev<T>d_alDiagX(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
     Dev<T>d_alDiagY(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
     Dev<T>d_alDiagZ(std::vector<T>(alGamma>0.?(std::size_t)nv:1,0));
-    if(alGamma!=0.){
-      hxt5d::nodals_al_source_mass<<<(np+255)/256,256>>>(
-        np,d_tg.p,d_contSource.p,d_alQ.p,alGamma,pin);
-      hxt4a::BT_apply(B,d_alQ.p,d_alRhsX.p,d_alRhsY.p,d_alRhsZ.p);
-      HXT1_CUDA(cudaMemset(d_alDiagX.p,0,(std::size_t)nv*sizeof(T)));
-      HXT1_CUDA(cudaMemset(d_alDiagY.p,0,(std::size_t)nv*sizeof(T)));
-      HXT1_CUDA(cudaMemset(d_alDiagZ.p,0,(std::size_t)nv*sizeof(T)));
-      hxt5d::nodals_al_diag<<<np,32>>>(np,B.row.p,B.col.p,
-        B.bx.p,B.by.p,B.bz.p,d_tg.p,alGamma,pin,
-        d_alDiagX.p,d_alDiagY.p,d_alDiagZ.p);
-      HXT1_CUDA(cudaGetLastError());
-    }
     Dev<T>d_dg(std::vector<T>(A.nnz,0)),d_diagDG(std::vector<T>((std::size_t)nv,0)),d_inletRhsX(std::vector<T>((std::size_t)nv,0)),d_inletRhsY(std::vector<T>((std::size_t)nv,0)),d_inletRhsZ(std::vector<T>((std::size_t)nv,0));
     // Stage6.B.3: with zero deviatoric RHS, the staged X/Y RHS is
     // precisely the already allocated inlet RHS. s22b_add_extra uses
@@ -1469,6 +1457,19 @@ int main(int argc,char**argv){
       pin=0;
       if(!M.outHex.empty())pin=M.outHex[0].cell;
       else if(!M.outTet.empty())pin=nh+M.outTet[0].cell;
+    }
+    // AL cache initialization belongs AFTER the actual B and pressure gauge are constructed.
+    if(alGamma!=0.){
+      hxt5d::nodals_al_source_mass<<<(np+255)/256,256>>>(
+        np,d_tg.p,d_contSource.p,d_alQ.p,alGamma,pin);
+      hxt4a::BT_apply(B,d_alQ.p,d_alRhsX.p,d_alRhsY.p,d_alRhsZ.p);
+      HXT1_CUDA(cudaMemset(d_alDiagX.p,0,(std::size_t)nv*sizeof(T)));
+      HXT1_CUDA(cudaMemset(d_alDiagY.p,0,(std::size_t)nv*sizeof(T)));
+      HXT1_CUDA(cudaMemset(d_alDiagZ.p,0,(std::size_t)nv*sizeof(T)));
+      hxt5d::nodals_al_diag<<<np,32>>>(np,B.row.p,B.col.p,
+        B.bx.p,B.by.p,B.bz.p,d_tg.p,alGamma,pin,
+        d_alDiagX.p,d_alDiagY.p,d_alDiagZ.p);
+      HXT1_CUDA(cudaGetLastError());
     }
     std::printf(
       "NODALS_HXT5B_PRESSURE_GAUGE mode=%s pin=%d "
