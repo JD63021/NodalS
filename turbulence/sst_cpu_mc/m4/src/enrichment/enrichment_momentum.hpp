@@ -53,7 +53,7 @@ inline void augment_momentum(const EnrichmentSpace&enrich,const Mesh&m,int cell,
     // elevated (6x6xradial) volume quadrature as enriched momentum.
     // All 12 test/trial shapes contribute, including PP, PE, EP, EE.
     // It is added to EK (not K), therefore never double-counted.
-    if(cfg.gradDivGamma>0){
+    if(cfg.gradDivGamma>0&&cfg.gradDivForm=="volume"){
       std::array<std::array<double,3>,12> gg{};
       for(int a=0;a<12;++a)gg[a]={gp[a].x,gp[a].y,gp[a].z};
       add_grad_div_rank_one<12>(EK,gg,cfg.gradDivGamma*wt);
