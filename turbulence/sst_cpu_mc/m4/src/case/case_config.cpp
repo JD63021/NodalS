@@ -32,8 +32,8 @@ CaseConfig read_case(const std::string& path,const std::string& meshPath,int n){
    throw std::runtime_error("enrichment requires wall_function.momentum_bc=strong_noslip_enriched");
  c.nu=real("physics.kinematic_viscosity");c.diameter=real("mesh.diameter");c.alphaU=real("simple.ur_u");c.alphaP=real("simple.ur_p");
  c.gradDivGamma=a.count("momentum.grad_div_gamma")?real("momentum.grad_div_gamma"):0.0;
- if(!(std::isfinite(c.gradDivGamma)&&c.gradDivGamma>=0.0&&c.gradDivGamma<=100.0))
-   throw std::runtime_error("momentum.grad_div_gamma must be finite, >=0 and <=100 m2/s");
+ if(!(std::isfinite(c.gradDivGamma)&&c.gradDivGamma>=0.0))
+   throw std::runtime_error("momentum.grad_div_gamma must be finite and nonnegative (m2/s)");
  c.convection=must("convection.form");c.stress=must("stress.form");c.method=must("solver.u.method");
  c.momSweeps=a.count("solver.u.sweeps")?intval("solver.u.sweeps"):2;
  c.momOmega=a.count("solver.u.omega")?real("solver.u.omega"):0.7;
