@@ -25,7 +25,7 @@ class SSTTransport {
  std::vector<RayPoint> wallPoints_;
  SSTFields state_;
  double bulk_=0;
- int omegaAdvanceCount_=0;
+ int omegaAdvanceCount_=0,kAdvanceCount_=0;
  ScalarReport advance_impl(bool omegaEq,const std::vector<double>&u,const nodals::cpu_mc::m3::WallFaceFit*fit);
 public:
  SSTTransport(const Mesh&m,const Ownership&o,const CaseConfig&cfg,int rank,
@@ -34,7 +34,8 @@ public:
  const SSTFields&state()const{return state_;}
  const std::vector<double>&wall_distance()const{return distance_;}
  // assembly uses real corrected velocity and both turbulence fields
- ScalarReport advance_k(const std::vector<double>&physicalVelocity);
+ ScalarReport advance_k(const std::vector<double>&physicalVelocity,
+                       const nodals::cpu_mc::m3::WallFaceFit&fit);
  ScalarReport advance_omega(const std::vector<double>&physicalVelocity,const nodals::cpu_mc::m3::WallFaceFit&fit);
  double mean_nut(const std::vector<double>&velocity)const;
  double cell_nut(int c,const std::vector<double>&velocity)const;
