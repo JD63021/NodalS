@@ -1,0 +1,32 @@
+name: Serial CPU SST source handoff
+on:
+  push:
+    branches:
+      - exp/serial-cpu-sst-transfer-20261115
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out CPU SST experimental branch
+        uses: actions/checkout@v4
+      - name: Assemble source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f turbulence/sst_cpu_mc/m4/src/app/mpi_sst_simple.cpp
+          test -f turbulence/sst_gpu_v2/source/puretet_profile5_eq5_hxt5b/modules/wall/portable/spalding_active.hpp
+          tar -czf "$RUNNER_TEMP/nodals_cpu_sst_source.tar.gz"             turbulence/sst_cpu_mc             turbulence/sst_gpu_v2/source/puretet_profile5_eq5_hxt5b
+          du -h "$RUNNER_TEMP/nodals_cpu_sst_source.tar.gz"
+      - name: Export CPU source as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodals-cpu-sst-source-20261115
+          path: ${{ runner.temp }}/nodals_cpu_sst_source.tar.gz
+          if-no-files-found: error
+          retention-days: 2
